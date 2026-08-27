@@ -109,7 +109,7 @@ function serveStatic(res, filename, type) {
   return text(res, 200, fs.readFileSync(file), type, { 'cache-control': 'no-cache' });
 }
 
-export function createServer({ store, worker, config }) {
+export function createServer({ store, worker, config, backupManager = null, vault = null }) {
   const auth = new AdminAuth(config);
 
   return http.createServer(async (req, res) => {
@@ -285,6 +285,35 @@ export function createServer({ store, worker, config }) {
 
       if (req.method === 'GET' && pathname === '/api/system/circuit') {
         return json(res, 200, worker.circuitState());
+      }
+
+      if (req.method === 'GET' && pathname === '/api/system/data-safety') {
+        return json(res, 200, {
+          vault: vault?.status?.() || null,
+          backups: backupManager?.status?.() || null,
+          restore: {
+            onlineSupported: false,
+            command: 'npm.cmd run backup:restore -- <backup-file>',
+            note: 'Stop the panel before restore. Keep the encryption key separately from data/backups.',
+          },
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/system/backups') {
+        if (!backupManager) return json(res, 503, { error: 'Backup manager is unavailable' });
+        const result = await backupManager.createBackup('manual');
+        store.audit('info', 'backup.created', `Encrypted backup created: ${result.name}`);
+        return json(res, 201, result);
+      }
+
+      if (req.method === 'POST' && pathname === '/api/system/backups/verify') {
+        if (!backupManager) return json(res, 503, { error: 'Backup manager is unavailable' });
+        const body = await readJson(req, 4096);
+        const name = body.name || backupManager.latestBackup()?.name;
+        if (!name) return json(res, 404, { error: 'No backup exists to verify' });
+        const result = backupManager.verifyBackup(name);
+        store.audit('info', 'backup.verified', `Encrypted backup verified: ${result.name}`);
+        return json(res, 200, result);
       }
 
       if (req.method === 'POST' && pathname === '/api/system/circuit/reset') {

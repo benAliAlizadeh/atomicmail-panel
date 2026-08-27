@@ -5,3 +5,5 @@ data/
 *.sqlite-wal
 npm-debug.log*
 .DS_Store
+secrets/
+backups/

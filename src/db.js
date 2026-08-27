@@ -204,6 +204,28 @@ export class Store {
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
   }
 
+  createSnapshot(targetPath) {
+    const escaped = String(targetPath).replaceAll("'", "''");
+    try { fs.rmSync(targetPath, { force: true }); } catch {}
+    this.db.exec(`VACUUM INTO '${escaped}'`);
+    try { fs.chmodSync(targetPath, 0o600); } catch {}
+    return targetPath;
+  }
+
+  rebaseCredentialPaths(credentialsRoot) {
+    const rows = this.db.prepare(`SELECT id, username, credentials_path FROM mailboxes`).all();
+    const update = this.db.prepare(`UPDATE mailboxes SET credentials_path=? WHERE id=?`);
+    let changed = 0;
+    for (const row of rows) {
+      const expected = path.join(credentialsRoot, row.username, 'credentials.json.enc');
+      if (row.credentials_path !== expected) {
+        update.run(expected, row.id);
+        changed += 1;
+      }
+    }
+    return changed;
+  }
+
   isUsernameTaken(username) {
     const row = this.db.prepare(`
       SELECT 1 AS found FROM mailboxes WHERE username=?

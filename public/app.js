@@ -442,10 +442,56 @@ function renderAudit(items) {
   </div>`).join('') : '<div class="empty">No audit events.</div>';
 }
 
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderDataSafety(data) {
+  const vault = data?.vault || {};
+  const backups = data?.backups || {};
+  const latest = backups.latest;
+  const vaultRows = [
+    ['Credential encryption', vault.encryption || 'Unavailable'],
+    ['Encrypted files', vault.encryptedCredentialFiles ?? '—'],
+    ['Plaintext files', vault.plaintextCredentialFiles ?? '—'],
+    ['Temporary workspaces', vault.runtimeCredentialDirectories ?? '—'],
+    ['Key storage', vault.keySource || '—'],
+    ['Key fingerprint', vault.keyFingerprint || '—'],
+    ['File permissions', vault.filePermissions?.hardened ? vault.filePermissions.method : `Warning: ${vault.filePermissions?.warning || 'not hardened'}`],
+  ];
+  const backupRows = [
+    ['Automatic backups', backups.enabled ? 'Enabled' : 'Disabled'],
+    ['Schedule', backups.enabled ? `Every ${backups.intervalMinutes} min` : '—'],
+    ['Retention', backups.retention ? `${backups.retention} backups` : '—'],
+    ['Backup count', backups.backupCount ?? '—'],
+    ['Latest backup', latest ? formatDate(latest.createdAt) : 'None yet'],
+    ['Latest size', latest ? formatBytes(latest.sizeBytes) : '—'],
+  ];
+  $('#vaultDetails').innerHTML = vaultRows.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
+  $('#backupDetails').innerHTML = backupRows.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
+  const warning = $('#dataSafetyWarning');
+  const plaintext = Number(vault.plaintextCredentialFiles || 0);
+  const permissionWarning = vault.filePermissions && !vault.filePermissions.hardened ? vault.filePermissions.warning : '';
+  const warnings = [];
+  if (plaintext) warnings.push(`${plaintext} plaintext credential file(s) remain on disk. Do not create more mailboxes until migration succeeds.`);
+  if (permissionWarning) warnings.push(`OS file-permission hardening warning: ${permissionWarning}`);
+  warning.hidden = warnings.length === 0;
+  warning.textContent = warnings.join(' ');
+  $('#verifyBackup').disabled = !latest;
+}
+
 async function loadSystem() {
-  const [circuit, audit] = await Promise.all([api('/api/system/circuit'), api('/api/audit?limit=80')]);
+  const [circuit, audit, dataSafety] = await Promise.all([
+    api('/api/system/circuit'),
+    api('/api/audit?limit=80'),
+    api('/api/system/data-safety'),
+  ]);
   renderCircuit(circuit);
   renderAudit(audit.items || []);
+  renderDataSafety(dataSafety);
 }
 
 function startPolling() {
@@ -580,6 +626,32 @@ $('#mailboxesBody').addEventListener('click', async (event) => {
 $('#exportCsv').addEventListener('click', () => downloadExport('csv').catch(handleError));
 $('#exportJson').addEventListener('click', () => downloadExport('json').catch(handleError));
 $('#refreshAudit').addEventListener('click', () => loadSystem().catch(handleError));
+$('#createBackup').addEventListener('click', async () => {
+  const button = $('#createBackup');
+  button.disabled = true;
+  try {
+    const result = await api('/api/system/backups', { method: 'POST', body: '{}' });
+    showToast(`Encrypted backup created and verified: ${result.name}`);
+    await loadSystem();
+  } catch (error) {
+    handleError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+$('#verifyBackup').addEventListener('click', async () => {
+  const button = $('#verifyBackup');
+  button.disabled = true;
+  try {
+    const result = await api('/api/system/backups/verify', { method: 'POST', body: '{}' });
+    showToast(`Backup verified: ${result.name}`);
+    await loadSystem();
+  } catch (error) {
+    handleError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
 
 $('#resetCircuit').addEventListener('click', async (event) => {
   const permanent = event.currentTarget.dataset.permanent === 'true';

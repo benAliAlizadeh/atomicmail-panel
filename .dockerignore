@@ -3,6 +3,7 @@
 .env
 .env.*
 data/
+secrets/
 backups/
 node_modules/
 coverage/

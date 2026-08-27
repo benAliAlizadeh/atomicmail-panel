@@ -9,10 +9,11 @@ function sleep(ms) {
 }
 
 export class JobWorker {
-  constructor({ store, provider, config }) {
+  constructor({ store, provider, config, backupManager = null }) {
     this.store = store;
     this.provider = provider;
     this.config = config;
+    this.backupManager = backupManager;
     this.timer = null;
     this.busy = false;
     this.stopping = false;
@@ -133,6 +134,7 @@ export class JobWorker {
       this.store.updateItemProgress(item.id, 'saving', 'Provider registration complete; saving mailbox record');
       this.store.markItemSucceeded(item.id, mailbox);
       this.store.audit('info', 'mailbox.created', `Created ${mailbox.email}`, item.job_id, item.id);
+      this.backupManager?.requestBackup('mailbox-created');
       this.consecutiveTransientFailures = 0;
       this.setNotBefore(this.config.postSuccessDelayMs);
     } catch (error) {

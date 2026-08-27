@@ -21,3 +21,4 @@
 | AM-17 | Production Docker | ✅ Done — healthcheck + read-only root + reduced privileges + graceful stop |
 | AM-18 | Live Validation | ✅ Done — first real @atomicmail.ai inbox created successfully |
 | AM-19 | Live Progress / ETA / Auth Clarity | ✅ Done — phase heartbeat, elapsed time, rolling ETA, API-key account model surfaced |
+| AM-20 | Data Safety / Encrypted Vault / Backup & Restore | ✅ Done — AES-256-GCM credentials, key separation, automatic verified encrypted backups, offline restore, portable path rebasing, OS permission hardening |

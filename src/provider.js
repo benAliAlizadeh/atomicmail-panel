@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { redactSecrets, safeJsonParse } from './utils.js';
+import { redactSecrets } from './utils.js';
 
 export class ProviderError extends Error {
   constructor(message, { kind = 'permanent', retryAfterMs = null, raw = '' } = {}) {
@@ -168,47 +168,55 @@ function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 13107
 }
 
 export class AtomicMailProvider {
-  constructor(config) {
+  constructor(config, vault) {
     this.config = config;
+    this.vault = vault;
     this.activeAbortController = null;
-  }
-
-  credentialsDir(username) {
-    return path.join(this.config.credentialsRoot, username);
   }
 
   abortActive() {
     this.activeAbortController?.abort();
   }
 
-  async register(username, { onProgress } = {}) {
-    emitProgress(onProgress, 'preparing', 'Preparing isolated credential directory');
-    const credentialsDir = this.credentialsDir(username);
-    fs.mkdirSync(credentialsDir, { recursive: true, mode: 0o700 });
-
-    // Crash-safe idempotency: the official CLI owns this credential directory.
-    // If registration completed before our DB commit and the process restarted,
-    // reuse the already-created inbox instead of attempting another signup.
-    const existingCredentialsPath = path.join(credentialsDir, 'credentials.json');
-    if (fs.existsSync(existingCredentialsPath)) {
-      const existing = safeJsonParse(fs.readFileSync(existingCredentialsPath, 'utf8'), {});
-      const inboxId = typeof existing?.inboxId === 'string' ? existing.inboxId : '';
-      const expectedLocalPart = inboxId.includes('@') ? inboxId.split('@', 1)[0].toLowerCase() : '';
-      if (inboxId && expectedLocalPart === username.toLowerCase()) {
-        try { fs.chmodSync(credentialsDir, 0o700); } catch {}
-        try { fs.chmodSync(existingCredentialsPath, 0o600); } catch {}
-        emitProgress(onProgress, 'recovered', 'Existing provider credentials found; reusing crash-safe registration');
-        return { username, email: inboxId, inboxId, credentialsPath: existingCredentialsPath };
-      }
-      throw new ProviderError('Credential directory already exists but does not match the requested username', {
+  existingMailbox(username) {
+    if (!this.vault?.hasCredentials(username)) return null;
+    const existing = this.vault.readCredentials(username);
+    if (!this.vault.validateCredentials(username, existing)) {
+      throw new ProviderError('Encrypted credential vault does not match the requested username', {
         kind: 'policy',
-        raw: 'Credential directory mismatch; refusing to overwrite provider credentials',
+        raw: 'Credential vault mismatch; refusing to overwrite provider credentials',
       });
     }
+    const inboxId = existing.inboxId;
+    return {
+      username,
+      email: inboxId,
+      inboxId,
+      credentialsPath: this.vault.credentialsPath(username),
+    };
+  }
 
+  async register(username, { onProgress } = {}) {
+    emitProgress(onProgress, 'preparing', 'Preparing encrypted credential workspace');
+
+    // Crash-safe idempotency now reads the encrypted permanent vault. A
+    // completed registration is never repeated merely because the DB commit
+    // was interrupted.
+    const existing = this.existingMailbox(username);
+    if (existing) {
+      emitProgress(onProgress, 'recovered', 'Encrypted provider credentials found; reusing crash-safe registration');
+      return existing;
+    }
+
+    // The official AgentSkill requires a normal credential directory while it
+    // is running. Plaintext therefore exists only inside an isolated temporary
+    // runtime directory and is sealed into AES-256-GCM storage immediately
+    // after the process exits. Stale runtime directories are recovered/sealed
+    // on the next panel start after a hard crash.
+    const runtimeDir = this.vault.createRuntimeDir(username);
     const env = {
       ...process.env,
-      ATOMIC_MAIL_CREDENTIALS_DIR: credentialsDir,
+      ATOMIC_MAIL_CREDENTIALS_DIR: runtimeDir,
       ATOMIC_MAIL_AUTH_URL: this.config.atomicAuthUrl,
       ATOMIC_MAIL_API_URL: this.config.atomicApiUrl,
       NO_COLOR: '1',
@@ -226,6 +234,7 @@ export class AtomicMailProvider {
     this.activeAbortController = controller;
 
     let result;
+    let spawnError = null;
     try {
       emitProgress(onProgress, 'launching', 'Starting official Atomic Mail AgentSkill');
       const invocation = resolveProviderInvocation(this.config.atomicCliCommand, args);
@@ -236,56 +245,73 @@ export class AtomicMailProvider {
         onProgress,
       });
     } catch (error) {
-      const classified = classifyProviderError(error?.message || String(error));
-      throw new ProviderError(classified.message, {
-        ...classified,
-        raw: redactSecrets(error?.message || String(error)),
-      });
+      spawnError = error;
     } finally {
       if (this.activeAbortController === controller) this.activeAbortController = null;
     }
 
+    // If AgentSkill managed to persist a complete API-key credential before a
+    // timeout/abort/CLI error, preserve it in the encrypted vault. The worker
+    // may still classify this attempt as interrupted, but the next attempt will
+    // safely reuse the already-created inbox instead of signing up again.
+    let sealed = null;
+    try {
+      sealed = this.vault.sealRuntimeDir(username, runtimeDir, { requireUsableCredentials: true });
+    } catch (error) {
+      this.vault.discardRuntime(runtimeDir);
+      throw new ProviderError('Atomic Mail credentials were created but could not be sealed safely', {
+        kind: 'permanent',
+        raw: redactSecrets(error?.message || String(error)),
+      });
+    }
+
+    if (spawnError) {
+      if (!sealed) this.vault.discardRuntime(runtimeDir);
+      const classified = classifyProviderError(spawnError?.message || String(spawnError));
+      throw new ProviderError(classified.message, {
+        ...classified,
+        raw: redactSecrets(spawnError?.message || String(spawnError)),
+      });
+    }
+
     const combined = redactSecrets(`${result.stdout}\n${result.stderr}`.trim());
     if (result.aborted) {
+      if (!sealed) this.vault.discardRuntime(runtimeDir);
       throw new ProviderError('Atomic Mail registration was interrupted by controlled shutdown', {
         kind: 'interrupted',
         raw: 'registration interrupted by operator shutdown',
       });
     }
     if (result.timedOut) {
+      if (!sealed) this.vault.discardRuntime(runtimeDir);
       throw new ProviderError('Atomic Mail registration process timed out', {
         kind: 'transient',
         raw: combined || 'registration timeout',
       });
     }
     if (result.code !== 0) {
+      if (!sealed) this.vault.discardRuntime(runtimeDir);
       const classified = classifyProviderError(combined || `CLI exited with code ${result.code}, signal ${result.signal || 'none'}`);
       throw new ProviderError(classified.message, { ...classified, raw: combined });
     }
 
-    emitProgress(onProgress, 'validating', 'Registration returned successfully; validating credential files');
-    const credentialsPath = path.join(credentialsDir, 'credentials.json');
-    if (!fs.existsSync(credentialsPath)) {
-      throw new ProviderError('Atomic Mail CLI exited successfully but credentials.json was not created', {
+    emitProgress(onProgress, 'validating', 'Registration returned successfully; validating encrypted credentials');
+    if (!sealed) {
+      this.vault.discardRuntime(runtimeDir);
+      throw new ProviderError('Atomic Mail CLI exited successfully but complete credentials were not created', {
         kind: 'transient',
         raw: combined,
       });
     }
 
-    try { fs.chmodSync(credentialsDir, 0o700); } catch {}
-    try { fs.chmodSync(credentialsPath, 0o600); } catch {}
-
-    const credentials = safeJsonParse(fs.readFileSync(credentialsPath, 'utf8'), {});
-    const inboxId = typeof credentials?.inboxId === 'string' && credentials.inboxId.includes('@')
-      ? credentials.inboxId
-      : `${username}@atomicmail.ai`;
-
-    emitProgress(onProgress, 'finalizing', 'Credentials validated; saving mailbox in the panel');
+    const credentials = sealed.credentials;
+    const inboxId = credentials.inboxId;
+    emitProgress(onProgress, 'finalizing', 'Credentials encrypted and validated; saving mailbox in the panel');
     return {
       username,
       email: inboxId,
       inboxId,
-      credentialsPath,
+      credentialsPath: sealed.credentialsPath,
     };
   }
 }

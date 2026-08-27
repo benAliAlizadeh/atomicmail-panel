@@ -4,7 +4,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { AtomicMailProvider, classifyProviderError, resolveProviderInvocation } from '../src/provider.js';
+import { CredentialVault } from '../src/credential-vault.js';
 import { redactSecrets, retryDelay } from '../src/utils.js';
+
+
+function makeVault(root) {
+  const config = {
+    credentialsRoot: path.join(root, 'credentials'),
+    runtimeCredentialsRoot: path.join(root, 'runtime'),
+    secretsDir: path.join(root, 'secrets'),
+    encryptionKeyPath: path.join(root, 'secrets', 'data.key'),
+  };
+  const vault = new CredentialVault(config);
+  vault.initialize();
+  return { vault, config };
+}
 
 test('classifies rate limiting', () => {
   const value = classifyProviderError('HTTP 429 Too Many Requests Retry-After: 120');
@@ -36,52 +50,59 @@ test('retry delay remains capped with jitter', () => {
 });
 
 
-test('provider reuses matching credentials after a crash instead of registering again', async () => {
+test('provider reuses matching encrypted credentials after a crash instead of registering again', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-provider-'));
   const username = 'reuse11111';
-  const dir = path.join(root, username);
+  const { vault, config: vaultConfig } = makeVault(root);
+  const dir = path.join(vaultConfig.credentialsRoot, username);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({
     inboxId: `${username}@atomicmail.ai`,
     apiKey: 'am_test_secret',
   }));
+  vault.migrateLegacyCredentials();
+  assert.equal(fs.existsSync(path.join(dir, 'credentials.json')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'credentials.json.enc')), true);
 
   const provider = new AtomicMailProvider({
-    credentialsRoot: root,
+    ...vaultConfig,
     atomicAuthUrl: 'https://auth.atomicmail.ai',
     atomicApiUrl: 'https://api.atomicmail.ai',
     atomicWatchMode: 'on-demand',
     atomicCliCommand: 'this-command-must-not-run',
     atomicCliPrefixArgs: [],
     registerTimeoutMs: 30000,
-  });
+  }, vault);
 
   const mailbox = await provider.register(username);
   assert.equal(mailbox.email, `${username}@atomicmail.ai`);
-  assert.equal(mailbox.credentialsPath, path.join(dir, 'credentials.json'));
+  assert.equal(mailbox.credentialsPath, path.join(dir, 'credentials.json.enc'));
 
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('provider refuses to overwrite a credential directory for a different inbox', async () => {
+test('provider refuses mismatched encrypted credentials for another inbox', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-provider-'));
   const username = 'wanted1111';
-  const dir = path.join(root, username);
+  const { vault, config: vaultConfig } = makeVault(root);
+  const dir = path.join(vaultConfig.credentialsRoot, username);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({
+  // Encrypt a syntactically valid credential file under the requested vault
+  // path but with a different inboxId to prove the provider refuses it.
+  vault.writeEncryptedFile(username, 'credentials.json', Buffer.from(JSON.stringify({
     inboxId: 'different111@atomicmail.ai',
     apiKey: 'am_test_secret',
-  }));
+  })));
 
   const provider = new AtomicMailProvider({
-    credentialsRoot: root,
+    ...vaultConfig,
     atomicAuthUrl: 'https://auth.atomicmail.ai',
     atomicApiUrl: 'https://api.atomicmail.ai',
     atomicWatchMode: 'on-demand',
     atomicCliCommand: 'this-command-must-not-run',
     atomicCliPrefixArgs: [],
     registerTimeoutMs: 30000,
-  });
+  }, vault);
 
   await assert.rejects(
     provider.register(username),
@@ -90,7 +111,6 @@ test('provider refuses to overwrite a credential directory for a different inbox
 
   fs.rmSync(root, { recursive: true, force: true });
 });
-
 
 test('Windows npx invocation bypasses the .cmd shim and runs npx-cli.js with node.exe', () => {
   const execPath = 'C:\\Program Files\\nodejs\\node.exe';
@@ -124,25 +144,24 @@ test('Windows npx resolution fails clearly before contacting the provider when n
 });
 
 
-test('provider reports operator-safe progress when reusing crash-safe credentials', async () => {
+test('provider reports operator-safe progress when reusing encrypted crash-safe credentials', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-provider-progress-'));
   const username = 'progress111';
-  const dir = path.join(root, username);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({
+  const { vault, config: vaultConfig } = makeVault(root);
+  vault.writeEncryptedFile(username, 'credentials.json', Buffer.from(JSON.stringify({
     inboxId: `${username}@atomicmail.ai`,
     apiKey: 'am_test_secret',
-  }));
+  })));
   const events = [];
   const provider = new AtomicMailProvider({
-    credentialsRoot: root,
+    ...vaultConfig,
     atomicAuthUrl: 'https://auth.atomicmail.ai',
     atomicApiUrl: 'https://api.atomicmail.ai',
     atomicWatchMode: 'on-demand',
     atomicCliCommand: 'must-not-run',
     atomicCliPrefixArgs: [],
     registerTimeoutMs: 30000,
-  });
+  }, vault);
   await provider.register(username, { onProgress: (event) => events.push(event) });
   assert.equal(events[0].phase, 'preparing');
   assert.ok(events.some((event) => event.phase === 'recovered'));

@@ -18,8 +18,17 @@ services:
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-false}
+      SECRETS_DIR: /app/secrets
+      DATA_ENCRYPTION_KEY_FILE: /app/secrets/data.key
+      BACKUP_DIR: /app/backups
+      AUTO_BACKUP_ENABLED: ${AUTO_BACKUP_ENABLED:-true}
+      AUTO_BACKUP_INTERVAL_MINUTES: ${AUTO_BACKUP_INTERVAL_MINUTES:-360}
+      BACKUP_MIN_GAP_MINUTES: ${BACKUP_MIN_GAP_MINUTES:-5}
+      BACKUP_RETENTION: ${BACKUP_RETENTION:-14}
     volumes:
       - ./data:/app/data
+      - ./secrets:/app/secrets
+      - ./backups:/app/backups
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=64m,mode=1777
     security_opt:

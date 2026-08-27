@@ -9,8 +9,9 @@ RUN npm install --global @atomicmail/agent-skill@0.3.26 \
 COPY --chown=node:node package.json ./
 COPY --chown=node:node src ./src
 COPY --chown=node:node public ./public
+COPY --chown=node:node scripts ./scripts
 
-RUN mkdir -p /app/data && chown -R node:node /app
+RUN mkdir -p /app/data /app/secrets /app/backups && chown -R node:node /app
 USER node
 
 ENV NODE_ENV=production \
@@ -18,11 +19,14 @@ ENV NODE_ENV=production \
     PORT=8787 \
     DATA_DIR=/app/data \
     DB_PATH=/app/data/atomicmail-panel.sqlite \
+    SECRETS_DIR=/app/secrets \
+    DATA_ENCRYPTION_KEY_FILE=/app/secrets/data.key \
+    BACKUP_DIR=/app/backups \
     ATOMICMAIL_CLI_COMMAND=atomicmail \
     ATOMICMAIL_CLI_PREFIX_ARGS_JSON=[] \
     ATOMICMAIL_WATCH_MODE=on-demand
 
-VOLUME ["/app/data"]
+VOLUME ["/app/data", "/app/secrets", "/app/backups"]
 EXPOSE 8787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

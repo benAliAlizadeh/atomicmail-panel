@@ -161,3 +161,44 @@ test('dashboard describes agent credential model and timing guards', async () =>
     });
   });
 });
+
+test('data-safety API exposes status without encryption key material and can verify backups', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-safety-api-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const worker = {
+    circuitState() { return { open: false, permanent: false, until: null, reason: null }; },
+    resetCircuit() {},
+  };
+  const vault = {
+    status() {
+      return {
+        encryption: 'AES-256-GCM', encryptedCredentialFiles: 1, plaintextCredentialFiles: 0,
+        keySource: 'external-key-file', keyFingerprint: '0123456789abcdef', portable: true,
+      };
+    },
+  };
+  const backupManager = {
+    status() { return { enabled: true, intervalMinutes: 360, retention: 14, latest: { name: 'safe.ambak' }, backupCount: 1 }; },
+    latestBackup() { return { name: 'safe.ambak' }; },
+    async createBackup() { return { name: 'safe.ambak', verified: true }; },
+    verifyBackup() { return { name: 'safe.ambak', verified: true }; },
+  };
+  const server = createServer({ store, worker, config: makeConfig(root, ''), vault, backupManager });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const statusResponse = await fetch(`${base}/api/system/data-safety`);
+    assert.equal(statusResponse.status, 200);
+    const raw = await statusResponse.text();
+    assert.match(raw, /0123456789abcdef/);
+    assert.doesNotMatch(raw, /data\.key|DATA_ENCRYPTION_KEY|apiKey/i);
+
+    const created = await fetch(`${base}/api/system/backups`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(created.status, 201);
+    assert.equal((await created.json()).verified, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

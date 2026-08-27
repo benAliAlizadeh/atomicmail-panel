@@ -147,6 +147,19 @@
             <div id="auditList" class="audit-list"></div>
           </article>
         </div>
+        <article class="panel data-safety-panel">
+          <div class="panel-head">
+            <div><h2>Data safety & portability</h2><p class="muted">Encrypted credentials, verified backups and migration readiness</p></div>
+            <div class="button-row"><button id="createBackup" class="btn primary small-btn">Create backup</button><button id="verifyBackup" class="btn ghost small-btn">Verify latest</button></div>
+          </div>
+          <div id="dataSafetyWarning" class="banner danger" hidden></div>
+          <div class="data-safety-grid">
+            <dl id="vaultDetails" class="kv-list"></dl>
+            <dl id="backupDetails" class="kv-list"></dl>
+          </div>
+          <p class="muted warning-note"><strong>Migration rule:</strong> copy <code>data/</code> and <code>secrets/data.key</code> to the new server. Keep the key separately from normal backups. If the key is lost, encrypted inbox credentials cannot be recovered.</p>
+          <p class="muted warning-note">Restore is intentionally offline: stop the panel, then run <code>npm.cmd run backup:restore -- &lt;backup-file&gt;</code>. A pre-restore encrypted safety backup is created automatically.</p>
+        </article>
       </section>
     </main>
   </div>

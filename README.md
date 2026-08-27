@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-19)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-20)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -23,6 +23,10 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - restrictive browser security headers/CSP
 - no credential file path, API key or JWT exposure through mailbox APIs
 - hardened Docker defaults: non-root, read-only root filesystem, dropped capabilities, healthcheck and graceful stop
+- AES-256-GCM permanent credential vault; no readable API-key JSON remains under `data/credentials/`
+- separately stored encryption key with portable key fingerprint
+- automatic authenticated encrypted backups with SQLite integrity verification and offline restore
+- Windows NTFS ACL / POSIX permission hardening with UI status
 
 ## Local run on Windows / PowerShell
 
@@ -174,7 +178,8 @@ Before exposing the service beyond localhost:
 2. Terminate TLS in a reverse proxy you control.
 3. Set `ADMIN_COOKIE_SECURE=true`.
 4. Keep the application port private/loopback where possible.
-5. Back up the entire `data/` directory securely; it contains both SQLite state and mailbox credentials.
+5. Back up `data/` plus `secrets/data.key` separately; credentials under `data/` are encrypted, and losing the key makes them unrecoverable.
+6. Keep `backups/` available for encrypted automatic restore points.
 
 ## Verification after deployment
 
@@ -187,4 +192,82 @@ The service should report healthy before you use **Create emails**.
 
 ## Live validation status
 
-AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung.
+AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately.
+
+## AM-20 — encrypted credential vault, backup and portability
+
+Permanent Atomic Mail credentials are no longer stored as readable JSON. On the first start after this patch, legacy files such as:
+
+```text
+data/credentials/<username>/credentials.json
+```
+
+are authenticated, encrypted with AES-256-GCM and replaced by:
+
+```text
+data/credentials/<username>/credentials.json.enc
+```
+
+The original plaintext file is deleted only after an encrypt/decrypt verification succeeds. During a live AgentSkill operation, plaintext credentials exist only in an isolated OS temporary workspace; the workspace is sealed back into the encrypted vault immediately after the provider process exits. A hard-crash leftover is recovered/sealed on the next start when it contains complete matching credentials.
+
+### Encryption key — do not lose this
+
+By default the panel generates this file once:
+
+```text
+secrets/data.key
+```
+
+It is intentionally outside `data/` and excluded from Git/Docker build context. Back it up **separately**. The System page shows only a non-secret SHA-256 fingerprint, never the key itself.
+
+For server migration, copy both:
+
+```text
+data/
+secrets/data.key
+```
+
+The database credential paths are rebased automatically to the new machine, so Windows/Linux/path changes do not invalidate the mailboxes. If `secrets/data.key` is lost, encrypted API keys and `.ambak` backups cannot be decrypted.
+
+An environment-provided 32-byte key is also supported through `DATA_ENCRYPTION_KEY` (base64 or 64 hex characters). When set, it takes precedence over the key file.
+
+### File permissions
+
+On Linux/macOS, storage directories are hardened to mode `0700` and secret files to `0600`. On Windows, the panel attempts to replace inherited NTFS ACLs on `data/`, `secrets/`, and `backups/` with access for the current user and SYSTEM. The System page surfaces a warning if OS-level hardening cannot be applied. Encryption remains the primary protection for provider API keys.
+
+### Encrypted automatic backups
+
+Backups are written to `backups/` as authenticated `.ambak` files. Each backup contains a consistent SQLite snapshot plus the encrypted credential vault, then the whole compressed payload is encrypted again with a purpose-derived AES-256-GCM key.
+
+Defaults:
+
+```env
+AUTO_BACKUP_ENABLED=true
+AUTO_BACKUP_INTERVAL_MINUTES=360
+BACKUP_MIN_GAP_MINUTES=5
+BACKUP_RETENTION=14
+```
+
+A successful mailbox creation requests a debounced backup; scheduled backups run as a second layer, and graceful shutdown creates a final backup when mailboxes exist. A backup is only reported successful after decryption and SQLite `integrity_check` pass.
+
+The **System → Data safety & portability** card can create a backup manually and verify the latest backup without exposing any credential material.
+
+CLI:
+
+```powershell
+npm.cmd run backup:status
+npm.cmd run backup:create
+npm.cmd run backup:verify
+```
+
+### Offline restore
+
+Restore is intentionally not exposed as a one-click web action because replacing a live SQLite database is unsafe. Stop the panel first, then run:
+
+```powershell
+npm.cmd run backup:restore -- atomicmail-backup-....ambak
+```
+
+Before replacement, the restore command attempts to create a fresh encrypted `pre-restore` safety backup. It authenticates/decrypts the selected backup, validates SQLite integrity, restores the encrypted credential files, and rebases credential paths to the current machine.
+
+A PID lock prevents restore while the panel is still running.

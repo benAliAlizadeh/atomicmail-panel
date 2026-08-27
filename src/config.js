@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 
 function intEnv(name, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
@@ -42,6 +44,8 @@ function enumEnv(name, fallback, allowed) {
 export function loadConfig() {
   const cwd = process.cwd();
   const dataDir = path.resolve(cwd, process.env.DATA_DIR || './data');
+  const secretsDir = path.resolve(cwd, process.env.SECRETS_DIR || './secrets');
+  const runtimeScope = crypto.createHash('sha256').update(cwd).digest('hex').slice(0, 12);
   const adminPassword = process.env.ADMIN_PASSWORD || '';
   if (adminPassword && adminPassword.length < 12) {
     throw new Error('ADMIN_PASSWORD must be at least 12 characters when admin authentication is enabled');
@@ -59,6 +63,16 @@ export function loadConfig() {
     dataDir,
     dbPath: path.resolve(cwd, process.env.DB_PATH || path.join(dataDir, 'atomicmail-panel.sqlite')),
     credentialsRoot: path.join(dataDir, 'credentials'),
+    runtimeCredentialsRoot: path.resolve(cwd, process.env.ATOMICMAIL_RUNTIME_DIR || path.join(os.tmpdir(), `atomicmail-panel-runtime-${runtimeScope}`)),
+    secretsDir,
+    encryptionKeyPath: path.resolve(cwd, process.env.DATA_ENCRYPTION_KEY_FILE || path.join(secretsDir, 'data.key')),
+    backupDir: path.resolve(cwd, process.env.BACKUP_DIR || './backups'),
+    pidPath: path.join(dataDir, 'panel.pid'),
+
+    autoBackupEnabled: boolEnv('AUTO_BACKUP_ENABLED', true),
+    autoBackupIntervalMs: intEnv('AUTO_BACKUP_INTERVAL_MINUTES', 360, 1, 10080) * 60000,
+    backupMinGapMs: intEnv('BACKUP_MIN_GAP_MINUTES', 5, 1, 1440) * 60000,
+    backupRetention: intEnv('BACKUP_RETENTION', 14, 1, 365),
 
     maxBatchSize: intEnv('MAX_BATCH_SIZE', 100, 1, 5000),
     usernameMinLength,
