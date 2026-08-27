@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-20)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-24)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -27,6 +27,10 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - separately stored encryption key with portable key fingerprint
 - automatic authenticated encrypted backups with SQLite integrity verification and offline restore
 - Windows NTFS ACL / POSIX permission hardening with UI status
+- on-demand Webmail for each `@atomicmail.ai` inbox through Atomic Mail JMAP
+- Inbox list with sender, subject, preview, unread state and attachment indicator
+- safe plain-text message reader with extracted HTTP/HTTPS links
+- Compose and Reply through the official AgentSkill JMAP send/reply flows
 
 ## Local run on Windows / PowerShell
 
@@ -112,6 +116,33 @@ On SIGINT/SIGTERM the panel stops accepting new work, aborts the active registra
 
 If the process is force-killed before graceful shutdown finishes, startup recovery handles the remaining `running` item.
 
+
+## Webmail — AM-21 → AM-24
+
+Open **Mailboxes → Open inbox** to use an agent inbox without exposing its API key to the browser. The browser talks only to this panel; the server materializes the encrypted Atomic Mail credential into an isolated OS-temp runtime, invokes the official AgentSkill `jmap_request`, then immediately re-encrypts any refreshed credentials.
+
+Available in this stage:
+
+- Inbox list and manual Refresh
+- open/read a message as sanitized plain text
+- safe `http://` / `https://` links extracted from the message
+- Compose / Send
+- Reply
+
+Message HTML is never rendered directly in the operator page, and scripts are not executed. Message bodies are not written to the panel audit log. Provider API keys, JWTs and credential paths remain server-side.
+
+Webmail is intentionally **on-demand** in AM-21→24: it does not poll every mailbox in the background, so opening the panel does not create continuous AgentSkill/JMAP traffic. Live inbox polling, Sent, search, mail actions and attachments are later tasks.
+
+Default mail guards:
+
+```env
+MAIL_COMMAND_TIMEOUT_MS=60000
+MAIL_INBOX_LIMIT=50
+MAIL_MAX_BODY_BYTES=524288
+MAIL_MAX_COMPOSE_BYTES=204800
+MAIL_MAX_SUBJECT_BYTES=2048
+```
+
 ## Exports
 
 The Mailboxes page exports the current search as CSV or JSON. Provider credentials and credential paths are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS`.
@@ -192,7 +223,7 @@ The service should report healthy before you use **Create emails**.
 
 ## Live validation status
 
-AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately.
+AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→24 add the first operator Webmail slice: JMAP core, Inbox, safe message read, Compose/Send and Reply.
 
 ## AM-20 — encrypted credential vault, backup and portability
 

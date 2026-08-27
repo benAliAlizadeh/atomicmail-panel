@@ -22,3 +22,16 @@
 | AM-18 | Live Validation | ✅ Done — first real @atomicmail.ai inbox created successfully |
 | AM-19 | Live Progress / ETA / Auth Clarity | ✅ Done — phase heartbeat, elapsed time, rolling ETA, API-key account model surfaced |
 | AM-20 | Data Safety / Encrypted Vault / Backup & Restore | ✅ Done — AES-256-GCM credentials, key separation, automatic verified encrypted backups, offline restore, portable path rebasing, OS permission hardening |
+| AM-21 | JMAP Mail Core | ✅ Done — encrypted-vault runtime + official AgentSkill `jmap_request` |
+| AM-22 | Inbox | ✅ Done — on-demand list/refresh, sender/subject/preview/unread/attachment flag |
+| AM-23 | Read Message | ✅ Done — safe plain-text body + HTTP/HTTPS links; raw HTML not rendered |
+| AM-24 | Send / Reply | ✅ Done — Compose/Send + Reply via JMAP submission |
+| AM-25 | Sent + Mail Actions | ⬜ Next |
+| AM-26 | Live Inbox | ⬜ Planned |
+| AM-27 | Search / Pagination | ⬜ Planned |
+| AM-28 | Attachments | ⬜ Planned |
+| AM-29 | Verification Helper | ⬜ Planned |
+| AM-30 | Mail Security hardening | ⬜ Planned |
+| AM-31 | Per-job destination account password vault | ⬜ Planned |
+| AM-32 | Webmail/password backup integration | ⬜ Planned |
+| AM-33 | Full mail regression / production validation | ⬜ Planned |

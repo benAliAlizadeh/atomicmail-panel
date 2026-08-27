@@ -109,7 +109,7 @@ function serveStatic(res, filename, type) {
   return text(res, 200, fs.readFileSync(file), type, { 'cache-control': 'no-cache' });
 }
 
-export function createServer({ store, worker, config, backupManager = null, vault = null }) {
+export function createServer({ store, worker, config, backupManager = null, vault = null, mailClient = null }) {
   const auth = new AdminAuth(config);
 
   return http.createServer(async (req, res) => {
@@ -278,6 +278,55 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         });
       }
 
+      const inboxMatch = routeMatch(pathname, '/api/mailboxes/:id/inbox');
+      if (req.method === 'GET' && inboxMatch) {
+        if (!mailClient) return json(res, 503, { error: 'Mail client is unavailable' });
+        const mailbox = store.getMailbox(inboxMatch.id);
+        if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
+        if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
+        const limit = boundedInt(url.searchParams.get('limit'), config.mailInboxLimit || 50, 1, 100);
+        const inbox = await mailClient.listInbox(mailbox.username, { limit });
+        return json(res, 200, { mailbox, ...inbox });
+      }
+
+      const messageMatch = routeMatch(pathname, '/api/mailboxes/:id/messages/:messageId');
+      if (req.method === 'GET' && messageMatch) {
+        if (!mailClient) return json(res, 503, { error: 'Mail client is unavailable' });
+        const mailbox = store.getMailbox(messageMatch.id);
+        if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
+        if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
+        const message = await mailClient.getMessage(mailbox.username, messageMatch.messageId);
+        return json(res, 200, { mailbox, message });
+      }
+
+      const sendMatch = routeMatch(pathname, '/api/mailboxes/:id/send');
+      if (req.method === 'POST' && sendMatch) {
+        if (!mailClient) return json(res, 503, { error: 'Mail client is unavailable' });
+        const mailbox = store.getMailbox(sendMatch.id);
+        if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
+        if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
+        const body = await readJson(req, Math.max(262144, Number(config.mailMaxComposeBytes || 204800) + 8192));
+        const result = await mailClient.send(mailbox.username, {
+          to: body.to,
+          subject: body.subject,
+          body: body.body,
+        });
+        store.audit('info', 'mail.sent', `Message sent from ${mailbox.email}`);
+        return json(res, 201, result);
+      }
+
+      const replyMatch = routeMatch(pathname, '/api/mailboxes/:id/messages/:messageId/reply');
+      if (req.method === 'POST' && replyMatch) {
+        if (!mailClient) return json(res, 503, { error: 'Mail client is unavailable' });
+        const mailbox = store.getMailbox(replyMatch.id);
+        if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
+        if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
+        const body = await readJson(req, Math.max(262144, Number(config.mailMaxComposeBytes || 204800) + 8192));
+        const result = await mailClient.reply(mailbox.username, replyMatch.messageId, { body: body.body });
+        store.audit('info', 'mail.replied', `Reply sent from ${mailbox.email}`);
+        return json(res, 201, result);
+      }
+
       if (req.method === 'GET' && pathname === '/api/audit') {
         const limit = boundedInt(url.searchParams.get('limit'), 100, 1, 500);
         return json(res, 200, { items: store.recentAudit(limit) });
@@ -340,7 +389,10 @@ export function createServer({ store, worker, config, backupManager = null, vaul
     } catch (error) {
       const status = Number(error?.statusCode) || 500;
       if (status >= 500) store.audit('error', 'http.internal_error', redactSecrets(String(error?.stack || error)));
-      return json(res, status, { error: status >= 500 ? 'Internal server error' : error.message });
+      const safeMessage = error?.expose === true || status < 500
+        ? redactSecrets(String(error?.message || 'Request failed')).slice(0, 1000)
+        : 'Internal server error';
+      return json(res, status, { error: safeMessage });
     }
   });
 }

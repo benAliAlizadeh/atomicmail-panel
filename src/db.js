@@ -479,6 +479,13 @@ export class Store {
     this.setJobStatus(jobId, Number(job.failed_count) > 0 ? 'failed' : 'completed');
   }
 
+  getMailbox(id) {
+    return this.db.prepare(`
+      SELECT id, username, email, status, created_at, job_id
+      FROM mailboxes WHERE id=?
+    `).get(String(id || '')) || null;
+  }
+
   listMailboxes(limit = 100, offset = 0, search = '') {
     const pattern = searchPattern(search);
     if (!pattern) {

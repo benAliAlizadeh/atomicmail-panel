@@ -4,6 +4,7 @@ import { Store } from './db.js';
 import { CredentialVault } from './credential-vault.js';
 import { BackupManager } from './backup-manager.js';
 import { AtomicMailProvider } from './provider.js';
+import { AtomicMailJmapClient } from './jmap-client.js';
 import { JobWorker } from './worker.js';
 import { createServer } from './server.js';
 import { acquirePidLock } from './process-lock.js';
@@ -32,8 +33,9 @@ if (legacyMigration.migratedMailboxes || runtimeRecovery.recovered || rebasedCre
 
 const backupManager = new BackupManager({ config, store, vault });
 const provider = new AtomicMailProvider(config, vault);
+const mailClient = new AtomicMailJmapClient(config, vault);
 const worker = new JobWorker({ store, provider, config, backupManager });
-const server = createServer({ store, worker, config, backupManager, vault });
+const server = createServer({ store, worker, config, backupManager, vault, mailClient });
 
 worker.start();
 backupManager.start();

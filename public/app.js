@@ -14,6 +14,10 @@ const state = {
   mailboxLimit: 50,
   mailboxSearch: '',
   mailboxTotal: 0,
+  selectedMailbox: null,
+  inboxItems: [],
+  selectedMessage: null,
+  composeMode: 'new',
   pollBusy: false,
   pollTimer: null,
   clockTimer: null,
@@ -25,6 +29,7 @@ const viewMeta = {
   create: ['Create emails', 'Start a safe sequential batch'],
   jobs: ['Jobs', 'Progress and batch controls'],
   mailboxes: ['Mailboxes', 'Search, copy and export created inboxes'],
+  webmail: ['Webmail', 'Read and send mail through Atomic Mail JMAP'],
   system: ['System', 'Circuit breaker and operational audit'],
 };
 
@@ -240,7 +245,8 @@ function switchView(view) {
   if (!viewMeta[view]) return;
   state.currentView = view;
   $$('.view').forEach((item) => { item.hidden = item.dataset.view !== view; });
-  $$('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.viewTarget === view));
+  const navView = view === 'webmail' ? 'mailboxes' : view;
+  $$('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.viewTarget === navView));
   $('#pageTitle').textContent = viewMeta[view][0];
   $('#pageSubtitle').textContent = viewMeta[view][1];
   if (view === 'jobs') loadJobs().catch(handleError);
@@ -415,13 +421,160 @@ async function loadMailboxes() {
     <td><span class="pill">API key</span></td>
     <td>${escapeHtml(formatDate(item.created_at))}</td>
     <td class="mono" title="${escapeHtml(item.job_id || '')}">${escapeHtml(item.job_id ? shortId(item.job_id) : '—')}</td>
-    <td><button class="copy-btn" data-copy-email="${escapeHtml(item.email)}">Copy</button></td>
+    <td><div class="mailbox-action-group"><button class="btn primary small-btn open-inbox-btn" data-open-inbox="${escapeHtml(item.id)}" data-mailbox-email="${escapeHtml(item.email)}">Open inbox</button><button class="copy-btn" data-copy-email="${escapeHtml(item.email)}">Copy</button></div></td>
   </tr>`).join('');
   const page = Math.floor(state.mailboxOffset / state.mailboxLimit) + 1;
   const pages = Math.max(1, Math.ceil(state.mailboxTotal / state.mailboxLimit));
   $('#mailboxPageText').textContent = `Page ${page} of ${pages}`;
   $('#mailboxPrev').disabled = state.mailboxOffset <= 0;
   $('#mailboxNext').disabled = state.mailboxOffset + state.mailboxLimit >= state.mailboxTotal;
+}
+
+function setMailError(message = '') {
+  const box = $('#mailError');
+  box.textContent = message;
+  box.hidden = !message;
+}
+
+function renderInbox(items) {
+  state.inboxItems = items || [];
+  $('#inboxEmpty').hidden = state.inboxItems.length > 0;
+  $('#inboxCountText').textContent = `${state.inboxItems.length} latest message${state.inboxItems.length === 1 ? '' : 's'}`;
+  $('#inboxList').innerHTML = state.inboxItems.map((item) => {
+    const active = state.selectedMessage?.id === item.id ? ' active' : '';
+    const unread = item.unread ? ' unread' : '';
+    return `<button class="mail-row${active}${unread}" type="button" data-message-id="${escapeHtml(item.id)}">
+      <span class="mail-row-top"><span class="mail-from">${item.unread ? '<span class="unread-dot" aria-label="Unread"></span>' : ''}${escapeHtml(item.fromText || 'Unknown sender')}</span><span class="mail-date">${escapeHtml(formatDate(item.receivedAt))}</span></span>
+      <span class="mail-subject">${escapeHtml(item.subject || '(no subject)')}${item.hasAttachment ? ' · 📎' : ''}</span>
+      <span class="mail-preview">${escapeHtml(item.preview || '')}</span>
+    </button>`;
+  }).join('');
+}
+
+async function loadInbox() {
+  if (!state.selectedMailbox) return;
+  const loading = $('#inboxLoading');
+  loading.hidden = false;
+  setMailError('');
+  $('#refreshInbox').disabled = true;
+  try {
+    const data = await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/inbox?limit=50`);
+    state.selectedMailbox = data.mailbox || state.selectedMailbox;
+    $('#webmailAddress').textContent = state.selectedMailbox.email;
+    $('#webmailSyncText').textContent = `Inbox refreshed ${new Date().toLocaleTimeString()}`;
+    renderInbox(data.items || []);
+  } catch (error) {
+    setMailError(error.message);
+  } finally {
+    loading.hidden = true;
+    $('#refreshInbox').disabled = false;
+  }
+}
+
+async function openMailbox(id, email) {
+  state.selectedMailbox = { id, email };
+  state.selectedMessage = null;
+  $('#webmailAddress').textContent = email;
+  $('#webmailSyncText').textContent = 'Loading on-demand inbox…';
+  $('#messageEmpty').hidden = false;
+  $('#messageDetail').hidden = true;
+  $('#messageLoading').hidden = true;
+  renderInbox([]);
+  switchView('webmail');
+  await loadInbox();
+}
+
+function renderMessage(message) {
+  state.selectedMessage = message;
+  $('#messageSubject').textContent = message.subject || '(no subject)';
+  const rows = [
+    ['From', message.fromText || 'Unknown sender'],
+    ['To', message.toText || state.selectedMailbox?.email || '—'],
+  ];
+  if (message.ccText) rows.push(['Cc', message.ccText]);
+  rows.push(['Received', formatDate(message.receivedAt || message.sentAt)]);
+  $('#messageMeta').innerHTML = rows.map(([label, value]) => `<span><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value)}</span>`).join('');
+  $('#messageBody').textContent = message.body || '(empty message)';
+  $('#messageTruncated').hidden = !message.bodyTruncated;
+  const links = Array.isArray(message.links) ? message.links : [];
+  const linkBox = $('#messageLinks');
+  linkBox.hidden = links.length === 0;
+  linkBox.innerHTML = links.length
+    ? `<strong>Links in this message</strong>${links.map((link) => `<a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link)}</a>`).join('')}`
+    : '';
+  $('#messageEmpty').hidden = true;
+  $('#messageDetail').hidden = false;
+  renderInbox(state.inboxItems);
+}
+
+async function loadMessage(messageId) {
+  if (!state.selectedMailbox) return;
+  setMailError('');
+  $('#messageEmpty').hidden = true;
+  $('#messageDetail').hidden = true;
+  $('#messageLoading').hidden = false;
+  try {
+    const data = await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(messageId)}`);
+    renderMessage(data.message);
+  } catch (error) {
+    setMailError(error.message);
+    $('#messageEmpty').textContent = 'Could not load this message.';
+    $('#messageEmpty').hidden = false;
+  } finally {
+    $('#messageLoading').hidden = true;
+  }
+}
+
+function openCompose(mode = 'new') {
+  if (!state.selectedMailbox) return;
+  state.composeMode = mode;
+  const reply = mode === 'reply';
+  $('#composeTitle').textContent = reply ? 'Reply' : 'New message';
+  $('#composeFrom').textContent = `From ${state.selectedMailbox.email}`;
+  $('#composeToRow').hidden = reply;
+  $('#composeSubjectRow').hidden = reply;
+  $('#composeTo').required = !reply;
+  $('#composeTo').value = reply ? (state.selectedMessage?.from?.[0]?.email || '') : '';
+  $('#composeSubject').value = reply ? `Re: ${state.selectedMessage?.subject || ''}` : '';
+  $('#composeBody').value = '';
+  $('#composeError').hidden = true;
+  $('#composeModal').hidden = false;
+  setTimeout(() => (reply ? $('#composeBody') : $('#composeTo')).focus(), 0);
+}
+
+function closeCompose() {
+  $('#composeModal').hidden = true;
+  $('#composeError').hidden = true;
+}
+
+async function submitCompose() {
+  if (!state.selectedMailbox) return;
+  const button = $('#sendCompose');
+  const errorBox = $('#composeError');
+  button.disabled = true;
+  errorBox.hidden = true;
+  try {
+    if (state.composeMode === 'reply') {
+      if (!state.selectedMessage?.id) throw new Error('No message selected for reply');
+      await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(state.selectedMessage.id)}/reply`, {
+        method: 'POST',
+        body: JSON.stringify({ body: $('#composeBody').value }),
+      });
+      showToast('Reply sent');
+    } else {
+      await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/send`, {
+        method: 'POST',
+        body: JSON.stringify({ to: $('#composeTo').value, subject: $('#composeSubject').value, body: $('#composeBody').value }),
+      });
+      showToast('Email sent');
+    }
+    closeCompose();
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function renderCircuit(circuit) {
@@ -613,6 +766,11 @@ $('#mailboxNext').addEventListener('click', () => {
 });
 
 $('#mailboxesBody').addEventListener('click', async (event) => {
+  const openButton = event.target.closest('[data-open-inbox]');
+  if (openButton) {
+    await openMailbox(openButton.dataset.openInbox, openButton.dataset.mailboxEmail).catch(handleError);
+    return;
+  }
   const button = event.target.closest('[data-copy-email]');
   if (!button) return;
   try {
@@ -621,6 +779,24 @@ $('#mailboxesBody').addEventListener('click', async (event) => {
   } catch {
     showToast('Clipboard access failed', true);
   }
+});
+
+$('#backToMailboxes').addEventListener('click', () => switchView('mailboxes'));
+$('#refreshInbox').addEventListener('click', () => loadInbox().catch(handleError));
+$('#composeMail').addEventListener('click', () => openCompose('new'));
+$('#replyMail').addEventListener('click', () => openCompose('reply'));
+$('#inboxList').addEventListener('click', (event) => {
+  const row = event.target.closest('[data-message-id]');
+  if (row) loadMessage(row.dataset.messageId).catch(handleError);
+});
+$('#closeCompose').addEventListener('click', closeCompose);
+$('#cancelCompose').addEventListener('click', closeCompose);
+$('#composeModal').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) closeCompose();
+});
+$('#composeForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  submitCompose().catch(handleError);
 });
 
 $('#exportCsv').addEventListener('click', () => downloadExport('csv').catch(handleError));
