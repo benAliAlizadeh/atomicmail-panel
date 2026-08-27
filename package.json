@@ -1,6 +1,6 @@
 {
   "name": "atomicmail-panel",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,8 +10,10 @@
     "start": "node --env-file-if-exists=.env src/index.js",
     "dev": "node --env-file-if-exists=.env --watch src/index.js",
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/server.js && node --check src/auth.js && node --check src/config.js && node --check src/db.js && node --check src/worker.js && node --check src/provider.js && node --check src/jmap-client.js && node --check src/credential-vault.js && node --check src/backup-manager.js && node --check src/process-lock.js && node --check src/file-security.js && node --check src/username-generator.js && node --check src/utils.js && node --check scripts/data-safety.js && node --check public/app.js",
+    "check": "node --check src/index.js && node --check src/server.js && node --check src/auth.js && node --check src/config.js && node --check src/db.js && node --check src/worker.js && node --check src/provider.js && node --check src/jmap-client.js && node --check src/credential-vault.js && node --check src/backup-manager.js && node --check src/process-lock.js && node --check src/file-security.js && node --check src/username-generator.js && node --check src/utils.js && node --check src/cloudflare-store.js && node --check src/cloudflare-runner-manager.js && node --check src/cloudflare-artifacts.js && node --check src/cloudflare-orchestrator.js && node --check src/cloudflare-verification.js && node --check runner/cloudflare-runner.js && node --check scripts/data-safety.js && node --check public/app.js",
     "verify": "npm run check && npm test",
+    "cloudflare:runner:install": "npm --prefix runner install && npm --prefix runner run install-browser",
+    "cloudflare:runner": "npm --prefix runner start --",
     "backup:status": "node --env-file-if-exists=.env scripts/data-safety.js status",
     "backup:create": "node --env-file-if-exists=.env scripts/data-safety.js create",
     "backup:verify": "node --env-file-if-exists=.env scripts/data-safety.js verify",

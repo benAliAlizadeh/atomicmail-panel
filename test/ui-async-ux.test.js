@@ -30,3 +30,18 @@ test('long operations expose accessible progress and preserve compose delivery s
   assert.match(styles, /\.btn\.primary\[aria-busy="true"\]/);
   assert.match(styles, /prefers-reduced-motion/);
 });
+
+test('Cloudflare operator workflow exposes selection, visible-runner and non-blocking action states', () => {
+  assert.match(html, /data-view="cloudflare"/);
+  assert.match(html, /id="cloudflareJobModal"[^>]+role="dialog"[^>]+aria-modal="true"/);
+  assert.match(html, /id="createCloudflareSelection"[^>]+disabled/);
+  assert.match(html, /id="cloudflareRunnerStatus"/);
+  assert.match(app, /selectedCloudflareMailboxIds: new Set/);
+  assert.match(app, /loadCloudflare\(\{ background = false/);
+  assert.match(app, /beginLatestRequest\('cloudflare'/);
+  assert.match(app, /data-cloudflare-item-focus/);
+  assert.match(app, /data-cloudflare-item-reconcile/);
+  assert.match(app, /data-cloudflare-resend-confirmed/);
+  assert.match(app, /\/api\/cloudflare\/eligible-mailboxes/);
+  assert.match(styles, /\.pill\.awaiting_submit/);
+});

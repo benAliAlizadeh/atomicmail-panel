@@ -1,0 +1,17 @@
+{
+  "name": "atomicmail-cloudflare-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.9"
+  },
+  "scripts": {
+    "install-browser": "playwright install chromium",
+    "start": "node cloudflare-runner.js",
+    "check": "node --check cloudflare-runner.js"
+  },
+  "dependencies": {
+    "playwright": "1.62.0"
+  }
+}

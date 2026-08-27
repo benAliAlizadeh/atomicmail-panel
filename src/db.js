@@ -93,6 +93,74 @@ export class Store {
         message TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS cloudflare_jobs (
+        id TEXT PRIMARY KEY,
+        requested_count INTEGER NOT NULL,
+        password_mode TEXT NOT NULL,
+        password_ciphertext TEXT NOT NULL,
+        status TEXT NOT NULL,
+        verified_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        needs_action_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        last_error_code TEXT,
+        last_error TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS cloudflare_accounts (
+        id TEXT PRIMARY KEY,
+        mailbox_id TEXT NOT NULL UNIQUE REFERENCES mailboxes(id) ON DELETE RESTRICT,
+        email TEXT NOT NULL UNIQUE,
+        credential_job_id TEXT NOT NULL REFERENCES cloudflare_jobs(id) ON DELETE RESTRICT,
+        status TEXT NOT NULL,
+        cloudflare_account_id TEXT,
+        verified_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_error_code TEXT,
+        last_error TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS cloudflare_job_items (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES cloudflare_jobs(id) ON DELETE CASCADE,
+        account_id TEXT NOT NULL REFERENCES cloudflare_accounts(id) ON DELETE RESTRICT,
+        mailbox_id TEXT NOT NULL REFERENCES mailboxes(id) ON DELETE RESTRICT,
+        position INTEGER NOT NULL,
+        email TEXT NOT NULL,
+        status TEXT NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'queued',
+        phase_message TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        submitted_at TEXT,
+        verification_received_at TEXT,
+        verified_at TEXT,
+        last_error_code TEXT,
+        last_error TEXT,
+        artifact_name TEXT,
+        browser_state_ciphertext TEXT,
+        verification_url_ciphertext TEXT,
+        lease_generation INTEGER NOT NULL DEFAULT 0,
+        leased_runner_id TEXT,
+        lease_expires_at TEXT,
+        attempt_started_at TEXT,
+        finished_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(job_id, position),
+        UNIQUE(job_id, mailbox_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cloudflare_items_runnable
+      ON cloudflare_job_items(status, next_attempt_at, job_id, position);
+
+      CREATE INDEX IF NOT EXISTS idx_cloudflare_items_lease
+      ON cloudflare_job_items(lease_expires_at, leased_runner_id);
     `);
 
     // Additive migration for databases created by earlier panel stages.
@@ -531,7 +599,8 @@ export class Store {
   hasBackupData() {
     const row = this.db.prepare(`
       SELECT EXISTS(SELECT 1 FROM jobs LIMIT 1)
-          OR EXISTS(SELECT 1 FROM mailboxes LIMIT 1) AS found
+          OR EXISTS(SELECT 1 FROM mailboxes LIMIT 1)
+          OR EXISTS(SELECT 1 FROM cloudflare_jobs LIMIT 1) AS found
     `).get();
     return Boolean(row?.found);
   }

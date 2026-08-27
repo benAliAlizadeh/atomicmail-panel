@@ -14,6 +14,14 @@ const state = {
   mailboxLimit: 50,
   mailboxSearch: '',
   mailboxTotal: 0,
+  mailboxItems: [],
+  selectedCloudflareMailboxIds: new Set(),
+  selectedCloudflareJobId: null,
+  selectedCloudflareJob: null,
+  activeCloudflareJob: null,
+  cloudflareStatus: null,
+  cloudflareJobPassword: null,
+  cloudflarePairingCommand: '',
   selectedMailbox: null,
   inboxItems: [],
   selectedMessage: null,
@@ -50,6 +58,7 @@ const viewMeta = {
   create: ['Create emails', 'Start a safe sequential batch'],
   jobs: ['Jobs', 'Progress and batch controls'],
   mailboxes: ['Mailboxes', 'Search, copy and export created inboxes'],
+  cloudflare: ['Cloudflare Accounts', 'Operator-assisted signup and verified-email workflow'],
   webmail: ['Webmail', 'Read and send mail through Atomic Mail JMAP'],
   system: ['System', 'Circuit breaker and operational audit'],
 };
@@ -111,6 +120,15 @@ function phaseLabel(phase) {
     completed: 'Completed',
     failed: 'Failed',
     cancelled: 'Cancelled',
+    awaiting_submit: 'Awaiting your submit',
+    opening_signup: 'Opening signup',
+    reconciling: 'Reconciling existing account',
+    waiting_for_verification: 'Waiting for verification email',
+    opening_verification: 'Opening verification',
+    verifying: 'Confirming verified status',
+    verified: 'Verified',
+    needs_action: 'Needs operator action',
+    retry_waiting: 'Waiting to retry',
   };
   return labels[phase] || String(phase || 'Working').replaceAll('_', ' ');
 }
@@ -376,6 +394,7 @@ function switchView(view, { load = true } = {}) {
   if (!viewMeta[view]) return;
   if (state.currentView === 'webmail' && view !== 'webmail') stopWebmailAutoRefresh();
   if (state.currentView === 'jobs' && view !== 'jobs') hideJobPassword();
+  if (state.currentView === 'cloudflare' && view !== 'cloudflare') hideCloudflarePassword();
   state.currentView = view;
   $$('.view').forEach((item) => { item.hidden = item.dataset.view !== view; });
   const navView = view === 'webmail' ? 'mailboxes' : view;
@@ -384,6 +403,7 @@ function switchView(view, { load = true } = {}) {
   $('#pageSubtitle').textContent = viewMeta[view][1];
   if (load && view === 'jobs') loadJobs().catch(handleError);
   if (load && view === 'mailboxes') loadMailboxes().catch(handleError);
+  if (load && view === 'cloudflare') loadCloudflare().catch(handleError);
   if (load && view === 'system') loadSystem().catch(handleError);
   if (view === 'webmail') startWebmailAutoRefresh();
 }
@@ -422,6 +442,7 @@ function refreshNamePreview() {
 
 function renderDashboard(data) {
   state.dashboard = data;
+  state.activeCloudflareJob = data.cloudflare?.activeJob || null;
   $('#statTotal').textContent = data.totalMailboxes;
   $('#statToday').textContent = data.createdToday;
   $('#statRunning').textContent = data.jobs?.running ?? 0;
@@ -613,11 +634,14 @@ async function loadMailboxes({ background = false } = {}) {
   }
   state.mailboxTotal = Number(data.total || 0);
   const items = data.items || [];
+  state.mailboxItems = items;
   $('#mailboxesEmpty').hidden = items.length > 0;
   $('#mailboxCountText').textContent = `${state.mailboxTotal} mailbox${state.mailboxTotal === 1 ? '' : 'es'}${state.mailboxSearch ? ` matching “${state.mailboxSearch}”` : ''}`;
   $('#mailboxesBody').innerHTML = items.map((item) => `<tr>
+    <td class="mailbox-selection-cell"><input type="checkbox" data-cloudflare-mailbox-id="${escapeHtml(item.id)}" aria-label="Select ${escapeHtml(item.email)} for Cloudflare" ${state.selectedCloudflareMailboxIds.has(item.id) ? 'checked' : ''} ${item.cloudflare_eligible ? '' : 'disabled'} /></td>
     <td class="mono">${escapeHtml(item.email)}</td>
     <td>${statusPill(item.status)}</td>
+    <td>${item.cloudflare_status ? statusPill(item.cloudflare_status) : '<span class="muted">Eligible</span>'}</td>
     <td><span class="pill">API key</span></td>
     <td>${escapeHtml(formatDate(item.created_at))}</td>
     <td class="mono" title="${escapeHtml(item.job_id || '')}">${escapeHtml(item.job_id ? shortId(item.job_id) : '—')}</td>
@@ -628,6 +652,250 @@ async function loadMailboxes({ background = false } = {}) {
   $('#mailboxPageText').textContent = `Page ${page} of ${pages}`;
   $('#mailboxPrev').disabled = state.mailboxOffset <= 0;
   $('#mailboxNext').disabled = state.mailboxOffset + state.mailboxLimit >= state.mailboxTotal;
+  updateCloudflareSelectionUi();
+}
+
+function updateCloudflareSelectionUi() {
+  const count = state.selectedCloudflareMailboxIds.size;
+  $('#createCloudflareSelection').textContent = `Create Cloudflare job (${count})`;
+  $('#createCloudflareSelection').disabled = count < 1;
+  $('#clearCloudflareSelection').disabled = count < 1;
+  const eligible = state.mailboxItems.filter((item) => item.cloudflare_eligible);
+  $('#toggleMailboxPageSelection').checked = eligible.length > 0 && eligible.every((item) => state.selectedCloudflareMailboxIds.has(item.id));
+  $('#toggleMailboxPageSelection').indeterminate = eligible.some((item) => state.selectedCloudflareMailboxIds.has(item.id))
+    && !eligible.every((item) => state.selectedCloudflareMailboxIds.has(item.id));
+}
+
+function selectMailboxRows(items, selected = true) {
+  for (const item of items) {
+    if (!item.cloudflare_eligible) continue;
+    if (selected) {
+      if (state.selectedCloudflareMailboxIds.size >= 100) break;
+      state.selectedCloudflareMailboxIds.add(item.id);
+    } else {
+      state.selectedCloudflareMailboxIds.delete(item.id);
+    }
+  }
+  $$('[data-cloudflare-mailbox-id]').forEach((input) => {
+    input.checked = state.selectedCloudflareMailboxIds.has(input.dataset.cloudflareMailboxId);
+  });
+  updateCloudflareSelectionUi();
+}
+
+async function selectFirstFilteredMailboxes(button) {
+  await withBusyButton(button, 'Selecting', 'Loading eligible mailboxes', async () => {
+    const params = new URLSearchParams({ limit: '100' });
+    if (state.mailboxSearch) params.set('search', state.mailboxSearch);
+    const data = await api(`/api/cloudflare/eligible-mailboxes?${params}`);
+    const eligible = data.items || [];
+    state.selectedCloudflareMailboxIds.clear();
+    selectMailboxRows(eligible.slice(0, 100));
+    showToast(`Selected ${state.selectedCloudflareMailboxIds.size} eligible mailbox${state.selectedCloudflareMailboxIds.size === 1 ? '' : 'es'}`);
+  });
+}
+
+function openCloudflareJobModal() {
+  const count = state.selectedCloudflareMailboxIds.size;
+  if (!count) return;
+  $('#cloudflareSelectionSummary').textContent = `${count} independent Cloudflare login${count === 1 ? '' : 's'} will be queued. Every signup Submit stays manual.`;
+  $('#cloudflarePasswordMode').value = 'generated';
+  $('#cloudflareManualPassword').value = '';
+  $('#cloudflareManualPasswordRow').hidden = true;
+  $('#cloudflareCreateError').hidden = true;
+  $('#cloudflareJobModal').hidden = false;
+  setTimeout(() => $('#cloudflarePasswordMode').focus(), 0);
+}
+
+function closeCloudflareJobModal() {
+  if ($('#cloudflareJobForm').getAttribute('aria-busy') === 'true') return;
+  $('#cloudflareJobModal').hidden = true;
+  $('#cloudflareManualPassword').value = '';
+  $('#cloudflareManualPassword').type = 'password';
+  $('#toggleCloudflareManualPassword').textContent = 'Show';
+}
+
+function cloudflareProgress(job) {
+  const requested = Math.max(1, Number(job?.requested_count || 0));
+  const counts = itemStatusCounts(job?.items || []);
+  const done = Number(job?.verified_count || 0) + Number(job?.failed_count || 0) + Number(counts.cancelled || 0);
+  return Math.min(100, Math.max(0, Math.round(done / requested * 100)));
+}
+
+function renderCloudflareStatus(status) {
+  state.cloudflareStatus = status;
+  state.activeCloudflareJob = status.activeJob || null;
+  $('#cloudflareTotal').textContent = status.totalAccounts ?? 0;
+  $('#cloudflareVerified').textContent = status.verifiedAccounts ?? 0;
+  $('#cloudflareNeedsAction').textContent = status.needsActionAccounts ?? 0;
+  $('#cloudflareRunnerShort').textContent = status.runner?.online ? (status.runner.busy ? 'Busy' : 'Online') : 'Offline';
+  $('#cloudflareRunnerHeartbeat').textContent = status.runner?.lastSeenAt ? `heartbeat ${formatDate(status.runner.lastSeenAt)}` : 'not paired';
+  $('#revokeCloudflareRunner').disabled = !status.runner?.online;
+  $('#cloudflareRunnerStatus').innerHTML = status.runner?.online
+    ? `<div class="runner-status-line"><span class="status-dot ok"></span><strong>${escapeHtml(status.runner.name || 'Operator browser')}</strong>${status.runner.busy ? '<span class="pill running">busy</span>' : '<span class="pill active">ready</span>'}</div><small>Runner ${escapeHtml(shortId(status.runner.runnerId))}${status.runner.activeItemId ? ` · item ${escapeHtml(shortId(status.runner.activeItemId))}` : ''}</small>`
+    : '<div class="runner-status-line"><span class="status-dot off"></span><strong>No visible browser runner connected</strong></div><small>Create a pairing code, then run the displayed command on the operator workstation.</small>';
+  const circuit = status.circuit || { open: false };
+  $('#cloudflareCircuitBanner').hidden = !circuit.open;
+  $('#cloudflareCircuitBanner').textContent = circuit.open
+    ? `Cloudflare workflow stopped: ${circuit.reason || 'provider cooldown'}${circuit.until ? ` · until ${formatDate(circuit.until)}` : ''}`
+    : '';
+  $('#resetCloudflareCircuit').hidden = !circuit.open;
+}
+
+function renderCloudflareJobs(jobs) {
+  $('#cloudflareJobsEmpty').hidden = jobs.length > 0;
+  $('#cloudflareJobsBody').innerHTML = jobs.map((job) => {
+    const done = Number(job.verified_count || 0) + Number(job.failed_count || 0);
+    return `<tr data-cloudflare-job-id="${escapeHtml(job.id)}">
+      <td>${escapeHtml(formatDate(job.created_at))}</td><td class="mono">${escapeHtml(shortId(job.id))}</td>
+      <td>${statusPill(job.status)}</td><td>${done}/${escapeHtml(job.requested_count)}</td>
+      <td>${escapeHtml(job.password_mode)}</td></tr>`;
+  }).join('');
+}
+
+function renderCloudflareAccounts(accounts) {
+  $('#cloudflareAccountsEmpty').hidden = accounts.length > 0;
+  $('#cloudflareAccountsBody').innerHTML = accounts.map((account) => `<tr>
+    <td class="mono">${escapeHtml(account.email)}</td><td>${statusPill(account.status)}</td>
+    <td>${escapeHtml(formatDate(account.verified_at))}</td><td class="mono">${escapeHtml(shortId(account.job_id))}</td>
+  </tr>`).join('');
+}
+
+async function loadCloudflareJobDetail(id, { background = false } = {}) {
+  const jobId = String(id || '');
+  if (!jobId) return;
+  if (state.selectedCloudflareJobId !== jobId) hideCloudflarePassword();
+  state.selectedCloudflareJobId = jobId;
+  const job = await api(`/api/cloudflare/jobs/${encodeURIComponent(jobId)}`);
+  if (state.selectedCloudflareJobId !== jobId) return;
+  state.selectedCloudflareJob = job;
+  $('#cloudflareJobDetail').hidden = false;
+  $('#cloudflareJobTitle').textContent = `Cloudflare job ${shortId(job.id)}`;
+  $('#cloudflareJobMeta').textContent = `Created ${formatDate(job.created_at)} · ${job.requested_count} account${job.requested_count === 1 ? '' : 's'} · ${job.password_mode} shared password`;
+  const percent = cloudflareProgress(job);
+  $('#cloudflareJobProgress').style.width = `${percent}%`;
+  const counts = itemStatusCounts(job.items);
+  $('#cloudflareJobNumbers').textContent = `${job.verified_count} verified · ${job.failed_count} failed · ${job.needs_action_count} need action · ${counts.waiting_for_verification || 0} waiting for email · ${percent}%`;
+  const actions = [];
+  if (job.status === 'running') actions.push('<button class="btn ghost small-btn" data-cloudflare-job-action="pause">Pause</button>');
+  if (job.status === 'paused') actions.push('<button class="btn primary small-btn" data-cloudflare-job-action="resume">Resume</button>');
+  if (['running', 'paused', 'needs_action'].includes(job.status)) actions.push('<button class="btn danger-btn small-btn" data-cloudflare-job-action="cancel">Cancel</button>');
+  $('#cloudflareJobActions').innerHTML = actions.join('');
+  $('#cloudflareItemsBody').innerHTML = (job.items || []).map((item) => {
+    const uncertainSignup = [
+      'interrupted_submit_unknown', 'runner_disconnected_uncertain', 'paused_submit_unknown', 'submit_timeout',
+      'submission_state_unknown', 'account_exists', 'invalid_credentials', 'reconcile_timeout',
+      'verification_link_expired', 'challenge', 'challenge_timeout', 'rate_limited', 'policy_blocked',
+    ]
+      .includes(item.last_error_code);
+    const canRetry = ['needs_action', 'failed', 'retry_waiting'].includes(item.status) && !item.leased_runner_id && !uncertainSignup;
+    const canReconcile = ['needs_action', 'failed', 'retry_waiting'].includes(item.status) && !item.leased_runner_id;
+    const canFocus = ['creating', 'awaiting_submit', 'verifying', 'needs_action'].includes(item.status);
+    const canConfirmResend = item.status === 'needs_action' && item.last_error_code === 'verification_pending' && item.leased_runner_id;
+    return `<tr><td>${escapeHtml(item.position)}</td><td class="mono">${escapeHtml(item.email)}</td>
+      <td>${statusPill(item.status)}</td><td><span class="phase-label">${escapeHtml(phaseLabel(item.phase))}</span><small class="phase-message">${escapeHtml(item.phase_message || '')}</small></td>
+      <td class="mono" data-elapsed-start="${escapeHtml(item.attempt_started_at || '')}" data-elapsed-end="${escapeHtml(item.finished_at || '')}">${item.attempt_started_at ? escapeHtml(formatDuration(secondsBetween(item.attempt_started_at, item.finished_at || Date.now()))) : '—'}</td>
+      <td>${escapeHtml(item.attempts)}</td><td><div class="cloudflare-item-actions">${canFocus ? `<button class="btn ghost small-btn" data-cloudflare-item-focus="${escapeHtml(item.id)}">Focus browser</button>` : ''}${canConfirmResend ? `<button class="btn primary small-btn" data-cloudflare-resend-confirmed="${escapeHtml(item.id)}">I clicked Resend</button>` : ''}${canRetry ? `<button class="btn ghost small-btn" data-cloudflare-item-retry="${escapeHtml(item.id)}">Retry safely</button>` : ''}${canReconcile ? `<button class="btn ghost small-btn" data-cloudflare-item-reconcile="${escapeHtml(item.id)}">Reconcile login</button>` : ''}${item.has_artifact ? `<button class="btn ghost small-btn" data-cloudflare-artifact="${escapeHtml(item.id)}">View failure</button>` : ''}</div></td>
+      <td class="truncate" title="${escapeHtml(item.last_error || '')}">${escapeHtml(item.last_error || '—')}</td></tr>`;
+  }).join('');
+  if (!background) refreshLiveTimers();
+}
+
+async function loadCloudflare({ background = false } = {}) {
+  const request = beginLatestRequest('cloudflare', { skipIfBusy: background });
+  if (!request) return;
+  const endActivity = background ? () => {} : beginActivity('cloudflare-load', 'Loading Cloudflare workflow');
+  if (!background) setButtonBusy($('#refreshCloudflare'), true, 'Refreshing');
+  $('#cloudflareJobsPanel').setAttribute('aria-busy', 'true');
+  try {
+    const [status, jobs, accounts] = await Promise.all([
+      api('/api/cloudflare/status', { signal: request.signal }),
+      api('/api/cloudflare/jobs?limit=75', { signal: request.signal }),
+      api('/api/cloudflare/accounts?limit=100&offset=0', { signal: request.signal }),
+    ]);
+    if (!request.isCurrent()) return;
+    renderCloudflareStatus(status);
+    renderCloudflareJobs(jobs.jobs || []);
+    renderCloudflareAccounts(accounts.items || []);
+    if (state.selectedCloudflareJobId) await loadCloudflareJobDetail(state.selectedCloudflareJobId, { background });
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+  } finally {
+    if (request.isCurrent()) {
+      request.finish();
+      $('#cloudflareJobsPanel').removeAttribute('aria-busy');
+      if (!background) setButtonBusy($('#refreshCloudflare'), false);
+    }
+    endActivity();
+  }
+}
+
+async function runCloudflareJobAction(action, button) {
+  if (!state.selectedCloudflareJobId) return;
+  if (action === 'cancel' && !confirm('Cancel this Cloudflare job? An already submitted external account may still exist.')) return;
+  await withBusyButton(button, `${action}…`, `Requesting Cloudflare job ${action}`, async () => {
+    await api(`/api/cloudflare/jobs/${encodeURIComponent(state.selectedCloudflareJobId)}/${action}`, { method: 'POST', body: '{}' });
+    showToast(`Cloudflare job ${action} requested`);
+    await Promise.all([loadCloudflare(), loadDashboard()]);
+  });
+}
+
+function hideCloudflarePassword() {
+  state.cloudflareJobPassword = null;
+  if (!$('#cloudflarePasswordValue')) return;
+  $('#cloudflarePasswordValue').textContent = '************';
+  $('#copyCloudflarePassword').disabled = true;
+  $('#hideCloudflarePassword').hidden = true;
+  $('#revealCloudflarePassword').hidden = false;
+}
+
+async function revealCloudflarePassword(button) {
+  if (!state.selectedCloudflareJobId) return;
+  await withBusyButton(button, 'Decrypting', 'Decrypting Cloudflare job password', async () => {
+    const result = await api(`/api/cloudflare/jobs/${encodeURIComponent(state.selectedCloudflareJobId)}/password`, { method: 'POST', body: '{}' });
+    state.cloudflareJobPassword = result.password;
+    $('#cloudflarePasswordValue').textContent = result.password;
+    $('#copyCloudflarePassword').disabled = false;
+    $('#hideCloudflarePassword').hidden = false;
+    $('#revealCloudflarePassword').hidden = true;
+  });
+}
+
+async function downloadCloudflareSensitiveExport() {
+  if (!confirm('This export contains plaintext Cloudflare passwords. Store it securely and delete it when finished. Continue?')) return;
+  const headers = { 'content-type': 'application/json' };
+  if (state.csrf) headers['x-atomicmail-csrf'] = state.csrf;
+  const response = await fetch('/api/cloudflare/accounts/export-sensitive', {
+    method: 'POST', headers, credentials: 'same-origin', body: JSON.stringify({ confirm: 'EXPORT CLOUDFLARE' }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `Cloudflare export failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  const href = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = href;
+  anchor.download = 'cloudflare-accounts.csv';
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(href);
+}
+
+async function viewCloudflareArtifact(itemId) {
+  if (!confirm('Failure screenshots may contain account metadata. Decrypt and view this screenshot?')) return;
+  const headers = { 'content-type': 'application/json' };
+  if (state.csrf) headers['x-atomicmail-csrf'] = state.csrf;
+  const response = await fetch(`/api/cloudflare/items/${encodeURIComponent(itemId)}/artifact`, {
+    method: 'POST', headers, credentials: 'same-origin', body: JSON.stringify({ confirm: 'VIEW' }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || 'Could not open Cloudflare failure screenshot');
+  }
+  const href = URL.createObjectURL(await response.blob());
+  window.open(href, '_blank', 'noopener,noreferrer');
+  setTimeout(() => URL.revokeObjectURL(href), 60000);
 }
 
 function setMailError(message = '', detail = '') {
@@ -1206,7 +1474,7 @@ async function loadSystem() {
 }
 
 function startPolling() {
-  schedulePoll(state.activeJob ? 2500 : 8000);
+  schedulePoll(state.activeJob || state.activeCloudflareJob ? 2500 : 8000);
   if (!state.clockTimer) state.clockTimer = setInterval(refreshLiveTimers, 1000);
 }
 
@@ -1218,7 +1486,8 @@ function schedulePoll(delay) {
       state.pollTimer = null;
       return;
     }
-    const active = ['pending', 'running'].includes(state.activeJob?.status);
+    const active = ['pending', 'running'].includes(state.activeJob?.status)
+      || ['running', 'needs_action'].includes(state.activeCloudflareJob?.status);
     schedulePoll(active ? 2500 : 10000);
   }, delay);
 }
@@ -1229,6 +1498,7 @@ async function poll() {
   try {
     await loadDashboard();
     if (state.currentView === 'jobs' && state.activeJob) await loadJobs({ background: true });
+    if (state.currentView === 'cloudflare') await loadCloudflare({ background: true });
   } catch (error) {
     if (!isAbortError(error) && error?.status !== 401) console.warn(error);
   } finally {
@@ -1264,6 +1534,7 @@ $('#logoutButton').addEventListener('click', async (event) => {
     try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch {}
     stopWebmailAutoRefresh();
     hideJobPassword();
+    hideCloudflarePassword();
     state.csrf = null;
     state.authenticated = false;
     showLogin();
@@ -1379,6 +1650,160 @@ $('#mailboxesBody').addEventListener('click', async (event) => {
   }
 });
 
+$('#mailboxesBody').addEventListener('change', (event) => {
+  const input = event.target.closest('[data-cloudflare-mailbox-id]');
+  if (!input || input.disabled) return;
+  if (input.checked) {
+    if (state.selectedCloudflareMailboxIds.size >= 100) {
+      input.checked = false;
+      showToast('A Cloudflare job is limited to 100 mailboxes', true);
+      return;
+    }
+    state.selectedCloudflareMailboxIds.add(input.dataset.cloudflareMailboxId);
+  } else {
+    state.selectedCloudflareMailboxIds.delete(input.dataset.cloudflareMailboxId);
+  }
+  updateCloudflareSelectionUi();
+});
+
+$('#toggleMailboxPageSelection').addEventListener('change', (event) => {
+  selectMailboxRows(state.mailboxItems, event.currentTarget.checked);
+});
+$('#selectCloudflarePage').addEventListener('click', () => selectMailboxRows(state.mailboxItems, true));
+$('#selectCloudflareFiltered').addEventListener('click', (event) => selectFirstFilteredMailboxes(event.currentTarget).catch(handleError));
+$('#clearCloudflareSelection').addEventListener('click', () => {
+  state.selectedCloudflareMailboxIds.clear();
+  selectMailboxRows(state.mailboxItems, false);
+});
+$('#createCloudflareSelection').addEventListener('click', openCloudflareJobModal);
+$('#closeCloudflareJobModal').addEventListener('click', closeCloudflareJobModal);
+$('#cancelCloudflareJob').addEventListener('click', closeCloudflareJobModal);
+$('#cloudflareJobModal').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) closeCloudflareJobModal();
+});
+$('#cloudflarePasswordMode').addEventListener('change', () => {
+  const manual = $('#cloudflarePasswordMode').value === 'manual';
+  $('#cloudflareManualPasswordRow').hidden = !manual;
+  $('#cloudflareManualPassword').required = manual;
+  if (manual) $('#cloudflareManualPassword').focus();
+});
+$('#toggleCloudflareManualPassword').addEventListener('click', () => {
+  const input = $('#cloudflareManualPassword');
+  input.type = input.type === 'password' ? 'text' : 'password';
+  $('#toggleCloudflareManualPassword').textContent = input.type === 'password' ? 'Show' : 'Hide';
+});
+$('#cloudflareJobForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = $('#submitCloudflareJob');
+  const errorBox = $('#cloudflareCreateError');
+  errorBox.hidden = true;
+  form.setAttribute('aria-busy', 'true');
+  setButtonBusy(button, true, 'Creating job');
+  const endActivity = beginActivity('cloudflare-create', 'Creating encrypted Cloudflare job', { immediate: true });
+  try {
+    const passwordMode = $('#cloudflarePasswordMode').value;
+    const job = await api('/api/cloudflare/jobs', {
+      method: 'POST',
+      body: JSON.stringify({
+        mailboxIds: [...state.selectedCloudflareMailboxIds],
+        passwordMode,
+        ...(passwordMode === 'manual' ? { password: $('#cloudflareManualPassword').value } : {}),
+      }),
+    });
+    state.selectedCloudflareMailboxIds.clear();
+    state.selectedCloudflareJobId = job.id;
+    $('#cloudflareJobModal').hidden = true;
+    $('#cloudflareManualPassword').value = '';
+    showToast(`Cloudflare job created for ${job.requested_count} account${job.requested_count === 1 ? '' : 's'}`);
+    switchView('cloudflare', { load: false });
+    await Promise.all([loadCloudflare(), loadMailboxes({ background: true }), loadDashboard()]);
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+  } finally {
+    form.setAttribute('aria-busy', 'false');
+    setButtonBusy(button, false);
+    endActivity();
+  }
+});
+
+$('#refreshCloudflare').addEventListener('click', () => loadCloudflare().catch(handleError));
+$('#cloudflareJobsBody').addEventListener('click', (event) => {
+  const row = event.target.closest('[data-cloudflare-job-id]');
+  if (row) loadCloudflareJobDetail(row.dataset.cloudflareJobId).catch(handleError);
+});
+$('#cloudflareJobActions').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-cloudflare-job-action]');
+  if (button) runCloudflareJobAction(button.dataset.cloudflareJobAction, button).catch(handleError);
+});
+$('#cloudflareItemsBody').addEventListener('click', async (event) => {
+  const focus = event.target.closest('[data-cloudflare-item-focus]');
+  if (focus) {
+    await withBusyButton(focus, 'Focusing', 'Focusing visible Chromium', () => api(`/api/cloudflare/items/${encodeURIComponent(focus.dataset.cloudflareItemFocus)}/focus`, { method: 'POST', body: '{}' })).catch(handleError);
+    return;
+  }
+  const retry = event.target.closest('[data-cloudflare-item-retry]');
+  if (retry) {
+    await withBusyButton(retry, 'Retrying', 'Scheduling safe Cloudflare reconciliation', async () => {
+      await api(`/api/cloudflare/items/${encodeURIComponent(retry.dataset.cloudflareItemRetry)}/retry`, { method: 'POST', body: '{}' });
+      await loadCloudflare();
+    }).catch(handleError);
+    return;
+  }
+  const reconcile = event.target.closest('[data-cloudflare-item-reconcile]');
+  if (reconcile) {
+    await withBusyButton(reconcile, 'Opening login', 'Scheduling existing-account reconciliation', async () => {
+      await api(`/api/cloudflare/items/${encodeURIComponent(reconcile.dataset.cloudflareItemReconcile)}/reconcile`, { method: 'POST', body: '{}' });
+      await loadCloudflare();
+    }).catch(handleError);
+    return;
+  }
+  const resendConfirmed = event.target.closest('[data-cloudflare-resend-confirmed]');
+  if (resendConfirmed) {
+    await withBusyButton(resendConfirmed, 'Confirming', 'Telling the browser runner to resume inbox verification', async () => {
+      await api(`/api/cloudflare/items/${encodeURIComponent(resendConfirmed.dataset.cloudflareResendConfirmed)}/resend-confirmed`, { method: 'POST', body: '{}' });
+      toast('Resend confirmed; waiting for the runner heartbeat', 'success');
+      await loadCloudflare();
+    }).catch(handleError);
+    return;
+  }
+  const artifact = event.target.closest('[data-cloudflare-artifact]');
+  if (artifact) await viewCloudflareArtifact(artifact.dataset.cloudflareArtifact).catch(handleError);
+});
+$('#revealCloudflarePassword').addEventListener('click', (event) => revealCloudflarePassword(event.currentTarget).catch(handleError));
+$('#hideCloudflarePassword').addEventListener('click', hideCloudflarePassword);
+$('#copyCloudflarePassword').addEventListener('click', () => {
+  if (state.cloudflareJobPassword != null) copyText(state.cloudflareJobPassword, 'Cloudflare password copied').catch(handleError);
+});
+$('#exportCloudflareSensitive').addEventListener('click', (event) => withBusyButton(event.currentTarget, 'Exporting', 'Preparing sensitive Cloudflare export', downloadCloudflareSensitiveExport).catch(handleError));
+$('#pairCloudflareRunner').addEventListener('click', async (event) => {
+  await withBusyButton(event.currentTarget, 'Creating code', 'Creating one-time runner pairing code', async () => {
+    const pairing = await api('/api/cloudflare/runners/pairing', { method: 'POST', body: '{}' });
+    const command = `npm.cmd run cloudflare:runner -- --panel "${location.origin}" --code ${pairing.code}`;
+    state.cloudflarePairingCommand = command;
+    $('#cloudflarePairingCommand').textContent = command;
+    $('#cloudflarePairingExpiry').textContent = `Expires ${formatDate(pairing.expiresAt)} · token remains only in runner memory`;
+    $('#cloudflarePairingPanel').hidden = false;
+  });
+});
+$('#copyCloudflarePairing').addEventListener('click', () => copyText(state.cloudflarePairingCommand, 'Runner command copied').catch(handleError));
+$('#revokeCloudflareRunner').addEventListener('click', async (event) => {
+  if (!confirm('Revoke the connected Cloudflare runner? Any visible browser task will stop.')) return;
+  await withBusyButton(event.currentTarget, 'Revoking', 'Revoking Cloudflare runner', async () => {
+    await api('/api/cloudflare/runners/revoke', { method: 'POST', body: '{}' });
+    $('#cloudflarePairingPanel').hidden = true;
+    await loadCloudflare();
+  }).catch(handleError);
+});
+$('#resetCloudflareCircuit').addEventListener('click', async (event) => {
+  if (!confirm('Reset the Cloudflare cooldown only after reviewing the provider response. Continue?')) return;
+  await withBusyButton(event.currentTarget, 'Resetting', 'Resetting Cloudflare cooldown', async () => {
+    await api('/api/cloudflare/circuit/reset', { method: 'POST', body: '{}' });
+    await loadCloudflare();
+  }).catch(handleError);
+});
+
 $('#backToMailboxes').addEventListener('click', () => switchView('mailboxes'));
 $('#refreshInbox').addEventListener('click', () => loadInbox({ statusText: 'Refreshing mailbox' }).catch(handleError));
 $$('[data-mail-folder]').forEach((button) => button.addEventListener('click', () => selectMailFolder(button.dataset.mailFolder)));
@@ -1492,10 +1917,12 @@ $('#resetCircuit').addEventListener('click', async (event) => {
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && state.currentView === 'webmail' && state.selectedMailbox) loadInbox({ background: true }).catch(() => {});
+  if (!document.hidden && state.currentView === 'cloudflare') loadCloudflare({ background: true }).catch(() => {});
 });
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !$('#composeModal').hidden) closeCompose();
+  if (event.key === 'Escape' && !$('#cloudflareJobModal').hidden) closeCloudflareJobModal();
 });
 
 window.addEventListener('beforeunload', (event) => {

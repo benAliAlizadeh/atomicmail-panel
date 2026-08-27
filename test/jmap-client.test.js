@@ -340,6 +340,39 @@ test('verification helpers are heuristic and only return safe HTTP links', () =>
   );
 });
 
+test('Cloudflare verification polling uses a bounded post-submit inbox query and trusted link selection', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-jmap-cloudflare-'));
+  try {
+    const vault = fakeVault(root);
+    const runner = async (_command, args) => {
+      const ops = JSON.parse(args[args.indexOf('--ops') + 1]);
+      assert.equal(ops.methodCalls[0][0], 'Email/query');
+      assert.equal(ops.methodCalls[0][1].filter.inMailbox, '$INBOX_MAILBOX_ID');
+      assert.equal(ops.methodCalls[0][1].filter.after, '2026-08-27T10:00:00.000Z');
+      assert.equal(ops.methodCalls[0][1].limit, 20);
+      assert.equal(ops.methodCalls[1][1].maxBodyValueBytes, 262144);
+      return response([
+        ['Email/query', { ids: ['cf-mail'] }, 'cfq0'],
+        ['Email/get', { list: [{
+          id: 'cf-mail', receivedAt: '2026-08-27T10:01:00.000Z',
+          from: [{ email: 'no-reply@cloudflare.com' }], to: [{ email: 'boxname111@atomicmail.ai' }],
+          subject: 'Verify your email address', preview: 'Confirm your email',
+          textBody: [{ partId: 't1', type: 'text/plain' }],
+          bodyValues: { t1: { value: 'Open https://dash.cloudflare.com/verify-email?token=private' } },
+        }] }, 'cfg0'],
+      ]);
+    };
+    const client = new AtomicMailJmapClient(config(), vault, { runner });
+    const found = await client.findCloudflareVerification('boxname111', {
+      recipient: 'boxname111@atomicmail.ai', submittedAt: '2026-08-27T10:00:00.000Z',
+    });
+    assert.equal(found.messageId, 'cf-mail');
+    assert.equal(found.url, 'https://dash.cloudflare.com/verify-email?token=private');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('mail headers reject CRLF injection and provider errors redact private compose values', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-jmap-redaction-'));
   try {

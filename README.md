@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-34)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-35)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -37,10 +37,21 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - safe attachment upload/download through the AgentSkill JMAP blob flow
 - verification-code and verification-link helpers without executing message HTML
 - encrypted per-job destination-account password vault with CSRF-protected reveal/copy and explicit sensitive export
+- independent Cloudflare onboarding jobs for selected AtomicMail inboxes
+- visible companion Chromium runner with one-time pairing, heartbeat and fenced task leases
+- manual signup Submit and challenge handling; no stealth, CAPTCHA solving or provider-control bypass
+- trusted Cloudflare verification-email polling with strict HTTPS/hostname validation
+- encrypted temporary browser recovery state, encrypted failure screenshots and restart reconciliation
 
 ## Local run on Windows / PowerShell
 
 Requirements: Node.js 22.9+.
+
+If the standard Windows install exists but this PowerShell session cannot find `node`/`npm`, activate it for the current session first:
+
+```powershell
+$env:Path = "C:\Program Files\nodejs;$env:Path"
+```
 
 ```powershell
 npm.cmd run verify
@@ -109,6 +120,39 @@ The optional **Destination account password** on the Create page is deliberately
 Use **Create emails** in the web panel, enter a count and optional prefix, then create the batch. The server reserves final usernames and the worker processes them one by one.
 
 A policy/abuse-protection response opens a permanent circuit and pauses the affected job. The panel never automatically resets a permanent circuit; an operator must review the provider response and explicitly reset it from **System**.
+
+## Create and verify Cloudflare logins
+
+Cloudflare onboarding is deliberately operator-assisted. The panel and runner automate preparation, inbox polling and safe verification, but a human must click every Cloudflare **Create account** submit control and solve every challenge shown by Cloudflare. The implementation does not use stealth browser patches, rotating proxies, CAPTCHA services or retry storms.
+
+1. Open **Mailboxes**, select up to 100 eligible inboxes, and choose **Create Cloudflare job**.
+2. Choose a generated 24-character shared password or provide a 12–128 byte shared password.
+3. Open **Cloudflare Accounts** and choose **Create pairing code**.
+4. The first time on the operator workstation, install the pinned runner and Chromium:
+
+```powershell
+npm.cmd run cloudflare:runner:install
+```
+
+5. Copy and run the one-time command shown by the panel. It has this shape:
+
+```powershell
+npm.cmd run cloudflare:runner -- --panel "http://127.0.0.1:8787" --code XXXX-XXXX
+```
+
+The runner opens a normal visible Chromium window and fills the official signup form. Submit it manually. The panel then polls only the selected AtomicMail inbox, accepts only a recent Cloudflare message and an HTTPS link on `cloudflare.com` or its real subdomains, and opens the link in an isolated browser context. An item becomes `verified` only after the runner confirms the email as verified in the Cloudflare profile.
+
+The following conditions stop instead of guessing: a challenge, CAPTCHA, 429/policy response, an already-existing account, an unknown Cloudflare UI, an expired link, or an uncertain disconnect near Submit. Use **Focus browser** for a live manual step. **Retry safely** is available only when a new pre-submit attempt is known to be safe; **Reconcile login** signs in to inspect the existing account and never re-submits signup. If verification must be resent, click Cloudflare's visible resend control and then **I clicked Resend** in the panel so the 20-minute trusted-inbox window starts from that human action.
+
+Cloudflare browser cookies are encrypted only while an item is recoverable and are deleted after verification or cancellation. Normal APIs never return the shared password, verification URL or browser state. Password reveal, failure-screenshot view and sensitive CSV export are POST-only, audited and returned with `Cache-Control: no-store`.
+
+### Windows and Docker runner topology
+
+- Direct Windows run: the runner and panel may both use `http://127.0.0.1:8787`.
+- Local Docker Compose: the published port remains bound to host loopback. `CLOUDFLARE_RUNNER_DOCKER_LOOPBACK_HTTP=true` permits only the Docker bridge request whose Host is `127.0.0.1`/`localhost`.
+- Remote Docker/server: enable `ADMIN_PASSWORD`, terminate HTTPS at a trusted reverse proxy, set `CLOUDFLARE_TRUST_PROXY=true`, and give the runner the public `https://` panel URL. The runner refuses plain HTTP for a non-loopback URL.
+
+The panel supports queues of up to 100, but live rollout should begin with 1, then 3, then 5 accounts. A provider challenge or rate limit stops the workflow for review; the software cannot promise that Cloudflare will accept any particular volume.
 
 ## Restart and shutdown safety
 
@@ -243,7 +287,7 @@ The service should report healthy before you use **Create emails**.
 
 ## Live validation status
 
-AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→30 complete the multi-mailbox JMAP Webmail, actions, live refresh, search/pagination, attachments, verification helpers and mail security controls. AM-31→32 add the encrypted per-job destination-password vault and backup/restore integration. AM-33 adds full regression, security, migration, backup and restart coverage. AM-34 removes stale-response races all the way through safe JMAP read-process cancellation, replaces aggressive polling with an adaptive non-overlapping scheduler, and gives every long operator action immediate progress, elapsed-time and accessible busy feedback. Send/Reply remain deliberately non-cancellable after submission so delivery state can never become ambiguous.
+AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→30 complete the multi-mailbox JMAP Webmail, actions, live refresh, search/pagination, attachments, verification helpers and mail security controls. AM-31→32 add the encrypted per-job destination-password vault and backup/restore integration. AM-33 adds full regression, security, migration, backup and restart coverage. AM-34 removes stale-response races all the way through safe JMAP read-process cancellation, replaces aggressive polling with an adaptive non-overlapping scheduler, and gives every long operator action immediate progress, elapsed-time and accessible busy feedback. AM-35 adds the isolated, operator-assisted Cloudflare signup/verification workflow and visible companion browser runner. Send/Reply and Cloudflare signup Submit remain deliberately non-cancellable after provider submission so their external state never becomes ambiguous.
 
 The AM-33 production check also completed a read-only live JMAP smoke for both Inbox and Sent against a temporary copy of the existing vault. No message was sent, modified or deleted, and the source data directory was not migrated or rewritten by the smoke.
 

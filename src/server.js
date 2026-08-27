@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { AdminAuth } from './auth.js';
 import { generateUniqueUsernames, normalizePrefix } from './username-generator.js';
@@ -116,6 +117,45 @@ function sensitiveMailboxesCsv(items) {
   return `${rows.join('\r\n')}\r\n`;
 }
 
+function cloudflareAccountsCsv(items) {
+  const rows = [['Email', 'CloudflarePassword', 'Status', 'VerifiedAt'].map(csvCell).join(',')];
+  for (const item of items) {
+    rows.push([item.email, item.password, item.status, item.verified_at || ''].map(csvCell).join(','));
+  }
+  return `${rows.join('\r\n')}\r\n`;
+}
+
+function generatedCloudflarePassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*_-+=';
+  const required = [
+    'ABCDEFGHJKLMNPQRSTUVWXYZ',
+    'abcdefghijkmnopqrstuvwxyz',
+    '23456789',
+    '!@#$%^&*_-+=',
+  ].map((group) => group[crypto.randomInt(group.length)]);
+  while (required.length < 24) required.push(alphabet[crypto.randomInt(alphabet.length)]);
+  for (let index = required.length - 1; index > 0; index -= 1) {
+    const other = crypto.randomInt(index + 1);
+    [required[index], required[other]] = [required[other], required[index]];
+  }
+  return required.join('');
+}
+
+function assertCloudflarePassword(value) {
+  const password = String(value ?? '');
+  const bytes = Buffer.byteLength(password, 'utf8');
+  if (bytes < 12 || bytes > 128) {
+    throw Object.assign(new Error('Manual Cloudflare password must be between 12 and 128 UTF-8 bytes'), {
+      statusCode: 400, code: 'invalid_cloudflare_password', expose: true,
+    });
+  }
+  return password;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function contentDispositionFilename(filename) {
   const clean = path.basename(String(filename || 'attachment.bin'))
     .replace(/[\u0000-\u001f\u007f]/g, '')
@@ -214,7 +254,18 @@ function serveStatic(res, filename, type) {
   return text(res, 200, fs.readFileSync(file), type, { 'cache-control': 'no-cache' });
 }
 
-export function createServer({ store, worker, config, backupManager = null, vault = null, mailClient = null }) {
+export function createServer({
+  store,
+  worker,
+  config,
+  backupManager = null,
+  vault = null,
+  mailClient = null,
+  cloudflareStore = null,
+  cloudflareOrchestrator = null,
+  runnerManager = null,
+  cloudflareArtifactStore = null,
+}) {
   const auth = new AdminAuth(config);
 
   return http.createServer(async (req, res) => {
@@ -260,6 +311,42 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         }, headers);
       }
 
+      // Companion runner endpoints use a separately paired bearer token. They
+      // intentionally bypass browser-cookie auth and never accept admin CSRF.
+      if (pathname.startsWith('/api/cloudflare/runner/')) {
+        if (!runnerManager || !cloudflareOrchestrator) return json(res, 503, { error: 'Cloudflare runner is unavailable' });
+        if (req.method === 'POST' && pathname === '/api/cloudflare/runner/pair') {
+          if (requestLooksCrossSite(req)) return json(res, 403, { error: 'Cross-site request rejected' });
+          const body = await readJson(req, 8192);
+          return json(res, 201, runnerManager.exchange(req, body));
+        }
+        const runnerSession = runnerManager.authenticate(req);
+        if (req.method === 'POST' && pathname === '/api/cloudflare/runner/heartbeat') {
+          const body = await readJson(req, 8192);
+          return json(res, 200, cloudflareOrchestrator.heartbeat(runnerSession, body));
+        }
+        if (req.method === 'GET' && pathname === '/api/cloudflare/runner/tasks/next') {
+          const waitSeconds = boundedInt(url.searchParams.get('wait'), 15, 0, 20);
+          const deadline = Date.now() + waitSeconds * 1000;
+          let task = null;
+          do {
+            task = cloudflareOrchestrator.claimTask(runnerSession);
+            if (task || Date.now() >= deadline || req.aborted) break;
+            await delay(500);
+          } while (true);
+          return json(res, 200, { task });
+        }
+        const runnerEvent = routeMatch(pathname, '/api/cloudflare/runner/tasks/:id/events');
+        if (req.method === 'POST' && runnerEvent) {
+          const body = await readJson(req, 3 * 1024 * 1024);
+          const generation = Number(body.generation);
+          if (!Number.isInteger(generation) || generation < 1) return json(res, 400, { error: 'Runner task generation is invalid' });
+          const item = cloudflareOrchestrator.handleRunnerEvent(runnerSession, runnerEvent.id, generation, body);
+          return json(res, 200, { item });
+        }
+        return json(res, 404, { error: 'Cloudflare runner endpoint not found' });
+      }
+
       let session = null;
       if (pathname.startsWith('/api/')) {
         session = auth.getSession(req);
@@ -303,7 +390,194 @@ export function createServer({ store, worker, config, backupManager = null, vaul
             maxAttachmentBytes: Number(config.mailMaxAttachmentBytes || 5242880),
             maxTotalAttachmentBytes: Number(config.mailMaxTotalAttachmentBytes || 10485760),
           },
+          cloudflare: cloudflareStore && cloudflareOrchestrator
+            ? { ...cloudflareStore.stats(), ...cloudflareOrchestrator.status() }
+            : null,
         });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/cloudflare/status') {
+        if (!cloudflareStore || !cloudflareOrchestrator) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        return json(res, 200, { ...cloudflareStore.stats(), ...cloudflareOrchestrator.status() });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/cloudflare/jobs') {
+        if (!cloudflareStore) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        const limit = boundedInt(url.searchParams.get('limit'), 50, 1, 200);
+        return json(res, 200, { jobs: cloudflareStore.listJobs(limit) });
+      }
+
+      const getCloudflareJob = routeMatch(pathname, '/api/cloudflare/jobs/:id');
+      if (req.method === 'GET' && getCloudflareJob) {
+        if (!cloudflareStore) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        const job = cloudflareStore.getJob(getCloudflareJob.id);
+        return job ? json(res, 200, job) : json(res, 404, { error: 'Cloudflare job not found' });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/cloudflare/jobs') {
+        if (!cloudflareStore || !cloudflareOrchestrator || !vault?.sealCloudflareSecret) {
+          return json(res, 503, { error: 'Cloudflare module or encrypted vault is unavailable' });
+        }
+        if (!config.cloudflareEnabled) return json(res, 409, { error: 'Cloudflare onboarding is disabled' });
+        if (cloudflareOrchestrator.circuitState().open) return json(res, 409, { error: 'Cloudflare circuit is open; review it before adding work' });
+        const body = await readJson(req, 65536);
+        const mailboxIds = Array.isArray(body.mailboxIds) ? body.mailboxIds.map(String) : [];
+        const maximum = Number(config.cloudflareMaxBatchSize || 100);
+        if (mailboxIds.length < 1 || mailboxIds.length > maximum) {
+          return json(res, 400, { error: `Select between 1 and ${maximum} mailboxes` });
+        }
+        const passwordMode = String(body.passwordMode || 'generated').toLowerCase();
+        if (!['manual', 'generated'].includes(passwordMode)) return json(res, 400, { error: 'passwordMode must be manual or generated' });
+        const password = passwordMode === 'generated' ? generatedCloudflarePassword() : assertCloudflarePassword(body.password);
+        const id = newId('cfjob');
+        const passwordCiphertext = vault.sealCloudflareSecret(password, { purpose: 'cloudflare-job-password', id });
+        const job = cloudflareStore.createJob({ id, mailboxIds, passwordMode, passwordCiphertext });
+        backupManager?.requestBackup?.('cloudflare-job-created');
+        return json(res, 201, job);
+      }
+
+      for (const action of ['pause', 'resume', 'cancel']) {
+        const match = routeMatch(pathname, `/api/cloudflare/jobs/:id/${action}`);
+        if (req.method === 'POST' && match) {
+          if (!cloudflareStore || !cloudflareOrchestrator) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+          const job = cloudflareStore.getJob(match.id);
+          if (!job) return json(res, 404, { error: 'Cloudflare job not found' });
+          if (['completed', 'failed', 'cancelled'].includes(job.status)) return json(res, 409, { error: `Cloudflare job is already ${job.status}` });
+          if (action === 'cancel') {
+            cloudflareStore.cancelJob(job.id);
+            const activeId = job.items.find((item) => ['preparing', 'creating', 'awaiting_submit', 'verifying'].includes(item.status))?.id;
+            if (activeId) runnerManager?.requestCommand('cancel', activeId);
+          } else if (action === 'pause') {
+            cloudflareStore.pauseJob(job.id);
+            const activeId = job.items.find((item) => ['preparing', 'creating', 'awaiting_submit', 'verifying'].includes(item.status))?.id;
+            if (activeId) runnerManager?.requestCommand('cancel', activeId);
+          } else {
+            if (cloudflareOrchestrator.circuitState().open) return json(res, 409, { error: 'Reset the Cloudflare circuit before resuming' });
+            if (job.items.some((item) => item.status === 'needs_action')) {
+              return json(res, 409, { error: 'Retry or reconcile the Needs Action item before resuming this job' });
+            }
+            cloudflareStore.setJobStatus(job.id, 'running');
+          }
+          store.audit('info', `cloudflare.job_${action}`, `Cloudflare job ${action} requested`, job.id);
+          return json(res, 200, cloudflareStore.getJob(job.id));
+        }
+      }
+
+      const revealCloudflarePassword = routeMatch(pathname, '/api/cloudflare/jobs/:id/password');
+      if (req.method === 'POST' && revealCloudflarePassword) {
+        if (!cloudflareStore || !vault?.openCloudflareSecret) return json(res, 503, { error: 'Cloudflare vault is unavailable' });
+        const record = cloudflareStore.getPasswordRecord(revealCloudflarePassword.id);
+        if (!record) return json(res, 404, { error: 'Cloudflare job not found' });
+        const password = vault.openCloudflareSecret(record.password_ciphertext, { purpose: 'cloudflare-job-password', id: record.id });
+        store.audit('warn', 'cloudflare.password_revealed', 'Cloudflare job password revealed by operator', record.id);
+        return json(res, 200, { password });
+      }
+
+      const retryCloudflareItem = routeMatch(pathname, '/api/cloudflare/items/:id/retry');
+      if (req.method === 'POST' && retryCloudflareItem) {
+        if (!cloudflareStore) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        if (cloudflareOrchestrator?.circuitState().open) return json(res, 409, { error: 'Reset the Cloudflare circuit before retrying' });
+        const item = cloudflareStore.retryItem(retryCloudflareItem.id);
+        store.audit('info', 'cloudflare.item_retry', `Cloudflare item retry requested for ${item.email}`, item.job_id, item.id);
+        return json(res, 200, { item });
+      }
+
+      const reconcileCloudflareItem = routeMatch(pathname, '/api/cloudflare/items/:id/reconcile');
+      if (req.method === 'POST' && reconcileCloudflareItem) {
+        if (!cloudflareStore) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        if (cloudflareOrchestrator?.circuitState().open) return json(res, 409, { error: 'Reset the Cloudflare circuit before reconciling' });
+        const item = cloudflareStore.reconcileItem(reconcileCloudflareItem.id);
+        store.audit('warn', 'cloudflare.item_reconcile', `Cloudflare item reconciliation requested for ${item.email}`, item.job_id, item.id);
+        return json(res, 202, { item });
+      }
+
+      const focusCloudflareItem = routeMatch(pathname, '/api/cloudflare/items/:id/focus');
+      if (req.method === 'POST' && focusCloudflareItem) {
+        const item = cloudflareStore?.getItem(focusCloudflareItem.id);
+        if (!item) return json(res, 404, { error: 'Cloudflare item not found' });
+        if (!runnerManager?.requestCommand('focus', item.id)) return json(res, 409, { error: 'Cloudflare runner is offline' });
+        return json(res, 202, { accepted: true });
+      }
+
+      const resendConfirmedItem = routeMatch(pathname, '/api/cloudflare/items/:id/resend-confirmed');
+      if (req.method === 'POST' && resendConfirmedItem) {
+        const item = cloudflareStore?.getItem(resendConfirmedItem.id);
+        if (!item) return json(res, 404, { error: 'Cloudflare item not found' });
+        if (item.status !== 'needs_action' || item.last_error_code !== 'verification_pending' || !item.leased_runner_id) {
+          return json(res, 409, { error: 'This item is not waiting for manual verification resend confirmation' });
+        }
+        if (!runnerManager?.requestCommand('resend-confirmed', item.id)) {
+          return json(res, 409, { error: 'Cloudflare runner is offline' });
+        }
+        store.audit('info', 'cloudflare.verification_resend_confirmed', `Operator confirmed manual verification resend for ${item.email}`, item.job_id, item.id);
+        return json(res, 202, { accepted: true });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/cloudflare/accounts') {
+        if (!cloudflareStore) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        const limit = boundedInt(url.searchParams.get('limit'), 50, 1, 100);
+        const offset = boundedInt(url.searchParams.get('offset'), 0, 0, 100000000);
+        const search = String(url.searchParams.get('search') || '').slice(0, 100);
+        return json(res, 200, {
+          total: cloudflareStore.countAccounts(search),
+          items: cloudflareStore.listAccounts(limit, offset, search),
+        });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/cloudflare/eligible-mailboxes') {
+        if (!cloudflareStore) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        const limit = boundedInt(url.searchParams.get('limit'), 100, 1, 100);
+        const search = String(url.searchParams.get('search') || '').slice(0, 100);
+        return json(res, 200, { items: cloudflareStore.listEligibleMailboxes(limit, search) });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/cloudflare/accounts/export-sensitive') {
+        if (!cloudflareStore || !vault?.openCloudflareSecret) return json(res, 503, { error: 'Cloudflare vault is unavailable' });
+        const body = await readJson(req, 8192);
+        if (body.confirm !== 'EXPORT CLOUDFLARE') return json(res, 400, { error: 'Sensitive export requires confirm="EXPORT CLOUDFLARE"' });
+        const search = String(body.search || '').slice(0, 100);
+        const total = cloudflareStore.countAccounts(search);
+        if (total > config.exportMaxRows) return json(res, 409, { error: `Export is limited to ${config.exportMaxRows} rows` });
+        const items = cloudflareStore.listAccounts(total || 1, 0, search).map((account) => {
+          const record = cloudflareStore.getAccountPasswordRecord(account.id);
+          return {
+            ...account,
+            password: vault.openCloudflareSecret(record.password_ciphertext, { purpose: 'cloudflare-job-password', id: record.job_id }),
+          };
+        });
+        store.audit('warn', 'cloudflare.sensitive_export', `Exported ${items.length} Cloudflare credential row(s)`);
+        return text(res, 200, cloudflareAccountsCsv(items), 'text/csv; charset=utf-8', {
+          'cache-control': 'no-store',
+          'content-disposition': `attachment; filename="cloudflare-accounts-${new Date().toISOString().slice(0, 10)}.csv"`,
+        });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/cloudflare/runners/pairing') {
+        if (!runnerManager) return json(res, 503, { error: 'Cloudflare runner manager is unavailable' });
+        return json(res, 201, runnerManager.issuePairing());
+      }
+
+      if (req.method === 'POST' && pathname === '/api/cloudflare/runners/revoke') {
+        if (!runnerManager) return json(res, 503, { error: 'Cloudflare runner manager is unavailable' });
+        runnerManager.revoke();
+        return json(res, 200, runnerManager.status());
+      }
+
+      const artifactMatch = routeMatch(pathname, '/api/cloudflare/items/:id/artifact');
+      if (req.method === 'POST' && artifactMatch) {
+        if (!cloudflareStore || !cloudflareArtifactStore) return json(res, 503, { error: 'Cloudflare artifact store is unavailable' });
+        const body = await readJson(req, 4096);
+        if (body.confirm !== 'VIEW') return json(res, 400, { error: 'Viewing a sensitive screenshot requires confirm="VIEW"' });
+        const record = cloudflareStore.getArtifactRecord(artifactMatch.id);
+        if (!record?.artifact_name) return json(res, 404, { error: 'Cloudflare failure screenshot is unavailable' });
+        store.audit('warn', 'cloudflare.artifact_viewed', 'Cloudflare failure screenshot viewed by operator', null, record.id);
+        return send(res, 200, cloudflareArtifactStore.read(record.artifact_name), 'image/png', { 'cache-control': 'no-store' });
+      }
+
+      if (req.method === 'POST' && pathname === '/api/cloudflare/circuit/reset') {
+        if (!cloudflareOrchestrator) return json(res, 503, { error: 'Cloudflare module is unavailable' });
+        cloudflareOrchestrator.resetCircuit();
+        return json(res, 200, cloudflareOrchestrator.circuitState());
       }
 
       if (req.method === 'GET' && pathname === '/api/jobs') {
@@ -431,9 +705,15 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         const limit = boundedInt(url.searchParams.get('limit'), 50, 1, 500);
         const offset = boundedInt(url.searchParams.get('offset'), 0, 0, 100000000);
         const search = String(url.searchParams.get('search') || '').slice(0, 100);
+        const items = store.listMailboxes(limit, offset, search);
+        const eligibility = cloudflareStore?.eligibleMailboxMap(items.map((item) => item.id)) || new Map();
         return json(res, 200, {
           total: store.countMailboxes(search),
-          items: store.listMailboxes(limit, offset, search),
+          items: items.map((item) => ({
+            ...item,
+            cloudflare_eligible: eligibility.get(item.id)?.cloudflare_eligible ?? 1,
+            cloudflare_status: eligibility.get(item.id)?.cloudflare_status || null,
+          })),
         });
       }
 
@@ -629,7 +909,7 @@ export function createServer({ store, worker, config, backupManager = null, vaul
       const safeMessage = error?.expose === true || status < 500
         ? redactSecrets(String(error?.message || 'Request failed')).slice(0, 1000)
         : 'Internal server error';
-      return json(res, status, { error: safeMessage });
+      return json(res, status, { error: safeMessage, ...(error?.code ? { code: String(error.code).slice(0, 80) } : {}) });
     }
   });
 }

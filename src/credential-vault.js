@@ -7,6 +7,7 @@ import { safeJsonParse } from './utils.js';
 const ENVELOPE_VERSION = 1;
 const KEY_BYTES = 32;
 const USERNAME_RE = /^[a-z0-9]{5,21}$/;
+const PURPOSE_RE = /^cloudflare-(?:job-password|verification-url|browser-state|artifact)$/;
 
 function chmodQuiet(target, mode) {
   try { fs.chmodSync(target, mode); } catch {}
@@ -164,6 +165,34 @@ export class CredentialVault {
       purpose: 'job-destination-password',
       aad: `job:${String(jobId)}`,
     }).toString('utf8');
+  }
+
+  sealCloudflareSecret(value, { purpose, id }) {
+    const safePurpose = String(purpose || '');
+    const safeId = String(id || '');
+    if (!PURPOSE_RE.test(safePurpose) || !safeId || safeId.length > 160) {
+      throw new Error('Invalid Cloudflare secret scope');
+    }
+    const plaintext = Buffer.isBuffer(value) ? value : Buffer.from(String(value ?? ''), 'utf8');
+    if (!plaintext.length) throw new Error('Cloudflare secret cannot be empty');
+    return this.encryptBuffer(plaintext, {
+      purpose: safePurpose,
+      aad: `cloudflare:${safeId}`,
+    }).toString('base64');
+  }
+
+  openCloudflareSecret(ciphertext, { purpose, id, asBuffer = false }) {
+    const safePurpose = String(purpose || '');
+    const safeId = String(id || '');
+    if (!PURPOSE_RE.test(safePurpose) || !safeId || safeId.length > 160) {
+      throw new Error('Invalid Cloudflare secret scope');
+    }
+    if (typeof ciphertext !== 'string' || !ciphertext) throw new Error('Cloudflare secret is not configured');
+    const plain = this.decryptBuffer(Buffer.from(ciphertext, 'base64'), {
+      purpose: safePurpose,
+      aad: `cloudflare:${safeId}`,
+    });
+    return asBuffer ? plain : plain.toString('utf8');
   }
 
   vaultDir(username) {

@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { resolveProviderInvocation } from './provider.js';
 import { redactSecrets } from './utils.js';
+import { selectCloudflareVerification } from './cloudflare-verification.js';
 
 const DEFAULT_OUTPUT_LIMIT = 4 * 1024 * 1024;
 const EMAIL_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
@@ -555,6 +556,42 @@ export class AtomicMailJmapClient {
 
   async listInbox(username, options = {}) {
     return this.listMailbox(username, { ...options, folder: 'inbox' });
+  }
+
+  async findCloudflareVerification(username, { recipient, submittedAt, signal = null } = {}) {
+    const afterMs = Date.parse(submittedAt || '');
+    if (!Number.isFinite(afterMs)) {
+      throw new MailClientError('Cloudflare submission timestamp is invalid', { statusCode: 400, code: 'invalid_verification_window' });
+    }
+    const ops = {
+      using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
+      methodCalls: [
+        ['Email/query', {
+          accountId: '$ACCOUNT_ID',
+          filter: {
+            inMailbox: '$INBOX_MAILBOX_ID',
+            after: new Date(afterMs).toISOString(),
+          },
+          sort: [{ property: 'receivedAt', isAscending: false }],
+          limit: 20,
+        }, 'cfq0'],
+        ['Email/get', {
+          accountId: '$ACCOUNT_ID',
+          '#ids': { resultOf: 'cfq0', name: 'Email/query', path: '/ids' },
+          properties: [
+            'id', 'receivedAt', 'from', 'to', 'cc', 'subject', 'preview',
+            'textBody', 'htmlBody', 'bodyValues',
+          ],
+          fetchTextBodyValues: true,
+          fetchHTMLBodyValues: true,
+          maxBodyValueBytes: Math.min(Number(this.config.mailMaxBodyBytes || 524288), 262144),
+        }, 'cfg0'],
+      ],
+    };
+    const result = await this.request(username, { ops, signal });
+    const payload = methodResponse(result, 'Email/get', 'cfg0') || {};
+    const messages = Array.isArray(payload.list) ? payload.list.map(normalizedMessage) : [];
+    return selectCloudflareVerification(messages, { recipient, submittedAt });
   }
 
   async getMessage(username, messageId, { signal = null } = {}) {
