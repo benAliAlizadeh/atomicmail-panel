@@ -179,12 +179,32 @@ export class CredentialVault {
     return fs.existsSync(this.credentialsPath(username));
   }
 
-  validateCredentials(username, credentials) {
+  credentialIdentity(username, credentials) {
     const clean = safeUsername(username);
-    const inboxId = typeof credentials?.inboxId === 'string' ? credentials.inboxId : '';
-    const local = inboxId.includes('@') ? inboxId.split('@', 1)[0].toLowerCase() : '';
+    const inboxId = typeof credentials?.inboxId === 'string' ? credentials.inboxId.trim() : '';
     const apiKey = typeof credentials?.apiKey === 'string' ? credentials.apiKey.trim() : '';
-    return Boolean(inboxId && local === clean && apiKey);
+    if (!inboxId || !apiKey) return null;
+
+    // AgentSkill currently persists inboxId as the local inbox identifier
+    // (for example "alice123"), while older fixtures/documentation may
+    // represent it as the full address ("alice123@atomicmail.ai"). Accept
+    // both official shapes, but always expose a canonical email address to
+    // the panel.
+    let local = inboxId.toLowerCase();
+    let email = `${clean}@atomicmail.ai`;
+    if (inboxId.includes('@')) {
+      const parts = inboxId.toLowerCase().split('@');
+      if (parts.length !== 2 || parts[1] !== 'atomicmail.ai') return null;
+      [local] = parts;
+      email = `${local}@atomicmail.ai`;
+    }
+
+    if (local !== clean) return null;
+    return { inboxId, email };
+  }
+
+  validateCredentials(username, credentials) {
+    return Boolean(this.credentialIdentity(username, credentials));
   }
 
   writeEncryptedFile(username, relative, plainBuffer) {

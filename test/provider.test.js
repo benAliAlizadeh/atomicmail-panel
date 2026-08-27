@@ -57,7 +57,7 @@ test('provider reuses matching encrypted credentials after a crash instead of re
   const dir = path.join(vaultConfig.credentialsRoot, username);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({
-    inboxId: `${username}@atomicmail.ai`,
+    inboxId: username,
     apiKey: 'am_test_secret',
   }));
   vault.migrateLegacyCredentials();
@@ -76,6 +76,7 @@ test('provider reuses matching encrypted credentials after a crash instead of re
 
   const mailbox = await provider.register(username);
   assert.equal(mailbox.email, `${username}@atomicmail.ai`);
+  assert.equal(mailbox.inboxId, username);
   assert.equal(mailbox.credentialsPath, path.join(dir, 'credentials.json.enc'));
 
   fs.rmSync(root, { recursive: true, force: true });
@@ -149,7 +150,7 @@ test('provider reports operator-safe progress when reusing encrypted crash-safe 
   const username = 'progress111';
   const { vault, config: vaultConfig } = makeVault(root);
   vault.writeEncryptedFile(username, 'credentials.json', Buffer.from(JSON.stringify({
-    inboxId: `${username}@atomicmail.ai`,
+    inboxId: username,
     apiKey: 'am_test_secret',
   })));
   const events = [];

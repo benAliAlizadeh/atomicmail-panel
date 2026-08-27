@@ -65,6 +65,32 @@ test('legacy plaintext credentials are authenticated, encrypted, and removed fro
   }
 });
 
+
+test('real AgentSkill local inboxId format migrates safely and resolves to an Atomic Mail address', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-vault-local-inbox-'));
+  try {
+    const config = makeConfig(root);
+    const vault = new CredentialVault(config);
+    vault.initialize();
+    const username = 'localid1111';
+    const dir = path.join(config.credentialsRoot, username);
+    fs.mkdirSync(dir, { recursive: true });
+    const plainPath = path.join(dir, 'credentials.json');
+    fs.writeFileSync(plainPath, JSON.stringify({ inboxId: username, apiKey: 'real-shape-secret' }));
+
+    const migrated = vault.migrateLegacyCredentials();
+    assert.equal(migrated.migratedMailboxes, 1);
+    assert.equal(fs.existsSync(plainPath), false);
+    assert.equal(vault.validateCredentials(username, vault.readCredentials(username)), true);
+    assert.deepEqual(vault.credentialIdentity(username, vault.readCredentials(username)), {
+      inboxId: username,
+      email: `${username}@atomicmail.ai`,
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('wrong encryption key cannot decrypt credential vault', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-vault-key-'));
   try {

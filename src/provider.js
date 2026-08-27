@@ -187,11 +187,11 @@ export class AtomicMailProvider {
         raw: 'Credential vault mismatch; refusing to overwrite provider credentials',
       });
     }
-    const inboxId = existing.inboxId;
+    const identity = this.vault.credentialIdentity(username, existing);
     return {
       username,
-      email: inboxId,
-      inboxId,
+      email: identity.email,
+      inboxId: identity.inboxId,
       credentialsPath: this.vault.credentialsPath(username),
     };
   }
@@ -305,12 +305,12 @@ export class AtomicMailProvider {
     }
 
     const credentials = sealed.credentials;
-    const inboxId = credentials.inboxId;
+    const identity = this.vault.credentialIdentity(username, credentials);
     emitProgress(onProgress, 'finalizing', 'Credentials encrypted and validated; saving mailbox in the panel');
     return {
       username,
-      email: inboxId,
-      inboxId,
+      email: identity.email,
+      inboxId: identity.inboxId,
       credentialsPath: sealed.credentialsPath,
     };
   }
