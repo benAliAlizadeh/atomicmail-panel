@@ -283,7 +283,8 @@ export class BackupManager {
     if (this.busyPromise) {
       try { await this.busyPromise; } catch {}
     }
-    if (finalBackup && this.store && this.store.countMailboxes() > 0) return this.createBackup('shutdown');
+    const hasData = this.store?.hasBackupData?.() ?? (this.store?.countMailboxes?.() > 0);
+    if (finalBackup && this.store && hasData) return this.createBackup('shutdown');
     return null;
   }
 

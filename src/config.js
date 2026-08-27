@@ -93,9 +93,15 @@ export function loadConfig() {
 
     mailCommandTimeoutMs: intEnv('MAIL_COMMAND_TIMEOUT_MS', 60000, 10000, 300000),
     mailInboxLimit: intEnv('MAIL_INBOX_LIMIT', 50, 1, 100),
+    mailAutoRefreshSeconds: intEnv('MAIL_AUTO_REFRESH_SECONDS', 45, 30, 300),
     mailMaxBodyBytes: intEnv('MAIL_MAX_BODY_BYTES', 524288, 16384, 2097152),
     mailMaxComposeBytes: intEnv('MAIL_MAX_COMPOSE_BYTES', 204800, 1024, 1048576),
     mailMaxSubjectBytes: intEnv('MAIL_MAX_SUBJECT_BYTES', 2048, 64, 16384),
+    mailMaxSearchBytes: intEnv('MAIL_MAX_SEARCH_BYTES', 256, 16, 2048),
+    mailMaxAttachmentCount: intEnv('MAIL_MAX_ATTACHMENT_COUNT', 5, 1, 20),
+    mailMaxAttachmentBytes: intEnv('MAIL_MAX_ATTACHMENT_BYTES', 5242880, 1024, 26214400),
+    mailMaxTotalAttachmentBytes: intEnv('MAIL_MAX_TOTAL_ATTACHMENT_BYTES', 10485760, 1024, 52428800),
+    destinationPasswordMaxBytes: intEnv('DESTINATION_PASSWORD_MAX_BYTES', 1024, 32, 8192),
 
     adminUsername: process.env.ADMIN_USERNAME || 'admin',
     adminPassword,

@@ -26,12 +26,12 @@
 | AM-22 | Inbox | ✅ Done — on-demand list/refresh, sender/subject/preview/unread/attachment flag |
 | AM-23 | Read Message | ✅ Done — safe plain-text body + HTTP/HTTPS links; raw HTML not rendered |
 | AM-24 | Send / Reply | ✅ Done — Compose/Send + Reply via JMAP submission |
-| AM-25 | Sent + Mail Actions | ⬜ Next |
-| AM-26 | Live Inbox | ⬜ Planned |
-| AM-27 | Search / Pagination | ⬜ Planned |
-| AM-28 | Attachments | ⬜ Planned |
-| AM-29 | Verification Helper | ⬜ Planned |
-| AM-30 | Mail Security hardening | ⬜ Planned |
-| AM-31 | Per-job destination account password vault | ⬜ Planned |
-| AM-32 | Webmail/password backup integration | ⬜ Planned |
-| AM-33 | Full mail regression / production validation | ⬜ Planned |
+| AM-25 | Sent + Mail Actions | ✅ Done — Inbox/Sent, read/unread, Archive, Trash, Refresh and Reply |
+| AM-26 | Live Inbox | ✅ Done — loading/error/retry state, last sync, unread count and active-mailbox-only auto-refresh |
+| AM-27 | Search / Pagination | ✅ Done — provider-side subject/sender/recipient filters and position pagination |
+| AM-28 | Attachments | ✅ Done — guarded JMAP upload/download for Compose and Reply |
+| AM-29 | Verification Helper | ✅ Done — heuristic OTP and safe HTTP/HTTPS verification-link controls |
+| AM-30 | Mail Security hardening | ✅ Done — plain-text rendering, limits, CRLF rejection, secret redaction and safe downloads |
+| AM-31 | Per-job destination account password vault | ✅ Done — job-bound AES-256-GCM, protected reveal/copy and explicit sensitive CSV |
+| AM-32 | Webmail/password backup integration | ✅ Done — additive migration and verified portable restore coverage |
+| AM-33 | Full mail regression / production validation | ✅ Done — 50 automated mail/security/backup/restart/migration regressions plus read-only live Inbox/Sent smoke |

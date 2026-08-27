@@ -82,6 +82,10 @@
             <form id="createForm" class="form-stack">
               <label>Number of emails<input id="batchCount" type="number" min="1" value="5" required /></label>
               <label>Optional prefix<input id="batchPrefix" type="text" maxlength="12" placeholder="e.g. lab" autocomplete="off" /></label>
+              <label>Destination account password
+                <span class="password-input-row"><input id="destinationPassword" type="password" maxlength="1024" autocomplete="new-password" placeholder="Shared by this batch (optional)" /><button id="toggleDestinationPassword" class="btn ghost small-btn" type="button">Show</button></span>
+                <small class="muted">Encrypted at rest. This is for accounts you create at destination services; it is not an Atomic Mail password.</small>
+              </label>
               <div><span class="label-text">Preview</span><div id="namePreview" class="chips"></div><small class="muted">Preview only. Final names are reserved server-side when the job is created.</small></div>
               <div class="auth-model-note">
                 <strong>Agent mailbox authentication</strong>
@@ -116,6 +120,10 @@
           <div class="panel-head"><div><h2 id="jobDetailTitle">Job</h2><p id="jobDetailMeta" class="muted"></p></div><div id="jobActions" class="button-row"></div></div>
           <div class="progress-track large"><div id="jobDetailProgress" class="progress-bar"></div></div>
           <div id="jobDetailNumbers" class="progress-numbers"></div>
+          <div id="jobPasswordPanel" class="secret-panel" hidden>
+            <div><strong>Destination account password</strong><span id="jobPasswordValue" class="mono">************</span></div>
+            <div class="button-row"><button id="revealJobPassword" class="btn ghost small-btn" type="button">Reveal</button><button id="copyJobPassword" class="btn ghost small-btn" type="button" disabled>Copy</button><button id="hideJobPassword" class="btn ghost small-btn" type="button" hidden>Hide</button></div>
+          </div>
           <div id="jobLiveStatus" class="live-status" hidden></div>
           <p id="jobDetailError" class="form-error" hidden></p>
           <div class="table-wrap compact"><table><thead><tr><th>#</th><th>Username</th><th>Status</th><th>Phase</th><th>Elapsed</th><th>Attempts</th><th>Last error</th></tr></thead><tbody id="jobItemsBody"></tbody></table></div>
@@ -126,7 +134,7 @@
         <div class="panel table-panel">
           <div class="panel-head mailbox-head">
             <div><h2>Mailboxes</h2><p id="mailboxCountText" class="muted">Stored inboxes</p></div>
-            <div class="button-row"><button id="exportCsv" class="btn ghost small-btn">Export CSV</button><button id="exportJson" class="btn ghost small-btn">Export JSON</button></div>
+            <div class="button-row"><button id="exportCsv" class="btn ghost small-btn">Export CSV</button><button id="exportJson" class="btn ghost small-btn">Export JSON</button><button id="exportSensitiveCsv" class="btn danger-btn small-btn" title="Explicitly exports destination passwords">Export email + password</button></div>
           </div>
           <form id="mailboxSearchForm" class="search-row"><input id="mailboxSearch" type="search" placeholder="Search email or username" autocomplete="off" /><button class="btn ghost small-btn" type="submit">Search</button><button id="clearMailboxSearch" class="btn ghost small-btn" type="button">Clear</button></form>
           <div class="table-wrap"><table><thead><tr><th>Email</th><th>Status</th><th>Access</th><th>Created</th><th>Job</th><th></th></tr></thead><tbody id="mailboxesBody"></tbody></table></div>
@@ -150,10 +158,17 @@
         <div id="mailError" class="banner danger" hidden></div>
         <div class="webmail-grid">
           <article class="panel mail-list-panel">
-            <div class="panel-head"><div><h2>Inbox</h2><p id="inboxCountText" class="muted">Latest messages</p></div></div>
+            <div class="mail-tabs" role="tablist"><button class="mail-tab active" type="button" data-mail-folder="inbox">Inbox <span id="inboxUnreadBadge"></span></button><button class="mail-tab" type="button" data-mail-folder="sent">Sent</button></div>
+            <form id="mailSearchForm" class="mail-search-row">
+              <select id="mailSearchField" aria-label="Search field"><option value="subject">Subject</option><option value="from">Sender</option><option value="to">Recipient</option></select>
+              <input id="mailSearch" type="search" maxlength="256" placeholder="Search this folder" autocomplete="off" />
+              <button class="btn ghost small-btn" type="submit">Search</button><button id="clearMailSearch" class="btn ghost small-btn" type="button">Clear</button>
+            </form>
+            <div class="panel-head mail-list-heading"><div><h2 id="mailFolderTitle">Inbox</h2><p id="inboxCountText" class="muted">Latest messages</p></div><label class="page-size-label">Per page<select id="mailPageSize"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label></div>
             <div id="inboxLoading" class="mail-loading" hidden><span class="activity-dot"></span><span>Loading inbox from Atomic Mail…</span></div>
             <div id="inboxEmpty" class="empty" hidden>No messages in this inbox yet.</div>
             <div id="inboxList" class="mail-list"></div>
+            <div class="mail-pagination"><button id="mailPrev" class="btn ghost small-btn" type="button">Previous</button><span id="mailPageText" class="muted">Page 1</span><button id="mailNext" class="btn ghost small-btn" type="button">Next</button></div>
           </article>
           <article class="panel message-panel">
             <div id="messageEmpty" class="empty">Select an email to read it.</div>
@@ -164,9 +179,12 @@
                   <h2 id="messageSubject">Message</h2>
                   <div id="messageMeta" class="message-meta"></div>
                 </div>
-                <button id="replyMail" class="btn ghost small-btn" type="button">Reply</button>
+                <div class="message-actions"><button id="replyMail" class="btn ghost small-btn" type="button">Reply</button><button id="toggleReadMail" class="btn ghost small-btn" type="button">Mark read</button><button id="archiveMail" class="btn ghost small-btn" type="button">Archive</button><button id="trashMail" class="btn danger-btn small-btn" type="button">Move to trash</button></div>
               </div>
               <div id="messageBody" class="message-body"></div>
+              <div id="verificationCodes" class="message-helper" hidden></div>
+              <div id="verificationLinks" class="message-helper" hidden></div>
+              <div id="messageAttachments" class="message-helper" hidden></div>
               <div id="messageLinks" class="message-links" hidden></div>
               <p id="messageTruncated" class="muted warning-note" hidden>This message body was truncated by the safety limit.</p>
             </div>
@@ -210,6 +228,7 @@
       <label id="composeToRow">To<input id="composeTo" type="email" maxlength="320" autocomplete="off" required /></label>
       <label id="composeSubjectRow">Subject<input id="composeSubject" type="text" maxlength="500" autocomplete="off" /></label>
       <label>Message<textarea id="composeBody" rows="10" maxlength="200000" required></textarea></label>
+      <label>Attachments<input id="composeAttachments" type="file" multiple /><small id="attachmentLimits" class="muted"></small></label>
       <p id="composeError" class="form-error" hidden></p>
       <div class="compose-actions"><button id="cancelCompose" class="btn ghost" type="button">Cancel</button><button id="sendCompose" class="btn primary" type="submit">Send</button></div>
     </form>

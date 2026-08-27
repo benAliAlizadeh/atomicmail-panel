@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdminAuth } from './auth.js';
 import { generateUniqueUsernames, normalizePrefix } from './username-generator.js';
-import { redactSecrets } from './utils.js';
+import { newId, redactSecrets } from './utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(__dirname, '../public');
@@ -99,6 +99,100 @@ function mailboxesCsv(items) {
   return `${rows.join('\r\n')}\r\n`;
 }
 
+function sensitiveMailboxesCsv(items) {
+  const rows = [['Email', 'DestinationPassword'].map(csvCell).join(',')];
+  for (const item of items) rows.push([item.email, item.destinationPassword].map(csvCell).join(','));
+  return `${rows.join('\r\n')}\r\n`;
+}
+
+function contentDispositionFilename(filename) {
+  const clean = path.basename(String(filename || 'attachment.bin'))
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/["\\/]/g, '_')
+    .trim()
+    .slice(0, 180) || 'attachment.bin';
+  const ascii = clean.replace(/[^\x20-\x7e]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(clean)}`;
+}
+
+function assertDestinationPassword(value, config) {
+  const password = String(value ?? '');
+  if (!password) return '';
+  const maximum = Number(config.destinationPasswordMaxBytes || 1024);
+  if (Buffer.byteLength(password, 'utf8') > maximum) {
+    throw Object.assign(new Error('Destination password is too large'), { statusCode: 413, expose: true });
+  }
+  return password;
+}
+
+function decodeBase64(value) {
+  const encoded = String(value || '');
+  if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 !== 0) {
+    throw Object.assign(new Error('Attachment data is invalid'), { statusCode: 400, expose: true });
+  }
+  return Buffer.from(encoded, 'base64');
+}
+
+function parseAttachments(value, config) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw Object.assign(new Error('attachments must be an array'), { statusCode: 400, expose: true });
+  const maxCount = Number(config.mailMaxAttachmentCount || 5);
+  const maxEach = Number(config.mailMaxAttachmentBytes || 5242880);
+  const maxTotal = Number(config.mailMaxTotalAttachmentBytes || 10485760);
+  if (value.length > maxCount) {
+    throw Object.assign(new Error(`A maximum of ${maxCount} attachments is allowed`), { statusCode: 413, expose: true });
+  }
+  let total = 0;
+  return value.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw Object.assign(new Error('Attachment metadata is invalid'), { statusCode: 400, expose: true });
+    }
+    const name = path.basename(String(item.name || `attachment-${index + 1}.bin`))
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .replace(/[<>:"/\\|?*]/g, '_')
+      .trim()
+      .slice(0, 180) || `attachment-${index + 1}.bin`;
+    const type = String(item.type || 'application/octet-stream').replace(/[\r\n]/g, '').slice(0, 255);
+    if (!/^[\w!#$&^_.+\-]+\/[\w!#$&^_.+\-]+(?:;[\x20-\x7e]+)?$/.test(type)) {
+      throw Object.assign(new Error(`Attachment ${index + 1} has an invalid MIME type`), { statusCode: 400, expose: true });
+    }
+    const data = decodeBase64(item.data);
+    if (data.length > maxEach) {
+      throw Object.assign(new Error(`Attachment ${index + 1} exceeds the ${maxEach}-byte limit`), { statusCode: 413, expose: true });
+    }
+    total += data.length;
+    if (total > maxTotal) {
+      throw Object.assign(new Error(`Attachments exceed the ${maxTotal}-byte total limit`), { statusCode: 413, expose: true });
+    }
+    return { name, type, data };
+  });
+}
+
+function composeRequestLimit(config) {
+  const attachments = Number(config.mailMaxTotalAttachmentBytes || 10485760);
+  const compose = Number(config.mailMaxComposeBytes || 204800);
+  return Math.max(262144, Math.ceil(attachments * 4 / 3) + compose + 262144);
+}
+
+function mailErrorPayload(error, status) {
+  const detail = redactSecrets(String(error?.message || '')).slice(0, 1000);
+  if (status < 500 && !String(error?.code || '').startsWith('mail_') && error?.code !== 'jmap_method_error') {
+    return { error: detail || 'Request failed', code: error?.code || undefined };
+  }
+  const summaries = {
+    mail_timeout: 'The mail provider timed out',
+    jmap_method_error: 'The mail provider rejected this operation',
+    mailbox_unavailable: 'This mail folder is unavailable',
+    attachment_not_found: 'Attachment was not found',
+    attachment_too_large: 'Attachment exceeds the safety limit',
+  };
+  return {
+    error: summaries[error?.code] || (status >= 500 ? 'Unable to complete the mail operation' : 'Mail operation failed'),
+    code: error?.code || 'mail_provider_error',
+    ...(detail ? { detail } : {}),
+  };
+}
+
 function exportFilename(extension) {
   const stamp = new Date().toISOString().replaceAll(':', '-').replace(/\.\d{3}Z$/, 'Z');
   return `atomicmail-mailboxes-${stamp}.${extension}`;
@@ -189,6 +283,14 @@ export function createServer({ store, worker, config, backupManager = null, vaul
             registerTimeoutMs: config.registerTimeoutMs,
             postSuccessDelayMs: config.postSuccessDelayMs,
           },
+          mail: {
+            autoRefreshSeconds: Number(config.mailAutoRefreshSeconds || 45),
+            pageSize: Number(config.mailInboxLimit || 50),
+            maxComposeBytes: Number(config.mailMaxComposeBytes || 204800),
+            maxAttachmentCount: Number(config.mailMaxAttachmentCount || 5),
+            maxAttachmentBytes: Number(config.mailMaxAttachmentBytes || 5242880),
+            maxTotalAttachmentBytes: Number(config.mailMaxTotalAttachmentBytes || 10485760),
+          },
         });
       }
 
@@ -217,13 +319,33 @@ export function createServer({ store, worker, config, backupManager = null, vaul
           return json(res, 400, { error: `count must be an integer between 1 and ${config.maxBatchSize}` });
         }
         const prefix = normalizePrefix(body.prefix || '');
+        const destinationPassword = assertDestinationPassword(body.destinationPassword, config);
+        if (destinationPassword && !vault?.sealJobPassword) {
+          return json(res, 503, { error: 'Encrypted destination-password vault is unavailable' });
+        }
         const usernames = generateUniqueUsernames(
           count,
           (username) => store.isUsernameTaken(username),
           { prefix, minLength: config.usernameMinLength, maxLength: config.usernameMaxLength },
         );
-        const job = store.createJob({ count, prefix, usernames });
+        const id = newId('job');
+        const destinationPasswordCiphertext = destinationPassword
+          ? vault.sealJobPassword(destinationPassword, id)
+          : null;
+        const job = store.createJob({ id, count, prefix, usernames, destinationPasswordCiphertext });
+        if (destinationPasswordCiphertext) backupManager?.requestBackup?.('job-password-created');
         return json(res, 201, job);
+      }
+
+      const revealJobPassword = routeMatch(pathname, '/api/jobs/:id/destination-password');
+      if (req.method === 'POST' && revealJobPassword) {
+        if (!vault?.openJobPassword) return json(res, 503, { error: 'Encrypted destination-password vault is unavailable' });
+        const record = store.getJobPasswordCiphertext(revealJobPassword.id);
+        if (!record) return json(res, 404, { error: 'Job not found' });
+        if (!record.destination_password_ciphertext) return json(res, 404, { error: 'Destination password is not configured for this job' });
+        const password = vault.openJobPassword(record.destination_password_ciphertext, record.id);
+        store.audit('info', 'job.destination_password_revealed', 'Destination password revealed by operator', record.id);
+        return json(res, 200, { password });
       }
 
       for (const action of ['pause', 'resume', 'cancel']) {
@@ -268,6 +390,31 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         });
       }
 
+      if (req.method === 'POST' && pathname === '/api/mailboxes/export-sensitive') {
+        if (!vault?.openJobPassword) return json(res, 503, { error: 'Encrypted destination-password vault is unavailable' });
+        const body = await readJson(req, 8192);
+        if (body.confirm !== 'EXPORT') return json(res, 400, { error: 'Sensitive export requires confirm="EXPORT"' });
+        const search = String(body.search || '').slice(0, 100);
+        const total = store.countMailboxes(search);
+        if (total > config.exportMaxRows) {
+          return json(res, 409, { error: `Export is limited to ${config.exportMaxRows} rows. Narrow the search first.` });
+        }
+        const items = store.exportMailboxes(search, config.exportMaxRows).map((mailbox) => {
+          const record = store.getMailboxPasswordCiphertext(mailbox.id);
+          return {
+            email: mailbox.email,
+            destinationPassword: record?.destination_password_ciphertext
+              ? vault.openJobPassword(record.destination_password_ciphertext, record.job_id)
+              : '',
+          };
+        });
+        store.audit('warn', 'mailboxes.sensitive_export', `Explicit destination-password export created for ${items.length} mailbox(es)`);
+        return text(res, 200, sensitiveMailboxesCsv(items), 'text/csv; charset=utf-8', {
+          'cache-control': 'no-store',
+          'content-disposition': `attachment; filename="${exportFilename('csv').replace('.csv', '-destination-passwords.csv')}"`,
+        });
+      }
+
       if (req.method === 'GET' && pathname === '/api/mailboxes') {
         const limit = boundedInt(url.searchParams.get('limit'), 50, 1, 500);
         const offset = boundedInt(url.searchParams.get('offset'), 0, 0, 100000000);
@@ -276,6 +423,17 @@ export function createServer({ store, worker, config, backupManager = null, vaul
           total: store.countMailboxes(search),
           items: store.listMailboxes(limit, offset, search),
         });
+      }
+
+      const revealMailboxPassword = routeMatch(pathname, '/api/mailboxes/:id/destination-password');
+      if (req.method === 'POST' && revealMailboxPassword) {
+        if (!vault?.openJobPassword) return json(res, 503, { error: 'Encrypted destination-password vault is unavailable' });
+        const record = store.getMailboxPasswordCiphertext(revealMailboxPassword.id);
+        if (!record) return json(res, 404, { error: 'Mailbox not found' });
+        if (!record.destination_password_ciphertext) return json(res, 404, { error: 'Destination password is not configured for this mailbox' });
+        const password = vault.openJobPassword(record.destination_password_ciphertext, record.job_id);
+        store.audit('info', 'mailbox.destination_password_revealed', `Destination password revealed for ${record.email}`, record.job_id);
+        return json(res, 200, { password });
       }
 
       const inboxMatch = routeMatch(pathname, '/api/mailboxes/:id/inbox');
@@ -289,6 +447,24 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         return json(res, 200, { mailbox, ...inbox });
       }
 
+      const mailListMatch = routeMatch(pathname, '/api/mailboxes/:id/mail');
+      if (req.method === 'GET' && mailListMatch) {
+        if (!mailClient?.listMailbox) return json(res, 503, { error: 'Mail client is unavailable' });
+        const mailbox = store.getMailbox(mailListMatch.id);
+        if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
+        if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
+        const limit = boundedInt(url.searchParams.get('limit'), config.mailInboxLimit || 50, 1, 100);
+        const position = boundedInt(url.searchParams.get('position'), 0, 0, 100000000);
+        const folder = String(url.searchParams.get('folder') || 'inbox').toLowerCase();
+        const field = String(url.searchParams.get('field') || 'subject').toLowerCase();
+        const search = String(url.searchParams.get('search') || '');
+        if (Buffer.byteLength(search, 'utf8') > Number(config.mailMaxSearchBytes || 256)) {
+          return json(res, 413, { error: 'Search query is too large' });
+        }
+        const mail = await mailClient.listMailbox(mailbox.username, { folder, limit, position, search, field });
+        return json(res, 200, { mailbox, ...mail });
+      }
+
       const messageMatch = routeMatch(pathname, '/api/mailboxes/:id/messages/:messageId');
       if (req.method === 'GET' && messageMatch) {
         if (!mailClient) return json(res, 503, { error: 'Mail client is unavailable' });
@@ -299,17 +475,50 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         return json(res, 200, { mailbox, message });
       }
 
+      const attachmentMatch = routeMatch(pathname, '/api/mailboxes/:id/messages/:messageId/attachments/:attachmentId');
+      if (req.method === 'GET' && attachmentMatch) {
+        if (!mailClient?.downloadAttachment) return json(res, 503, { error: 'Mail client is unavailable' });
+        const mailbox = store.getMailbox(attachmentMatch.id);
+        if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
+        if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
+        const attachment = await mailClient.downloadAttachment(
+          mailbox.username,
+          attachmentMatch.messageId,
+          attachmentMatch.attachmentId,
+        );
+        return send(res, 200, attachment.data, attachment.type || 'application/octet-stream', {
+          'cache-control': 'no-store',
+          'content-disposition': contentDispositionFilename(attachment.name),
+          'content-security-policy': "default-src 'none'; sandbox",
+        });
+      }
+
+      const actionMatch = routeMatch(pathname, '/api/mailboxes/:id/messages/:messageId/actions');
+      if (req.method === 'POST' && actionMatch) {
+        if (!mailClient?.updateMessage) return json(res, 503, { error: 'Mail client is unavailable' });
+        const mailbox = store.getMailbox(actionMatch.id);
+        if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
+        if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
+        const body = await readJson(req, 4096);
+        const action = String(body.action || '');
+        const result = await mailClient.updateMessage(mailbox.username, actionMatch.messageId, action);
+        store.audit('info', `mail.${result.action}`, `Mail action ${result.action} completed for ${mailbox.email}`);
+        return json(res, 200, result);
+      }
+
       const sendMatch = routeMatch(pathname, '/api/mailboxes/:id/send');
       if (req.method === 'POST' && sendMatch) {
         if (!mailClient) return json(res, 503, { error: 'Mail client is unavailable' });
         const mailbox = store.getMailbox(sendMatch.id);
         if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
         if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
-        const body = await readJson(req, Math.max(262144, Number(config.mailMaxComposeBytes || 204800) + 8192));
+        const body = await readJson(req, composeRequestLimit(config));
+        const attachments = parseAttachments(body.attachments, config);
         const result = await mailClient.send(mailbox.username, {
           to: body.to,
           subject: body.subject,
           body: body.body,
+          attachments,
         });
         store.audit('info', 'mail.sent', `Message sent from ${mailbox.email}`);
         return json(res, 201, result);
@@ -321,8 +530,9 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         const mailbox = store.getMailbox(replyMatch.id);
         if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
         if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
-        const body = await readJson(req, Math.max(262144, Number(config.mailMaxComposeBytes || 204800) + 8192));
-        const result = await mailClient.reply(mailbox.username, replyMatch.messageId, { body: body.body });
+        const body = await readJson(req, composeRequestLimit(config));
+        const attachments = parseAttachments(body.attachments, config);
+        const result = await mailClient.reply(mailbox.username, replyMatch.messageId, { body: body.body, attachments });
         store.audit('info', 'mail.replied', `Reply sent from ${mailbox.email}`);
         return json(res, 201, result);
       }
@@ -388,6 +598,10 @@ export function createServer({ store, worker, config, backupManager = null, vaul
       return json(res, 404, { error: 'Not found' });
     } catch (error) {
       const status = Number(error?.statusCode) || 500;
+      if (error?.name === 'MailClientError') {
+        store.audit('error', 'mail.operation_failed', `Mail operation failed (${String(error.code || 'mail_provider_error').slice(0, 80)}, HTTP ${status})`);
+        return json(res, status, mailErrorPayload(error, status));
+      }
       if (status >= 500) store.audit('error', 'http.internal_error', redactSecrets(String(error?.stack || error)));
       const safeMessage = error?.expose === true || status < 500
         ? redactSecrets(String(error?.message || 'Request failed')).slice(0, 1000)
