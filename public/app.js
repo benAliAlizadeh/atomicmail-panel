@@ -33,6 +33,7 @@ const state = {
   mailSearchField: 'subject',
   mailRefreshBusy: false,
   mailAutoTimer: null,
+  mailRateRetryTimer: null,
   selectedMessageId: null,
   messageLoadingId: null,
   mailActionBusy: false,
@@ -657,7 +658,7 @@ async function loadMailboxes({ background = false } = {}) {
 
 function updateCloudflareSelectionUi() {
   const count = state.selectedCloudflareMailboxIds.size;
-  $('#createCloudflareSelection').textContent = `Create Cloudflare job (${count})`;
+  $('#createCloudflareSelection').textContent = `Start Cloudflare batch (${count})`;
   $('#createCloudflareSelection').disabled = count < 1;
   $('#clearCloudflareSelection').disabled = count < 1;
   const eligible = state.mailboxItems.filter((item) => item.cloudflare_eligible);
@@ -697,19 +698,24 @@ async function selectFirstFilteredMailboxes(button) {
 function openCloudflareJobModal() {
   const count = state.selectedCloudflareMailboxIds.size;
   if (!count) return;
-  $('#cloudflareSelectionSummary').textContent = `${count} independent Cloudflare login${count === 1 ? '' : 's'} will be queued. Every signup Submit stays manual.`;
-  $('#cloudflarePasswordMode').value = 'generated';
+  $('#cloudflareCreateTitle').textContent = 'Cloudflare Account Batch';
+  $('#cloudflareSelectionSummary').textContent = `${count} email${count === 1 ? '' : 's'} selected`;
+  $('#cloudflarePasswordMode').value = 'manual';
+  $('#cloudflareGeneratePassword').checked = false;
   $('#cloudflareManualPassword').value = '';
-  $('#cloudflareManualPasswordRow').hidden = true;
+  $('#cloudflareManualPassword').disabled = false;
+  $('#cloudflareManualPassword').required = true;
   $('#cloudflareCreateError').hidden = true;
   $('#cloudflareJobModal').hidden = false;
-  setTimeout(() => $('#cloudflarePasswordMode').focus(), 0);
+  setTimeout(() => $('#cloudflareManualPassword').focus(), 0);
 }
 
 function closeCloudflareJobModal() {
   if ($('#cloudflareJobForm').getAttribute('aria-busy') === 'true') return;
   $('#cloudflareJobModal').hidden = true;
   $('#cloudflareManualPassword').value = '';
+  $('#cloudflareGeneratePassword').checked = false;
+  $('#cloudflareManualPassword').disabled = false;
   $('#cloudflareManualPassword').type = 'password';
   $('#toggleCloudflareManualPassword').textContent = 'Show';
 }
@@ -727,18 +733,85 @@ function renderCloudflareStatus(status) {
   $('#cloudflareTotal').textContent = status.totalAccounts ?? 0;
   $('#cloudflareVerified').textContent = status.verifiedAccounts ?? 0;
   $('#cloudflareNeedsAction').textContent = status.needsActionAccounts ?? 0;
-  $('#cloudflareRunnerShort').textContent = status.runner?.online ? (status.runner.busy ? 'Busy' : 'Online') : 'Offline';
-  $('#cloudflareRunnerHeartbeat').textContent = status.runner?.lastSeenAt ? `heartbeat ${formatDate(status.runner.lastSeenAt)}` : 'not paired';
+  $('#cloudflareRunnerShort').textContent = status.runner?.online ? 'Connected' : 'Disconnected';
+  $('#cloudflareRunnerHeartbeat').textContent = status.runner?.online ? '' : 'Reconnect required';
+  $('#pairCloudflareRunner').hidden = Boolean(status.runner?.online);
   $('#revokeCloudflareRunner').disabled = !status.runner?.online;
   $('#cloudflareRunnerStatus').innerHTML = status.runner?.online
     ? `<div class="runner-status-line"><span class="status-dot ok"></span><strong>${escapeHtml(status.runner.name || 'Operator browser')}</strong>${status.runner.busy ? '<span class="pill running">busy</span>' : '<span class="pill active">ready</span>'}</div><small>Runner ${escapeHtml(shortId(status.runner.runnerId))}${status.runner.activeItemId ? ` · item ${escapeHtml(shortId(status.runner.activeItemId))}` : ''}</small>`
     : '<div class="runner-status-line"><span class="status-dot off"></span><strong>No visible browser runner connected</strong></div><small>Create a pairing code, then run the displayed command on the operator workstation.</small>';
+  $('#cloudflareRunnerStatus').innerHTML = status.runner?.online
+    ? `<div class="runner-status-line"><span class="status-dot ok"></span><strong>Browser Runner</strong><span>Connected${status.runner.busy ? ' · working' : ''}</span></div>`
+    : '<div class="runner-status-line"><span class="status-dot off"></span><strong>Browser Runner disconnected</strong></div>';
+  if (status.runner?.online) $('#cloudflarePairingPanel').hidden = true;
   const circuit = status.circuit || { open: false };
   $('#cloudflareCircuitBanner').hidden = !circuit.open;
   $('#cloudflareCircuitBanner').textContent = circuit.open
     ? `Cloudflare workflow stopped: ${circuit.reason || 'provider cooldown'}${circuit.until ? ` · until ${formatDate(circuit.until)}` : ''}`
     : '';
   $('#resetCloudflareCircuit').hidden = !circuit.open;
+}
+
+function cloudflareTimelineState(item) {
+  const accepted = Boolean(item?.submitted_at && item?.signup_acceptance_evidence);
+  const received = Boolean(item?.verification_received_at);
+  const verified = item?.status === 'verified';
+  const started = Number(item?.attempts || 0) > 0 || Boolean(item?.attempt_started_at);
+  const opened = started && !['queued', 'preparing', 'opening_signup'].includes(item?.phase);
+  const needsAction = item?.status === 'needs_action';
+  return [
+    { label: 'Preparing account', done: started, current: !started },
+    { label: 'Opening Cloudflare', done: opened, current: started && !opened },
+    { label: 'Signup submitted', done: accepted, current: opened && !accepted },
+    { label: 'Waiting for email', done: received, current: accepted && !received },
+    { label: 'Email received', done: received, current: false },
+    { label: 'Verifying account', done: verified, current: received && !verified },
+    { label: 'Verified', done: verified, current: false },
+  ].map((step) => ({ ...step, current: step.current && !needsAction }));
+}
+
+function renderCloudflareTimeline(job) {
+  const items = job.items || [];
+  const current = items.find((item) => item.status === 'needs_action')
+    || items.find((item) => !['verified', 'failed', 'cancelled'].includes(item.status))
+    || items.at(-1);
+  const summary = $('#cloudflareCurrentSummary');
+  const action = $('#cloudflareActionRequired');
+  if (!current) {
+    summary.hidden = true;
+    action.hidden = true;
+    $('#cloudflareTimeline').replaceChildren();
+    return;
+  }
+  summary.hidden = false;
+  const lastCheckSeconds = secondsBetween(current.last_inbox_check_at, Date.now());
+  const nextCheckSeconds = secondsBetween(Date.now(), current.next_attempt_at);
+  const remaining = Math.max(0, Number(job.requested_count || 0) - Number(job.verified_count || 0));
+  const average = Number(job.timing?.average_verified_seconds || 0);
+  summary.innerHTML = `<strong>Current: <span class="mono">${escapeHtml(current.email)}</span></strong>
+    ${current.status === 'waiting_for_verification'
+      ? `<span>Last inbox check: ${lastCheckSeconds == null ? 'not yet' : `${escapeHtml(formatDuration(lastCheckSeconds))} ago`} · Next check: ${nextCheckSeconds == null ? 'soon' : escapeHtml(formatDuration(nextCheckSeconds))}</span>`
+      : `<span>${escapeHtml(current.phase_message || phaseLabel(current.phase))}</span>`}
+    <span>Estimated remaining: ${average > 0 ? escapeHtml(formatDuration(average * remaining)) : 'estimating after the first verified account'}</span>`;
+  $('#cloudflareTimeline').innerHTML = cloudflareTimelineState(current).map((step, index) => {
+    const css = step.done ? 'done' : step.current ? 'current' : 'pending';
+    const marker = step.done ? '&#10003;' : step.current ? '&#8987;' : '&mdash;';
+    return `<li class="${css}"><span>${index + 1}. ${escapeHtml(step.label)}</span><strong>${marker}</strong></li>`;
+  }).join('');
+
+  if (current.status !== 'needs_action') {
+    action.hidden = true;
+    action.replaceChildren();
+    return;
+  }
+  const canFocus = Boolean(current.leased_runner_id);
+  const verificationTimeout = current.last_error_code === 'verification_email_timeout';
+  action.hidden = false;
+  action.innerHTML = `<div><strong>Action required</strong><span>${escapeHtml(current.phase_message || 'Open Cloudflare to continue')}</span></div>
+    <div class="button-row">
+      ${verificationTimeout ? `<button class="btn ghost small-btn" data-cloudflare-check-inbox="${escapeHtml(current.mailbox_id)}" data-cloudflare-check-email="${escapeHtml(current.email)}">Check inbox</button><button class="btn ghost small-btn" data-cloudflare-item-retry="${escapeHtml(current.id)}">Retry verification</button>` : ''}
+      <button class="btn primary small-btn" data-cloudflare-item-open="${escapeHtml(current.id)}" data-cloudflare-open-mode="${canFocus ? 'focus' : 'reconcile'}">Open browser</button>
+    </div>`;
 }
 
 function renderCloudflareJobs(jobs) {
@@ -769,12 +842,12 @@ async function loadCloudflareJobDetail(id, { background = false } = {}) {
   if (state.selectedCloudflareJobId !== jobId) return;
   state.selectedCloudflareJob = job;
   $('#cloudflareJobDetail').hidden = false;
-  $('#cloudflareJobTitle').textContent = `Cloudflare job ${shortId(job.id)}`;
-  $('#cloudflareJobMeta').textContent = `Created ${formatDate(job.created_at)} · ${job.requested_count} account${job.requested_count === 1 ? '' : 's'} · ${job.password_mode} shared password`;
+  $('#cloudflareJobTitle').textContent = 'Cloudflare Account Batch';
   const percent = cloudflareProgress(job);
+  $('#cloudflareJobMeta').textContent = `${job.requested_count} email${job.requested_count === 1 ? '' : 's'} · started ${formatDate(job.created_at)}`;
   $('#cloudflareJobProgress').style.width = `${percent}%`;
-  const counts = itemStatusCounts(job.items);
-  $('#cloudflareJobNumbers').textContent = `${job.verified_count} verified · ${job.failed_count} failed · ${job.needs_action_count} need action · ${counts.waiting_for_verification || 0} waiting for email · ${percent}%`;
+  $('#cloudflareJobNumbers').textContent = `${job.verified_count} / ${job.requested_count} Verified`;
+  renderCloudflareTimeline(job);
   const actions = [];
   if (job.status === 'running') actions.push('<button class="btn ghost small-btn" data-cloudflare-job-action="pause">Pause</button>');
   if (job.status === 'paused') actions.push('<button class="btn primary small-btn" data-cloudflare-job-action="resume">Resume</button>');
@@ -785,16 +858,16 @@ async function loadCloudflareJobDetail(id, { background = false } = {}) {
       'interrupted_submit_unknown', 'runner_disconnected_uncertain', 'paused_submit_unknown', 'submit_timeout',
       'submission_state_unknown', 'account_exists', 'invalid_credentials', 'reconcile_timeout',
       'verification_link_expired', 'challenge', 'challenge_timeout', 'rate_limited', 'policy_blocked',
+      'signup_acceptance_unconfirmed',
     ]
       .includes(item.last_error_code);
     const canRetry = ['needs_action', 'failed', 'retry_waiting'].includes(item.status) && !item.leased_runner_id && !uncertainSignup;
     const canReconcile = ['needs_action', 'failed', 'retry_waiting'].includes(item.status) && !item.leased_runner_id;
-    const canFocus = ['creating', 'awaiting_submit', 'verifying', 'needs_action'].includes(item.status);
-    const canConfirmResend = item.status === 'needs_action' && item.last_error_code === 'verification_pending' && item.leased_runner_id;
+    const canFocus = Boolean(item.leased_runner_id) && ['creating', 'awaiting_submit', 'verifying', 'needs_action'].includes(item.status);
     return `<tr><td>${escapeHtml(item.position)}</td><td class="mono">${escapeHtml(item.email)}</td>
       <td>${statusPill(item.status)}</td><td><span class="phase-label">${escapeHtml(phaseLabel(item.phase))}</span><small class="phase-message">${escapeHtml(item.phase_message || '')}</small></td>
       <td class="mono" data-elapsed-start="${escapeHtml(item.attempt_started_at || '')}" data-elapsed-end="${escapeHtml(item.finished_at || '')}">${item.attempt_started_at ? escapeHtml(formatDuration(secondsBetween(item.attempt_started_at, item.finished_at || Date.now()))) : '—'}</td>
-      <td>${escapeHtml(item.attempts)}</td><td><div class="cloudflare-item-actions">${canFocus ? `<button class="btn ghost small-btn" data-cloudflare-item-focus="${escapeHtml(item.id)}">Focus browser</button>` : ''}${canConfirmResend ? `<button class="btn primary small-btn" data-cloudflare-resend-confirmed="${escapeHtml(item.id)}">I clicked Resend</button>` : ''}${canRetry ? `<button class="btn ghost small-btn" data-cloudflare-item-retry="${escapeHtml(item.id)}">Retry safely</button>` : ''}${canReconcile ? `<button class="btn ghost small-btn" data-cloudflare-item-reconcile="${escapeHtml(item.id)}">Reconcile login</button>` : ''}${item.has_artifact ? `<button class="btn ghost small-btn" data-cloudflare-artifact="${escapeHtml(item.id)}">View failure</button>` : ''}</div></td>
+      <td>${escapeHtml(item.attempts)}</td><td><div class="cloudflare-item-actions">${canFocus ? `<button class="btn ghost small-btn" data-cloudflare-item-focus="${escapeHtml(item.id)}">Open browser</button>` : ''}${canRetry ? `<button class="btn ghost small-btn" data-cloudflare-item-retry="${escapeHtml(item.id)}">Retry</button>` : ''}${canReconcile ? `<button class="btn ghost small-btn" data-cloudflare-item-reconcile="${escapeHtml(item.id)}">Open Cloudflare</button>` : ''}${item.has_artifact ? `<button class="btn ghost small-btn" data-cloudflare-artifact="${escapeHtml(item.id)}">View failure</button>` : ''}</div></td>
       <td class="truncate" title="${escapeHtml(item.last_error || '')}">${escapeHtml(item.last_error || '—')}</td></tr>`;
   }).join('');
   if (!background) refreshLiveTimers();
@@ -816,7 +889,9 @@ async function loadCloudflare({ background = false } = {}) {
     renderCloudflareStatus(status);
     renderCloudflareJobs(jobs.jobs || []);
     renderCloudflareAccounts(accounts.items || []);
-    if (state.selectedCloudflareJobId) await loadCloudflareJobDetail(state.selectedCloudflareJobId, { background });
+    const jobId = state.selectedCloudflareJobId || status.activeJob?.id || jobs.jobs?.[0]?.id;
+    if (jobId) await loadCloudflareJobDetail(jobId, { background });
+    else $('#cloudflareJobDetail').hidden = true;
   } catch (error) {
     if (!isAbortError(error)) throw error;
   } finally {
@@ -898,8 +973,10 @@ async function viewCloudflareArtifact(itemId) {
   setTimeout(() => URL.revokeObjectURL(href), 60000);
 }
 
-function setMailError(message = '', detail = '') {
+function setMailError(message = '', detail = '', { temporary = false } = {}) {
   const box = $('#mailError');
+  box.classList.toggle('danger', Boolean(message) && !temporary);
+  box.classList.toggle('warning', Boolean(message) && temporary);
   box.replaceChildren();
   if (message) {
     const summary = document.createElement('strong');
@@ -973,7 +1050,25 @@ async function loadInbox({ background = false, statusText = 'Syncing mailbox' } 
     $('#inboxUnreadBadge').textContent = state.mailFolder === 'inbox' && Number(data.unreadTotal || 0) > 0 ? String(data.unreadTotal) : '';
     renderInbox(data.items || []);
   } catch (error) {
-    if (!isAbortError(error) && request.isCurrent()) setMailError(error.message, error.body?.detail || '');
+    if (!isAbortError(error) && request.isCurrent()) {
+      if (error.body?.code === 'mail_rate_limited') {
+        setMailError(
+          'Atomic Mail is temporarily rate limiting requests. Retrying automatically…',
+          '',
+          { temporary: true },
+        );
+        clearTimeout(state.mailRateRetryTimer);
+        const retryMs = Math.max(2000, Number(error.body.retryAfterMs || 5000));
+        const expectedMailboxId = mailboxId;
+        state.mailRateRetryTimer = setTimeout(() => {
+          if (state.currentView === 'webmail' && state.selectedMailbox?.id === expectedMailboxId) {
+            loadInbox({ background: true, statusText: 'Retrying inbox sync' }).catch(() => {});
+          }
+        }, retryMs);
+      } else {
+        setMailError(error.message, error.body?.detail || '');
+      }
+    }
   } finally {
     if (request.isCurrent()) {
       request.finish();
@@ -1030,7 +1125,9 @@ function selectMailFolder(folder, refresh = true) {
 
 function stopWebmailAutoRefresh() {
   clearInterval(state.mailAutoTimer);
+  clearTimeout(state.mailRateRetryTimer);
   state.mailAutoTimer = null;
+  state.mailRateRetryTimer = null;
 }
 
 function startWebmailAutoRefresh() {
@@ -1681,11 +1778,13 @@ $('#cancelCloudflareJob').addEventListener('click', closeCloudflareJobModal);
 $('#cloudflareJobModal').addEventListener('click', (event) => {
   if (event.target === event.currentTarget) closeCloudflareJobModal();
 });
-$('#cloudflarePasswordMode').addEventListener('change', () => {
-  const manual = $('#cloudflarePasswordMode').value === 'manual';
-  $('#cloudflareManualPasswordRow').hidden = !manual;
-  $('#cloudflareManualPassword').required = manual;
-  if (manual) $('#cloudflareManualPassword').focus();
+$('#cloudflareGeneratePassword').addEventListener('change', (event) => {
+  const generated = event.currentTarget.checked;
+  $('#cloudflarePasswordMode').value = generated ? 'generated' : 'manual';
+  $('#cloudflareManualPassword').disabled = generated;
+  $('#cloudflareManualPassword').required = !generated;
+  if (generated) $('#cloudflareManualPassword').value = '';
+  else $('#cloudflareManualPassword').focus();
 });
 $('#toggleCloudflareManualPassword').addEventListener('click', () => {
   const input = $('#cloudflareManualPassword');
@@ -1737,6 +1836,32 @@ $('#cloudflareJobActions').addEventListener('click', (event) => {
   const button = event.target.closest('[data-cloudflare-job-action]');
   if (button) runCloudflareJobAction(button.dataset.cloudflareJobAction, button).catch(handleError);
 });
+$('#cloudflareActionRequired').addEventListener('click', async (event) => {
+  const inbox = event.target.closest('[data-cloudflare-check-inbox]');
+  if (inbox) {
+    await openMailbox(inbox.dataset.cloudflareCheckInbox, inbox.dataset.cloudflareCheckEmail).catch(handleError);
+    return;
+  }
+  const retry = event.target.closest('[data-cloudflare-item-retry]');
+  if (retry) {
+    await withBusyButton(retry, 'Retrying', 'Scheduling another verification inbox check', async () => {
+      await api(`/api/cloudflare/items/${encodeURIComponent(retry.dataset.cloudflareItemRetry)}/retry`, { method: 'POST', body: '{}' });
+      await loadCloudflare();
+    }).catch(handleError);
+    return;
+  }
+  const open = event.target.closest('[data-cloudflare-item-open]');
+  if (!open) return;
+  const mode = open.dataset.cloudflareOpenMode;
+  await withBusyButton(open, 'Opening', 'Opening the visible Cloudflare browser', async () => {
+    if (mode === 'focus') {
+      await api(`/api/cloudflare/items/${encodeURIComponent(open.dataset.cloudflareItemOpen)}/focus`, { method: 'POST', body: '{}' });
+    } else {
+      await api(`/api/cloudflare/items/${encodeURIComponent(open.dataset.cloudflareItemOpen)}/reconcile`, { method: 'POST', body: '{}' });
+      await loadCloudflare();
+    }
+  }).catch(handleError);
+});
 $('#cloudflareItemsBody').addEventListener('click', async (event) => {
   const focus = event.target.closest('[data-cloudflare-item-focus]');
   if (focus) {
@@ -1755,15 +1880,6 @@ $('#cloudflareItemsBody').addEventListener('click', async (event) => {
   if (reconcile) {
     await withBusyButton(reconcile, 'Opening login', 'Scheduling existing-account reconciliation', async () => {
       await api(`/api/cloudflare/items/${encodeURIComponent(reconcile.dataset.cloudflareItemReconcile)}/reconcile`, { method: 'POST', body: '{}' });
-      await loadCloudflare();
-    }).catch(handleError);
-    return;
-  }
-  const resendConfirmed = event.target.closest('[data-cloudflare-resend-confirmed]');
-  if (resendConfirmed) {
-    await withBusyButton(resendConfirmed, 'Confirming', 'Telling the browser runner to resume inbox verification', async () => {
-      await api(`/api/cloudflare/items/${encodeURIComponent(resendConfirmed.dataset.cloudflareResendConfirmed)}/resend-confirmed`, { method: 'POST', body: '{}' });
-      toast('Resend confirmed; waiting for the runner heartbeat', 'success');
       await loadCloudflare();
     }).catch(handleError);
     return;

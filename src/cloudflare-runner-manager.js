@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { newId } from './utils.js';
 
-export const CLOUDFLARE_RUNNER_PROTOCOL = 1;
+export const CLOUDFLARE_RUNNER_PROTOCOL = 2;
 
 function tokenHash(value) {
   return crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
@@ -100,7 +100,7 @@ export class CloudflareRunnerManager {
     this.pairings.delete(hash);
     this.failedExchanges.delete(ip);
 
-    // V1 deliberately supports one visible runner so two operators can never
+    // The protocol deliberately supports one visible runner so two operators can never
     // race the same manual Cloudflare form.
     for (const session of this.sessions.values()) session.revoked = true;
     this.prune();
@@ -144,6 +144,7 @@ export class CloudflareRunnerManager {
   }
 
   requestCommand(type, itemId) {
+    if (!['focus', 'cancel'].includes(String(type || ''))) return false;
     const live = this.liveSession();
     if (!live) return false;
     live.commands.push({ type, itemId: String(itemId || '') });

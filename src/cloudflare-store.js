@@ -7,7 +7,7 @@ const ACTIVE_ITEM_STATUSES = [
 ];
 const UNCERTAIN_SIGNUP_CODES = new Set([
   'interrupted_submit_unknown', 'runner_disconnected_uncertain', 'paused_submit_unknown',
-  'submit_timeout', 'submission_state_unknown', 'account_exists', 'invalid_credentials',
+  'submit_timeout', 'submission_state_unknown', 'signup_acceptance_unconfirmed', 'account_exists', 'invalid_credentials',
   'reconcile_timeout', 'verification_link_expired', 'challenge', 'challenge_timeout',
   'rate_limited', 'policy_blocked',
 ]);
@@ -35,7 +35,8 @@ function publicJobColumns(alias = 'j') {
 function publicItemColumns(alias = 'i') {
   return `${alias}.id, ${alias}.job_id, ${alias}.account_id, ${alias}.mailbox_id, ${alias}.position,
           ${alias}.email, ${alias}.status, ${alias}.phase, ${alias}.phase_message, ${alias}.attempts,
-          ${alias}.next_attempt_at, ${alias}.submitted_at, ${alias}.verification_received_at,
+          ${alias}.next_attempt_at, ${alias}.submitted_at, ${alias}.signup_acceptance_evidence,
+          ${alias}.verification_wait_started_at, ${alias}.last_inbox_check_at, ${alias}.verification_received_at,
           ${alias}.verified_at, ${alias}.last_error_code, ${alias}.last_error,
           ${alias}.artifact_name IS NOT NULL AS has_artifact,
           ${alias}.lease_generation, ${alias}.leased_runner_id, ${alias}.lease_expires_at,
@@ -76,9 +77,27 @@ export class CloudflareStore {
             lease_expires_at=NULL, next_attempt_at=?, updated_at=?
         WHERE status='verifying'
       `).run(now, now);
+      const unconfirmed = this.db.prepare(`
+        UPDATE cloudflare_job_items
+        SET status='needs_action', phase='needs_action',
+            phase_message='Signup acceptance was not confirmed by the browser; open Cloudflare and reconcile',
+            last_error_code='signup_acceptance_unconfirmed',
+            last_error='The previous runner protocol did not preserve reliable browser acceptance evidence',
+            leased_runner_id=NULL, lease_expires_at=NULL, updated_at=?
+        WHERE status='waiting_for_verification' AND signup_acceptance_evidence IS NULL
+      `).run(now);
       this.db.prepare(`
-        UPDATE cloudflare_accounts SET status='needs_action', last_error_code='interrupted_submit_unknown',
-          last_error='Cloudflare may have accepted the form before the runner disconnected', updated_at=?
+        UPDATE cloudflare_accounts SET status='needs_action',
+          last_error_code=COALESCE((
+            SELECT i.last_error_code FROM cloudflare_job_items i
+            WHERE i.account_id=cloudflare_accounts.id AND i.status='needs_action'
+            ORDER BY i.updated_at DESC LIMIT 1
+          ), 'interrupted_submit_unknown'),
+          last_error=COALESCE((
+            SELECT i.last_error FROM cloudflare_job_items i
+            WHERE i.account_id=cloudflare_accounts.id AND i.status='needs_action'
+            ORDER BY i.updated_at DESC LIMIT 1
+          ), 'Cloudflare may have accepted the form before the runner disconnected'), updated_at=?
         WHERE id IN (SELECT account_id FROM cloudflare_job_items WHERE status='needs_action')
       `).run(now);
       this.db.prepare(`
@@ -99,8 +118,9 @@ export class CloudflareStore {
         queued: Number(safe.changes || 0),
         needsAction: Number(uncertain.changes || 0),
         verificationRecovered: Number(verifying.changes || 0),
+        signupAcceptanceUnconfirmed: Number(unconfirmed.changes || 0),
       };
-      if (summary.queued || summary.needsAction || summary.verificationRecovered) {
+      if (summary.queued || summary.needsAction || summary.verificationRecovered || summary.signupAcceptanceUnconfirmed) {
         this.store.audit('warn', 'cloudflare.recovered', `Recovered Cloudflare work: ${JSON.stringify(summary)}`);
       }
       return summary;
@@ -199,8 +219,15 @@ export class CloudflareStore {
              AVG((julianday(finished_at)-julianday(attempt_started_at))*86400.0) AS average_verified_seconds
       FROM cloudflare_job_items WHERE job_id=? AND status='verified'
     `).get(job.id);
+    const counts = items.reduce((result, item) => {
+      if (item.status === 'verified') result.verified_count += 1;
+      if (item.status === 'failed') result.failed_count += 1;
+      if (item.status === 'needs_action') result.needs_action_count += 1;
+      return result;
+    }, { verified_count: 0, failed_count: 0, needs_action_count: 0 });
     return {
       ...job,
+      ...counts,
       items,
       timing: {
         sample_count: Number(timing?.sample_count || 0),
@@ -427,8 +454,9 @@ export class CloudflareStore {
     const next = new Date(now.getTime() + Math.max(1000, Number(delayMs) || 15000)).toISOString();
     this.db.prepare(`
       UPDATE cloudflare_job_items SET status='waiting_for_verification', phase='waiting_for_verification',
-        phase_message=?, next_attempt_at=?, updated_at=? WHERE id=? AND status='waiting_for_verification'
-    `).run(cleanMessage(message), next, now.toISOString(), id);
+        phase_message=?, next_attempt_at=?, last_inbox_check_at=?, updated_at=?
+      WHERE id=? AND status='waiting_for_verification'
+    `).run(cleanMessage(message), next, now.toISOString(), now.toISOString(), id);
   }
 
   markVerificationFound(id, verificationUrlCiphertext, receivedAt) {
@@ -440,6 +468,11 @@ export class CloudflareStore {
         leased_runner_id=NULL, lease_expires_at=NULL, updated_at=?
       WHERE id=? AND status='waiting_for_verification'
     `).run(verificationUrlCiphertext, receivedAt || now, now, now, id);
+    const item = this.db.prepare('SELECT job_id, account_id FROM cloudflare_job_items WHERE id=?').get(id);
+    if (item) {
+      this.db.prepare(`UPDATE cloudflare_accounts SET status='verifying', last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=?`).run(now, item.account_id);
+      this.refreshJob(item.job_id);
+    }
   }
 
   claimRunnerTask(runnerId, leaseMs = 60000) {
@@ -518,17 +551,25 @@ export class CloudflareStore {
     return result.changes > 0;
   }
 
-  markSubmitted(id, runnerId, generation, browserStateCiphertext = null, { resetSubmittedAt = false } = {}) {
+  markSubmitted(id, runnerId, generation, browserStateCiphertext = null, {
+    resetSubmittedAt = false,
+    evidence = 'browser_confirmed',
+  } = {}) {
     if (!this.validateLease(id, runnerId, generation)) return false;
+    const safeEvidence = String(evidence || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 80);
+    if (!safeEvidence) return false;
     const now = nowIso();
+    const item = this.db.prepare('SELECT job_id FROM cloudflare_job_items WHERE id=?').get(id);
     const result = this.db.prepare(`
       UPDATE cloudflare_job_items SET status='waiting_for_verification', phase='waiting_for_verification',
-        phase_message='Signup submitted; polling the AtomicMail inbox',
+        phase_message='Cloudflare accepted signup; waiting for the verification email',
         submitted_at=CASE WHEN ? THEN ? ELSE COALESCE(submitted_at, ?) END,
+        signup_acceptance_evidence=?, verification_wait_started_at=?, last_inbox_check_at=NULL,
         browser_state_ciphertext=COALESCE(?, browser_state_ciphertext), next_attempt_at=?,
         leased_runner_id=NULL, lease_expires_at=NULL, last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=?
-    `).run(resetSubmittedAt ? 1 : 0, now, now, browserStateCiphertext, now, now, id);
-    this.db.prepare(`UPDATE cloudflare_accounts SET status='waiting_for_verification', updated_at=? WHERE id=(SELECT account_id FROM cloudflare_job_items WHERE id=?)`).run(now, id);
+    `).run(resetSubmittedAt ? 1 : 0, now, now, safeEvidence, now, browserStateCiphertext, now, now, id);
+    this.db.prepare(`UPDATE cloudflare_accounts SET status='waiting_for_verification', last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=(SELECT account_id FROM cloudflare_job_items WHERE id=?)`).run(now, id);
+    if (item) this.refreshJob(item.job_id);
     return result.changes > 0;
   }
 
@@ -624,13 +665,14 @@ export class CloudflareStore {
     const now = nowIso();
     const nextStatus = item.submitted_at ? 'waiting_for_verification' : 'queued';
     const phaseMessage = item.submitted_at
-      ? 'Reconciling the existing signup through its verification email'
+      ? 'Checking again for the existing signup verification email'
       : 'Queued for another browser attempt';
     this.db.prepare(`
       UPDATE cloudflare_job_items SET status=?, phase=?, phase_message=?, next_attempt_at=?,
+        verification_wait_started_at=CASE WHEN submitted_at IS NOT NULL THEN ? ELSE verification_wait_started_at END,
         last_error_code=NULL, last_error=NULL, leased_runner_id=NULL, lease_expires_at=NULL,
         finished_at=NULL, updated_at=? WHERE id=?
-    `).run(nextStatus, nextStatus, phaseMessage, now, now, item.id);
+    `).run(nextStatus, nextStatus, phaseMessage, now, now, now, item.id);
     this.db.prepare(`UPDATE cloudflare_accounts SET status=?, last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=?`)
       .run(nextStatus, now, item.account_id);
     this.db.prepare(`UPDATE cloudflare_jobs SET status='running', last_error_code=NULL, last_error=NULL, completed_at=NULL, updated_at=? WHERE id=?`)

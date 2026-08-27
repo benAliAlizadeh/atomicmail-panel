@@ -4,6 +4,7 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 npm-debug.log*
+node_modules/
 runner/node_modules/
 .DS_Store
 secrets/

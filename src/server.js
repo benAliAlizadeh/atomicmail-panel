@@ -231,6 +231,7 @@ function mailErrorPayload(error, status) {
     return { error: detail || 'Request failed', code: error?.code || undefined };
   }
   const summaries = {
+    mail_rate_limited: 'Atomic Mail is temporarily rate limiting requests. Retrying automatically…',
     mail_timeout: 'The mail provider timed out',
     jmap_method_error: 'The mail provider rejected this operation',
     mailbox_unavailable: 'This mail folder is unavailable',
@@ -240,6 +241,9 @@ function mailErrorPayload(error, status) {
   return {
     error: summaries[error?.code] || (status >= 500 ? 'Unable to complete the mail operation' : 'Mail operation failed'),
     code: error?.code || 'mail_provider_error',
+    ...(error?.retryAfterMs ? { retryAfterMs: Number(error.retryAfterMs) } : {}),
+    ...(error?.retryAt ? { retryAt: String(error.retryAt) } : {}),
+    ...(error?.code === 'mail_rate_limited' ? { temporary: true } : {}),
     ...(detail ? { detail } : {}),
   };
 }
@@ -496,20 +500,6 @@ export function createServer({
         const item = cloudflareStore?.getItem(focusCloudflareItem.id);
         if (!item) return json(res, 404, { error: 'Cloudflare item not found' });
         if (!runnerManager?.requestCommand('focus', item.id)) return json(res, 409, { error: 'Cloudflare runner is offline' });
-        return json(res, 202, { accepted: true });
-      }
-
-      const resendConfirmedItem = routeMatch(pathname, '/api/cloudflare/items/:id/resend-confirmed');
-      if (req.method === 'POST' && resendConfirmedItem) {
-        const item = cloudflareStore?.getItem(resendConfirmedItem.id);
-        if (!item) return json(res, 404, { error: 'Cloudflare item not found' });
-        if (item.status !== 'needs_action' || item.last_error_code !== 'verification_pending' || !item.leased_runner_id) {
-          return json(res, 409, { error: 'This item is not waiting for manual verification resend confirmation' });
-        }
-        if (!runnerManager?.requestCommand('resend-confirmed', item.id)) {
-          return json(res, 409, { error: 'Cloudflare runner is offline' });
-        }
-        store.audit('info', 'cloudflare.verification_resend_confirmed', `Operator confirmed manual verification resend for ${item.email}`, item.job_id, item.id);
         return json(res, 202, { accepted: true });
       }
 
@@ -902,8 +892,16 @@ export function createServer({
           if (res.destroyed || res.writableEnded) return;
           return json(res, 499, { error: 'Mail request was cancelled', code: 'mail_cancelled' });
         }
-        store.audit('error', 'mail.operation_failed', `Mail operation failed (${String(error.code || 'mail_provider_error').slice(0, 80)}, HTTP ${status})`);
-        return json(res, status, mailErrorPayload(error, status));
+        if (error.code !== 'mail_rate_limited') {
+          store.audit('error', 'mail.operation_failed', `Mail operation failed (${String(error.code || 'mail_provider_error').slice(0, 80)}, HTTP ${status})`);
+        }
+        const retrySeconds = Math.max(1, Math.ceil(Number(error.retryAfterMs || 0) / 1000));
+        return json(
+          res,
+          status,
+          mailErrorPayload(error, status),
+          error.code === 'mail_rate_limited' ? { 'retry-after': String(retrySeconds) } : {},
+        );
       }
       if (status >= 500) store.audit('error', 'http.internal_error', redactSecrets(String(error?.stack || error)));
       const safeMessage = error?.expose === true || status < 500

@@ -1,7 +1,14 @@
 import os from 'node:os';
 import { chromium } from 'playwright';
+import {
+  inspectCloudflareSignup,
+  inspectCloudflareVerificationRequest,
+  isCloudflareChallenge,
+  observeTrustedOperatorSubmit,
+  signupFormState,
+} from './cloudflare-browser-adapter.js';
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const HEARTBEAT_MS = 10000;
 const TASK_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -79,24 +86,6 @@ async function pageText(page) {
   return normalizedText((await page.locator('body').innerText({ timeout: 5000 }).catch(() => '')).slice(0, 120000));
 }
 
-function challengePage(url, text) {
-  return /\/cdn-cgi\/challenge|challenge-platform/i.test(url)
-    || /verify you are human|checking your browser|security check|captcha|turnstile/i.test(text);
-}
-
-function rateLimited(text) {
-  return /too many requests|rate.?limit|try again later|temporarily blocked/i.test(text);
-}
-
-function accountExists(text) {
-  return /account.*already exists|email.*already (?:registered|in use)|already have an account/i.test(text);
-}
-
-function signupAccepted(url, text) {
-  return /verify (?:your )?email|check (?:your )?(?:email|inbox)|verification email/i.test(text)
-    || (!/sign-?up|register/i.test(url) && /dash\.cloudflare\.com/i.test(url) && !/login/i.test(url));
-}
-
 function emailVerifiedOnPage(text, email) {
   const normalized = normalizedText(text).toLowerCase();
   const address = String(email || '').trim().toLowerCase();
@@ -167,7 +156,7 @@ async function loginIfNeeded(page, task, notifyNeedsAction) {
   const deadline = Date.now() + TASK_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const text = await pageText(page);
-    if (challengePage(page.url(), text)) {
+    if (isCloudflareChallenge(page.url(), text)) {
       if (!challengeReported) {
         await notifyNeedsAction('challenge', 'Complete the Cloudflare login challenge in the visible Chromium window');
         challengeReported = true;
@@ -234,7 +223,6 @@ class Runner {
     for (const command of response.commands || []) {
       if (command.itemId && command.itemId !== this.active?.task.id) continue;
       if (command.type === 'focus') await this.active?.page?.bringToFront().catch(() => {});
-      if (command.type === 'resend-confirmed' && this.active) this.active.resendConfirmed = true;
       if (command.type === 'cancel') {
         this.active.cancelled = true;
         await this.active.context?.close().catch(() => {});
@@ -245,6 +233,10 @@ class Runner {
   async signup(task, context, page) {
     await this.event(task, 'progress', { phase: 'opening_signup', message: 'Opening the official Cloudflare signup page' });
     await fillSignup(page, task);
+    await observeTrustedOperatorSubmit(page, (submittedAt) => {
+      if (!this.active) return;
+      this.active.operatorSubmitObservedAt ||= submittedAt;
+    });
     this.active.stage = 'awaiting_submit';
     await this.event(task, 'awaiting_submit', { storageState: await context.storageState() });
     process.stdout.write(`Ready: submit ${task.email} in the visible Chromium window.\n`);
@@ -254,31 +246,58 @@ class Runner {
     while (Date.now() < deadline && !this.active.cancelled && !page.isClosed()) {
       const text = await pageText(page);
       const url = page.url();
-      if (rateLimited(text)) {
+      const form = await signupFormState(page);
+      const state = inspectCloudflareSignup({
+        url,
+        text,
+        email: task.email,
+        submitObserved: Boolean(this.active.operatorSubmitObservedAt),
+        ...form,
+      });
+      if (state.state === 'rate_limited') {
         await this.event(task, 'failed', {
           code: 'rate_limited', message: 'Cloudflare rate limited or temporarily blocked signup', uncertain: true,
           screenshotBase64: await screenshot(page),
         });
         return;
       }
-      if (accountExists(text)) {
+      if (state.state === 'account_exists') {
         await this.event(task, 'failed', {
           code: 'account_exists', message: 'Cloudflare reports that this email already has an account',
           screenshotBase64: await screenshot(page),
         });
         return;
       }
-      if (challengePage(url, text)) {
+      if (state.state === 'validation_error') {
+        await this.event(task, 'needs_action', {
+          code: 'validation_error', message: 'Cloudflare did not accept the signup form. Correct the highlighted fields in Chromium.',
+          keepTaskOpen: false, screenshotBase64: await screenshot(page),
+        });
+        return;
+      }
+      if (state.state === 'challenge') {
         if (!challengeReported) {
           await this.event(task, 'needs_action', {
             code: 'challenge', message: 'Complete the Cloudflare challenge in the visible Chromium window', keepTaskOpen: true,
           });
           challengeReported = true;
         }
-      } else if (signupAccepted(url, text)) {
-        this.active.stage = 'submitted';
-        await this.event(task, 'submitted', { storageState: await context.storageState() });
-        process.stdout.write(`Submitted: ${task.email}; the panel is polling AtomicMail.\n`);
+      } else if (state.state === 'accepted') {
+        this.active.stage = 'signup_accepted';
+        await this.event(task, 'signup_accepted', {
+          evidence: state.evidence,
+          storageState: await context.storageState(),
+        });
+        process.stdout.write(`Cloudflare accepted signup for ${task.email}; the panel is polling AtomicMail.\n`);
+        return;
+      }
+      if (this.active.operatorSubmitObservedAt && Date.now() - this.active.operatorSubmitObservedAt > 45000) {
+        await this.event(task, 'needs_action', {
+          code: 'submission_state_unknown',
+          message: 'Cloudflare did not show a recognized signup confirmation. Review the visible browser before continuing.',
+          keepTaskOpen: false,
+          screenshotBase64: await screenshot(page),
+        });
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -296,15 +315,15 @@ class Runner {
     await page.goto(officialCloudflareUrl(task.url), { waitUntil: 'domcontentloaded', timeout: 60000 });
     const notifyNeedsAction = async (code, message) => this.event(task, 'needs_action', { code, message, keepTaskOpen: true });
     let text = await pageText(page);
-    if (challengePage(page.url(), text)) {
+    if (isCloudflareChallenge(page.url(), text)) {
       await notifyNeedsAction('challenge', 'Complete the Cloudflare verification challenge in the visible Chromium window');
       const challengeDeadline = Date.now() + TASK_TIMEOUT_MS;
       while (Date.now() < challengeDeadline && !this.active.cancelled && !page.isClosed()) {
         text = await pageText(page);
-        if (!challengePage(page.url(), text)) break;
+        if (!isCloudflareChallenge(page.url(), text)) break;
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-      if (challengePage(page.url(), text)) {
+      if (isCloudflareChallenge(page.url(), text)) {
         throw Object.assign(new Error('Cloudflare verification challenge timed out'), { code: 'challenge_timeout' });
       }
     }
@@ -315,7 +334,7 @@ class Runner {
     let challengeReported = false;
     while (Date.now() < deadline && !this.active.cancelled && !page.isClosed()) {
       text = await pageText(page);
-      if (challengePage(page.url(), text)) {
+      if (isCloudflareChallenge(page.url(), text)) {
         if (!challengeReported) {
           await notifyNeedsAction('challenge', 'Complete the Cloudflare profile challenge in the visible Chromium window');
           challengeReported = true;
@@ -359,13 +378,21 @@ class Runner {
     }
     await notifyNeedsAction(
       'verification_pending',
-      'Existing account opened. Use Cloudflare\'s visible UI to resend verification, then click "I clicked Resend" in the panel.',
+      'Existing account opened. If needed, request another verification email in the visible Cloudflare page.',
     );
+    await observeTrustedOperatorSubmit(page, (requestedAt) => {
+      if (!this.active) return;
+      this.active.verificationRequestObservedAt ||= requestedAt;
+    });
     let challengeReported = false;
     const deadline = Date.now() + TASK_TIMEOUT_MS;
     while (Date.now() < deadline && !this.active.cancelled && !page.isClosed()) {
       const text = await pageText(page);
-      if (challengePage(page.url(), text)) {
+      const requestState = inspectCloudflareVerificationRequest({
+        url: page.url(), text, email: task.email,
+        requestObserved: Boolean(this.active.verificationRequestObservedAt),
+      });
+      if (requestState.state === 'challenge') {
         if (!challengeReported) {
           await notifyNeedsAction('challenge', 'Complete the Cloudflare reconciliation challenge in the visible Chromium window');
           challengeReported = true;
@@ -375,10 +402,18 @@ class Runner {
         await this.event(task, 'verified', { cloudflareAccountId: accountId });
         process.stdout.write(`Verified during reconciliation: ${task.email}\n`);
         return;
-      } else if (this.active.resendConfirmed) {
-        this.active.stage = 'submitted';
-        await this.event(task, 'submitted', { storageState: await context.storageState(), resubmitted: true });
-        process.stdout.write(`Verification requested during reconciliation: ${task.email}\n`);
+      } else if (requestState.state === 'rate_limited') {
+        await this.event(task, 'needs_action', {
+          code: 'rate_limited', message: 'Cloudflare temporarily rate limited the verification request', keepTaskOpen: false,
+        });
+        return;
+      } else if (requestState.state === 'accepted') {
+        this.active.stage = 'verification_requested';
+        await this.event(task, 'verification_requested', {
+          evidence: requestState.evidence,
+          storageState: await context.storageState(),
+        });
+        process.stdout.write(`Cloudflare confirmed a verification request for ${task.email}\n`);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -394,7 +429,10 @@ class Runner {
   async handle(task) {
     const context = await this.browser.newContext(task.storageState ? { storageState: task.storageState } : {});
     const page = await context.newPage();
-    this.active = { task, context, page, cancelled: false, stage: 'opening', resendConfirmed: false };
+    this.active = {
+      task, context, page, cancelled: false, stage: 'opening',
+      operatorSubmitObservedAt: null, verificationRequestObservedAt: null,
+    };
     try {
       if (task.kind === 'signup') await this.signup(task, context, page);
       else if (task.kind === 'verify') await this.verify(task, context, page);
@@ -408,7 +446,7 @@ class Runner {
           message: safeMessage,
           retryable: Boolean(error.retryable || /timeout|network|closed/i.test(safeMessage)),
           uncertain: task.kind === 'reconcile'
-            || (task.kind === 'signup' && ['awaiting_submit', 'submitted'].includes(this.active.stage)),
+            || (task.kind === 'signup' && ['awaiting_submit', 'signup_accepted'].includes(this.active.stage)),
           screenshotBase64: await screenshot(page),
         }).catch(() => {});
       }

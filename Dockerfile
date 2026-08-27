@@ -6,7 +6,8 @@ WORKDIR /app
 RUN npm install --global @atomicmail/agent-skill@0.3.26 \
     && npm cache clean --force
 
-COPY --chown=node:node package.json ./
+COPY --chown=node:node package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 COPY --chown=node:node src ./src
 COPY --chown=node:node public ./public
 COPY --chown=node:node scripts ./scripts

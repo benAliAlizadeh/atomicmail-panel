@@ -138,6 +138,9 @@ export class Store {
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at TEXT NOT NULL,
         submitted_at TEXT,
+        signup_acceptance_evidence TEXT,
+        verification_wait_started_at TEXT,
+        last_inbox_check_at TEXT,
         verification_received_at TEXT,
         verified_at TEXT,
         last_error_code TEXT,
@@ -178,6 +181,15 @@ export class Store {
     ];
     for (const [name, definition] of additions) {
       if (!jobItemColumns.has(name)) this.db.exec(`ALTER TABLE job_items ADD COLUMN ${name} ${definition}`);
+    }
+    const cloudflareItemColumns = new Set(this.db.prepare(`PRAGMA table_info(cloudflare_job_items)`).all().map((row) => row.name));
+    const cloudflareAdditions = [
+      ['signup_acceptance_evidence', 'TEXT'],
+      ['verification_wait_started_at', 'TEXT'],
+      ['last_inbox_check_at', 'TEXT'],
+    ];
+    for (const [name, definition] of cloudflareAdditions) {
+      if (!cloudflareItemColumns.has(name)) this.db.exec(`ALTER TABLE cloudflare_job_items ADD COLUMN ${name} ${definition}`);
     }
   }
 

@@ -2,20 +2,74 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import '@atomicmail/agent-skill/esm/_dnt.polyfills.js';
 import { resolveProviderInvocation } from './provider.js';
 import { redactSecrets } from './utils.js';
 import { selectCloudflareVerification } from './cloudflare-verification.js';
+import { createAgentSession } from '@atomicmail/agent-skill/esm/lib/integrations/create-agent-session.js';
+import {
+  DEFAULT_JMAP_USING,
+  readOpsFile,
+  runJmapRequest,
+} from '@atomicmail/agent-skill/esm/lib/agent/jmap/agent-jmap.js';
+import { JmapRequestCoordinator } from './jmap-coordinator.js';
 
 const DEFAULT_OUTPUT_LIMIT = 4 * 1024 * 1024;
 const EMAIL_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 
 export class MailClientError extends Error {
-  constructor(message, { statusCode = 502, code = 'mail_provider_error' } = {}) {
+  constructor(message, { statusCode = 502, code = 'mail_provider_error', retryAfterMs = 0, retryAt = null } = {}) {
     super(message);
     this.name = 'MailClientError';
     this.statusCode = statusCode;
     this.code = code;
+    this.retryAfterMs = Math.max(0, Number(retryAfterMs) || 0);
+    this.retryAt = retryAt || null;
     this.expose = true;
+  }
+}
+
+class EncryptedCredentialStore {
+  constructor(vault, username) {
+    this.vault = vault;
+    this.username = username;
+  }
+
+  optional(relative) {
+    try {
+      return this.vault.readEncryptedFile(this.username, relative).toString('utf8').trim() || undefined;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return undefined;
+      throw error;
+    }
+  }
+
+  async load() {
+    return {
+      credentials: this.vault.readCredentials(this.username),
+      sessionJwt: this.optional('session.jwt'),
+      capabilityJwt: this.optional('capability.jwt'),
+    };
+  }
+
+  async save(artifacts) {
+    if (artifacts.credentials !== undefined) {
+      this.vault.writeEncryptedFile(
+        this.username,
+        'credentials.json',
+        Buffer.from(`${JSON.stringify(artifacts.credentials, null, 2)}\n`, 'utf8'),
+      );
+    }
+    if (artifacts.sessionJwt !== undefined) {
+      this.vault.writeEncryptedFile(this.username, 'session.jwt', Buffer.from(String(artifacts.sessionJwt), 'utf8'));
+    }
+    if (artifacts.capabilityJwt !== undefined) {
+      this.vault.writeEncryptedFile(this.username, 'capability.jwt', Buffer.from(String(artifacts.capabilityJwt), 'utf8'));
+    }
+  }
+
+  async clear() {
+    throw new Error('Credential removal is not available through the mail session cache');
   }
 }
 
@@ -334,12 +388,30 @@ function safeAttachmentFilename(value, index = 0) {
 }
 
 export class AtomicMailJmapClient {
-  constructor(config, vault, { runner = runCliProcess } = {}) {
+  constructor(config, vault, {
+    runner = null,
+    coordinator = null,
+    sessionFactory = createAgentSession,
+    jmapExecutor = runJmapRequest,
+    opsReader = readOpsFile,
+  } = {}) {
     this.config = config;
     this.vault = vault;
-    this.runner = runner;
+    this.runner = runner || runCliProcess;
+    this.legacyRunner = Boolean(runner);
+    this.sessionFactory = sessionFactory;
+    this.jmapExecutor = jmapExecutor;
+    this.opsReader = opsReader;
+    this.sessions = new Map();
     this.queues = new Map();
     this.mailboxRoleCache = new Map();
+    this.coordinator = coordinator || new JmapRequestCoordinator({
+      executor: (username, operation, context) => this.executeDirect(username, operation, context),
+      maxRetries: Number(this.config.jmapMaxRetries ?? 3),
+      baseDelayMs: Number(this.config.jmapRetryBaseMs || 1000),
+      maxDelayMs: Number(this.config.jmapRetryMaxMs || 30000),
+      minIntervalMs: Number(this.config.jmapGlobalMinIntervalMs || 500),
+    });
   }
 
   enqueue(username, task) {
@@ -353,7 +425,119 @@ export class AtomicMailJmapClient {
     return tracked;
   }
 
-  async request(username, { ops = null, opsFile = null, vars = null, attachments = [], outputLimit = DEFAULT_OUTPUT_LIMIT, signal = null }) {
+  async getSession(username) {
+    if (!this.sessions.has(username)) {
+      const pending = this.sessionFactory({
+        store: new EncryptedCredentialStore(this.vault, username),
+        credentialDir: `encrypted-vault://${username}`,
+        env: {
+          authUrl: this.config.atomicAuthUrl,
+          apiUrl: this.config.atomicApiUrl,
+          scryptSalt: this.config.atomicScryptSalt,
+        },
+      }).catch((error) => {
+        this.sessions.delete(username);
+        throw error;
+      });
+      this.sessions.set(username, pending);
+    }
+    return this.sessions.get(username);
+  }
+
+  async executeDirect(username, operation, { signal = null } = {}) {
+    if (signal?.aborted) throw new MailClientError('Mail request was cancelled', { statusCode: 499, code: 'mail_cancelled' });
+    const {
+      ops = null,
+      opsFile = null,
+      vars = null,
+      attachments = [],
+      outputLimit = DEFAULT_OUTPUT_LIMIT,
+    } = operation;
+    let attachmentDir = null;
+    try {
+      let attachmentInputs = [];
+      if (attachments.length) {
+        const runtimeRoot = this.config.runtimeCredentialsRoot || os.tmpdir();
+        fs.mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
+        attachmentDir = fs.mkdtempSync(path.join(runtimeRoot, 'mail-attachments-'));
+        const usedNames = new Set();
+        attachmentInputs = attachments.map((attachment, index) => {
+          let filename = safeAttachmentFilename(attachment?.name, index);
+          if (usedNames.has(filename.toLowerCase())) {
+            const extension = path.extname(filename);
+            filename = `${path.basename(filename, extension).slice(0, 160)}-${index + 1}${extension}`;
+          }
+          usedNames.add(filename.toLowerCase());
+          const filePath = path.join(attachmentDir, filename);
+          fs.writeFileSync(filePath, Buffer.from(attachment.data), { mode: 0o600 });
+          return { path: filePath, filename, contentType: attachment.type || undefined };
+        });
+      }
+      const session = await this.getSession(username);
+      const opsJson = opsFile
+        ? await this.opsReader(process.cwd(), opsFile)
+        : (typeof ops === 'string' ? ops : JSON.stringify(ops));
+      const result = await this.jmapExecutor({
+        session,
+        opsJson,
+        defaultUsing: [...DEFAULT_JMAP_USING],
+        sourceLabel: opsFile || 'inline JMAP operations',
+        vars: vars || undefined,
+        attachments: attachmentInputs,
+        attachmentPathBase: attachmentDir || process.cwd(),
+      });
+      if (!result.ok) {
+        const detail = safeProviderDetail(result.bodyText, { vars, paths: [attachmentDir] }).slice(0, 700);
+        const error = new MailClientError(`Atomic Mail JMAP request failed (HTTP ${result.status})${detail ? `: ${detail}` : ''}`, {
+          statusCode: Number(result.status) || 502,
+          code: Number(result.status) === 429 ? 'mail_rate_limited' : 'mail_provider_error',
+        });
+        if (Number(result.status) === 401) {
+          session.invalidateJmapSessionCache?.();
+          this.sessions.delete(username);
+        }
+        throw error;
+      }
+      if (Buffer.byteLength(String(result.bodyText || ''), 'utf8') > Math.max(1024, Number(outputLimit) || DEFAULT_OUTPUT_LIMIT)) {
+        throw new MailClientError('Atomic Mail returned a JMAP response larger than the safety limit', {
+          statusCode: 502, code: 'mail_response_too_large',
+        });
+      }
+      const body = safeJson(result.bodyText);
+      if (!body || typeof body !== 'object') throw new MailClientError('Atomic Mail returned an invalid JMAP response');
+      const methodError = firstMethodError(body);
+      if (methodError) {
+        const detail = safeProviderDetail(methodError, { vars }).slice(0, 500);
+        throw new MailClientError(`Atomic Mail rejected the mail operation: ${detail}`, { statusCode: 422, code: 'jmap_method_error' });
+      }
+      return body;
+    } catch (error) {
+      if (signal?.aborted) throw new MailClientError('Mail request was cancelled', { statusCode: 499, code: 'mail_cancelled' });
+      if (error instanceof MailClientError) throw error;
+      const detail = safeProviderDetail(error?.message || String(error), { vars, paths: [attachmentDir] });
+      const status = Number(String(error?.message || '').match(/HTTP\s+(\d{3})\b/i)?.[1] || 0);
+      throw new MailClientError(`Atomic Mail mail request failed${detail ? `: ${detail.slice(0, 700)}` : ''}`, {
+        statusCode: status || 502,
+        code: status === 429 ? 'mail_rate_limited' : 'mail_provider_error',
+      });
+    } finally {
+      if (attachmentDir) {
+        try { fs.rmSync(attachmentDir, { recursive: true, force: true }); } catch {}
+      }
+    }
+  }
+
+  async request(username, options) {
+    if (this.legacyRunner) return this.requestViaCli(username, options);
+    const priority = options.priority === 'background' ? 'background' : 'interactive';
+    return this.coordinator.schedule(username, options, {
+      priority,
+      signal: options.signal || null,
+      coalesceKey: options.coalesceKey || '',
+    });
+  }
+
+  async requestViaCli(username, { ops = null, opsFile = null, vars = null, attachments = [], outputLimit = DEFAULT_OUTPUT_LIMIT, signal = null }) {
     return this.enqueue(username, async () => {
       if (signal?.aborted) {
         throw new MailClientError('Mail request was cancelled', { statusCode: 499, code: 'mail_cancelled' });
@@ -473,7 +657,7 @@ export class AtomicMailJmapClient {
     });
   }
 
-  async mailboxIdForRole(username, role, { required = true, signal = null } = {}) {
+  async mailboxIdForRole(username, role, { required = true, signal = null, priority = 'interactive' } = {}) {
     const safeRole = String(role || '').toLowerCase();
     if (!['inbox', 'sent', 'trash', 'archive'].includes(safeRole)) {
       throw new MailClientError('Mailbox folder is invalid', { statusCode: 400, code: 'invalid_mailbox' });
@@ -488,7 +672,12 @@ export class AtomicMailJmapClient {
         limit: 1,
       }, 'mq0']],
     };
-    const result = await this.request(username, { ops, signal });
+    const result = await this.request(username, {
+      ops,
+      signal,
+      priority,
+      coalesceKey: priority === 'background' ? `mailbox-role:${safeRole}` : '',
+    });
     const payload = methodResponse(result, 'Mailbox/query', 'mq0') || {};
     const id = Array.isArray(payload.ids) ? String(payload.ids[0] || '') : '';
     if (!id && required) throw new MailClientError(`${safeRole} mailbox is unavailable`, { statusCode: 422, code: 'mailbox_unavailable' });
@@ -511,7 +700,9 @@ export class AtomicMailJmapClient {
       max: this.config.mailMaxSearchBytes || 256,
       required: false,
     }).trim();
-    const mailboxId = safeFolder === 'inbox' ? '$INBOX_MAILBOX_ID' : await this.mailboxIdForRole(username, 'sent', { signal });
+    const mailboxId = safeFolder === 'inbox' && this.legacyRunner
+      ? '$INBOX_MAILBOX_ID'
+      : await this.mailboxIdForRole(username, safeFolder, { signal });
     const filter = { inMailbox: mailboxId };
     if (safeSearch) filter[safeField] = safeSearch;
     const ops = {
@@ -563,13 +754,16 @@ export class AtomicMailJmapClient {
     if (!Number.isFinite(afterMs)) {
       throw new MailClientError('Cloudflare submission timestamp is invalid', { statusCode: 400, code: 'invalid_verification_window' });
     }
+    const inboxMailboxId = this.legacyRunner
+      ? '$INBOX_MAILBOX_ID'
+      : await this.mailboxIdForRole(username, 'inbox', { signal, priority: 'background' });
     const ops = {
       using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
       methodCalls: [
         ['Email/query', {
           accountId: '$ACCOUNT_ID',
           filter: {
-            inMailbox: '$INBOX_MAILBOX_ID',
+            inMailbox: inboxMailboxId,
             after: new Date(afterMs).toISOString(),
           },
           sort: [{ property: 'receivedAt', isAscending: false }],
@@ -588,7 +782,12 @@ export class AtomicMailJmapClient {
         }, 'cfg0'],
       ],
     };
-    const result = await this.request(username, { ops, signal });
+    const result = await this.request(username, {
+      ops,
+      signal,
+      priority: 'background',
+      coalesceKey: `cloudflare-verification:${new Date(afterMs).toISOString()}`,
+    });
     const payload = methodResponse(result, 'Email/get', 'cfg0') || {};
     const messages = Array.isArray(payload.list) ? payload.list.map(normalizedMessage) : [];
     return selectCloudflareVerification(messages, { recipient, submittedAt });

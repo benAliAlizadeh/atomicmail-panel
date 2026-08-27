@@ -142,6 +142,29 @@ test('Cloudflare restart recovery never blindly re-submits an uncertain visible 
     const reconcileTask = orchestrator.claimTask(reconcileSession);
     assert.equal(reconcileTask.kind, 'reconcile');
     assert.equal(reconcileTask.url, 'https://dash.cloudflare.com/login');
+
+    const legacyId = 'cfjob_legacy_acceptance';
+    const legacy = current.cloudflareStore.createJob({
+      id: legacyId,
+      mailboxIds: ['mbx_2'],
+      passwordMode: 'manual',
+      passwordCiphertext: current.vault.sealCloudflareSecret('Strong!Shared-Password-2277', {
+        purpose: 'cloudflare-job-password', id: legacyId,
+      }),
+    });
+    current.store.db.prepare(`
+      UPDATE cloudflare_job_items SET status='waiting_for_verification', phase='waiting_for_verification',
+        submitted_at=?, signup_acceptance_evidence=NULL WHERE id=?
+    `).run(new Date().toISOString(), legacy.items[0].id);
+    const legacyRecovery = current.cloudflareStore.recoverInterruptedWork();
+    assert.equal(legacyRecovery.signupAcceptanceUnconfirmed, 1);
+    const legacyItem = current.cloudflareStore.getItem(legacy.items[0].id);
+    assert.equal(legacyItem.status, 'needs_action');
+    assert.equal(legacyItem.last_error_code, 'signup_acceptance_unconfirmed');
+    assert.throws(
+      () => current.cloudflareStore.retryItem(legacyItem.id),
+      (error) => error.code === 'reconcile_required',
+    );
   } finally {
     current.close();
   }
@@ -269,9 +292,15 @@ test('Cloudflare verification selector rejects lookalike domains and mismatched 
 test('Cloudflare runner pairing is one-time, protocol-bound and rejects insecure remote transport', () => {
   const current = fixture();
   try {
+    assert.equal(CLOUDFLARE_RUNNER_PROTOCOL, 2);
     const manager = new CloudflareRunnerManager({ config: current.config, store: current.store });
-    const pairing = manager.issuePairing();
+    const oldProtocol = manager.issuePairing();
     const localRequest = { socket: { remoteAddress: '127.0.0.1', encrypted: false }, headers: {} };
+    assert.throws(
+      () => manager.exchange(localRequest, { code: oldProtocol.code, protocolVersion: 1, name: 'Old runner' }),
+      (error) => error.statusCode === 409 && error.code === 'runner_protocol_mismatch',
+    );
+    const pairing = manager.issuePairing();
     const paired = manager.exchange(localRequest, {
       code: pairing.code, protocolVersion: CLOUDFLARE_RUNNER_PROTOCOL, name: 'Test runner',
     });
@@ -293,10 +322,18 @@ test('Cloudflare runner pairing is one-time, protocol-bound and rejects insecure
       (error) => error.statusCode === 403 && error.code === 'runner_transport_insecure',
     );
     manager.revoke();
+    assert.equal(manager.status().online, false);
     assert.throws(
       () => manager.authenticate({ ...localRequest, headers: { authorization: `Bearer ${paired.token}` } }),
       (error) => error.statusCode === 401 && error.code === 'runner_auth_invalid',
     );
+    const reconnectCode = manager.issuePairing();
+    const reconnected = manager.exchange(localRequest, {
+      code: reconnectCode.code, protocolVersion: CLOUDFLARE_RUNNER_PROTOCOL, name: 'Reconnected runner',
+    });
+    assert.equal(manager.status().online, true);
+    assert.notEqual(reconnected.token, paired.token);
+    manager.revoke();
     current.config.cloudflarePairingTtlMs = -1;
     const expired = manager.issuePairing();
     assert.throws(
@@ -355,9 +392,23 @@ test('Cloudflare orchestrator completes signup, trusted inbox polling and profil
     orchestrator.handleRunnerEvent(session, signup.id, signup.generation, {
       event: 'awaiting_submit', storageState: { cookies: [] },
     });
+    assert.throws(
+      () => orchestrator.handleRunnerEvent(session, signup.id, signup.generation, { event: 'submitted' }),
+      (error) => error.statusCode === 400,
+    );
+    assert.equal(current.cloudflareStore.getItem(signup.id).status, 'awaiting_submit');
     orchestrator.handleRunnerEvent(session, signup.id, signup.generation, {
-      event: 'submitted', storageState: { cookies: [{ name: 'cf', value: 'private' }] },
+      event: 'needs_action', code: 'challenge', message: 'Complete the visible challenge', keepTaskOpen: true,
     });
+    assert.equal(current.cloudflareStore.getJob(jobId).needs_action_count, 1);
+    orchestrator.handleRunnerEvent(session, signup.id, signup.generation, {
+      event: 'signup_accepted', evidence: 'verification_prompt_with_email',
+      storageState: { cookies: [{ name: 'cf', value: 'private' }] },
+    });
+    const waiting = current.cloudflareStore.getJob(jobId);
+    assert.equal(waiting.needs_action_count, 0);
+    assert.equal(waiting.items[0].status, 'waiting_for_verification');
+    assert.equal(waiting.items[0].signup_acceptance_evidence, 'verification_prompt_with_email');
     await orchestrator.tick();
     assert.equal(inboxChecks, 1);
     const verification = orchestrator.claimTask(session);
@@ -369,6 +420,51 @@ test('Cloudflare orchestrator completes signup, trusted inbox polling and profil
     const completed = current.cloudflareStore.getJob(jobId);
     assert.equal(completed.status, 'completed');
     assert.equal(completed.verified_count, 1);
+  } finally {
+    current.close();
+  }
+});
+
+test('Cloudflare verification polling stops with a recoverable action after its bounded window', async () => {
+  const current = fixture();
+  try {
+    const jobId = 'cfjob_timeout';
+    current.cloudflareStore.createJob({
+      id: jobId,
+      mailboxIds: ['mbx_1'],
+      passwordMode: 'manual',
+      passwordCiphertext: current.vault.sealCloudflareSecret('Strong!Shared-Password-3355', {
+        purpose: 'cloudflare-job-password', id: jobId,
+      }),
+    });
+    current.cloudflareStore.beginNextSignup();
+    const task = current.cloudflareStore.claimRunnerTask('runner-timeout', 60000);
+    current.cloudflareStore.markAwaitingSubmit(task.id, 'runner-timeout', task.lease_generation);
+    current.cloudflareStore.markSubmitted(task.id, 'runner-timeout', task.lease_generation, null, {
+      evidence: 'verification_prompt_after_operator_submit',
+    });
+    current.store.db.prepare(`
+      UPDATE cloudflare_job_items SET verification_wait_started_at=?, next_attempt_at=? WHERE id=?
+    `).run(new Date(Date.now() - 301000).toISOString(), new Date(0).toISOString(), task.id);
+    let mailCalls = 0;
+    const orchestrator = new CloudflareOrchestrator({
+      cloudflareStore: current.cloudflareStore,
+      store: current.store,
+      vault: current.vault,
+      mailClient: { async findCloudflareVerification() { mailCalls += 1; } },
+      runnerManager: { status: () => ({ online: false }) },
+      artifactStore: {},
+      config: { cloudflareVerificationTimeoutMs: 300000, cloudflareEmailPollMs: 15000 },
+    });
+    await orchestrator.pollVerification(current.cloudflareStore.getItem(task.id));
+    const timedOut = current.cloudflareStore.getJob(jobId);
+    assert.equal(mailCalls, 0);
+    assert.equal(timedOut.status, 'needs_action');
+    assert.equal(timedOut.needs_action_count, 1);
+    assert.equal(timedOut.items[0].last_error_code, 'verification_email_timeout');
+    const retried = current.cloudflareStore.retryItem(task.id);
+    assert.equal(retried.status, 'waiting_for_verification');
+    assert.equal(current.cloudflareStore.getJob(jobId).needs_action_count, 0);
   } finally {
     current.close();
   }

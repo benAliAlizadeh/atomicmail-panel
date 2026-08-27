@@ -515,3 +515,45 @@ test('mail provider failures return redacted details and never persist them in a
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('Atomic Mail 429 is a temporary friendly response with Retry-After and no red error audit', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-mail-rate-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const worker = { circuitState: () => ({ open: false }), resetCircuit() {} };
+  const mailClient = {
+    async listMailbox() {
+      const error = new Error('Atomic Mail is temporarily rate limiting requests. Retrying automatically…');
+      error.name = 'MailClientError';
+      error.statusCode = 429;
+      error.code = 'mail_rate_limited';
+      error.retryAfterMs = 2400;
+      error.retryAt = new Date(Date.now() + 2400).toISOString();
+      throw error;
+    },
+  };
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['ratelimit111'] });
+  const item = store.markItemRunning(job.items[0].id);
+  const mailboxId = store.markItemSucceeded(item.id, {
+    username: item.username,
+    email: `${item.username}@atomicmail.ai`,
+    inboxId: item.username,
+    credentialsPath: path.join(root, 'credentials', item.username, 'credentials.json.enc'),
+  });
+  const server = createServer({ store, worker, config: makeConfig(root, ''), mailClient });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/mailboxes/${mailboxId}/mail`);
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get('retry-after'), '3');
+    const body = await response.json();
+    assert.equal(body.code, 'mail_rate_limited');
+    assert.equal(body.temporary, true);
+    assert.equal(body.retryAfterMs, 2400);
+    assert.match(body.error, /temporarily rate limiting/i);
+    assert.doesNotMatch(JSON.stringify(store.recentAudit(20)), /mail\.operation_failed/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

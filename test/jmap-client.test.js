@@ -393,3 +393,25 @@ test('mail headers reject CRLF injection and provider errors redact private comp
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('production JMAP path reuses one encrypted-vault AgentSession per mailbox', async () => {
+  let sessionCreations = 0;
+  const seenSessions = [];
+  const session = { id: 'cached-session' };
+  const client = new AtomicMailJmapClient(config(), {}, {
+    sessionFactory: async () => {
+      sessionCreations += 1;
+      return session;
+    },
+    jmapExecutor: async (input) => {
+      seenSessions.push(input.session);
+      return { ok: true, status: 200, bodyText: JSON.stringify({ methodResponses: [] }) };
+    },
+  });
+  const operation = { using: ['urn:ietf:params:jmap:core'], methodCalls: [] };
+  await client.request('boxname111', { ops: operation });
+  await client.request('boxname111', { ops: operation });
+  assert.equal(sessionCreations, 1);
+  assert.deepEqual(seenSessions, [session, session]);
+  assert.equal(client.coordinator.status().activeMailbox, null);
+});

@@ -99,7 +99,7 @@ export class CloudflareOrchestrator {
       limits: {
         maxBatchSize: Number(this.config.cloudflareMaxBatchSize || 100),
         emailPollMs: Number(this.config.cloudflareEmailPollMs || 15000),
-        verificationTimeoutMs: Number(this.config.cloudflareVerificationTimeoutMs || 1200000),
+        verificationTimeoutMs: Number(this.config.cloudflareVerificationTimeoutMs || 300000),
       },
     };
   }
@@ -131,7 +131,9 @@ export class CloudflareOrchestrator {
       this.cloudflareStore.markNeedsAction(item.id, 'submission_time_missing', 'Signup submission time is missing; reconcile this account manually');
       return;
     }
-    if (Date.now() - submittedAt >= Number(this.config.cloudflareVerificationTimeoutMs || 1200000)) {
+    const waitStartedAt = Date.parse(item.verification_wait_started_at || item.submitted_at || '');
+    if (Number.isFinite(waitStartedAt)
+      && Date.now() - waitStartedAt >= Number(this.config.cloudflareVerificationTimeoutMs || 300000)) {
       this.cloudflareStore.markNeedsAction(item.id, 'verification_email_timeout', 'No trusted Cloudflare verification email arrived within the configured timeout');
       this.store.audit('warn', 'cloudflare.verification_timeout', `Verification email timed out for ${item.email}`, item.job_id, item.id);
       return;
@@ -152,8 +154,21 @@ export class CloudflareOrchestrator {
       this.store.audit('info', 'cloudflare.verification_email_found', `Trusted Cloudflare verification email found for ${item.email}`, item.job_id, item.id);
       this.backupManager?.requestBackup('cloudflare-verification-found');
     } catch (error) {
+      const isRateLimit = error?.code === 'mail_rate_limited' || Number(error?.statusCode) === 429;
+      const delay = Math.max(
+        Number(this.config.cloudflareEmailPollMs || 15000),
+        Number(error?.retryAfterMs || 0),
+      );
+      if (isRateLimit) {
+        this.cloudflareStore.scheduleVerificationPoll(
+          item.id,
+          delay,
+          'Atomic Mail is temporarily rate limiting requests. Retrying automatically…',
+        );
+        return;
+      }
       const message = cleanMessage(error?.message, 'AtomicMail verification polling failed');
-      this.cloudflareStore.scheduleVerificationPoll(item.id, this.config.cloudflareEmailPollMs, `Inbox check failed; will retry: ${message}`);
+      this.cloudflareStore.scheduleVerificationPoll(item.id, delay, 'Inbox check could not complete. Retrying automatically…');
       this.store.audit('warn', 'cloudflare.verification_poll_failed', `Inbox polling failed for ${item.email}: ${message}`, item.job_id, item.id);
     }
   }
@@ -237,12 +252,35 @@ export class CloudflareOrchestrator {
       this.cloudflareStore.updateProgress(item.id, session.id, generation, body.phase, body.message);
     } else if (event === 'awaiting_submit') {
       this.cloudflareStore.markAwaitingSubmit(item.id, session.id, generation, this.sealStorageState(item.id, body.storageState));
-    } else if (event === 'submitted') {
+    } else if (event === 'signup_accepted' || event === 'verification_requested') {
+      const acceptedEvidence = new Set([
+        'verification_prompt_with_email',
+        'verification_prompt_after_operator_submit',
+        'resend_prompt_with_email',
+        'resend_prompt_after_operator_action',
+      ]);
+      const evidence = cleanCode(body.evidence, '');
+      const expectedState = event === 'signup_accepted'
+        ? item.status === 'awaiting_submit'
+          || (item.status === 'needs_action' && item.last_error_code === 'challenge')
+        : item.phase === 'needs_action' && item.last_error_code === 'verification_pending';
+      if (!expectedState || !acceptedEvidence.has(evidence)) {
+        throw Object.assign(new Error('Cloudflare signup acceptance evidence is invalid for the current state'), {
+          statusCode: 409, code: 'invalid_signup_acceptance', expose: true,
+        });
+      }
       this.cloudflareStore.markSubmitted(
         item.id, session.id, generation, this.sealStorageState(item.id, body.storageState),
-        { resetSubmittedAt: Boolean(body.resubmitted) },
+        { resetSubmittedAt: event === 'verification_requested', evidence },
       );
       this.cloudflareStore.setJobStatus(item.job_id, 'running');
+      this.store.audit(
+        'info',
+        event === 'signup_accepted' ? 'cloudflare.signup_accepted' : 'cloudflare.verification_request_accepted',
+        `Cloudflare browser confirmed ${event === 'signup_accepted' ? 'signup' : 'verification request'} for ${item.email}`,
+        item.job_id,
+        item.id,
+      );
       this.backupManager?.requestBackup('cloudflare-signup-submitted');
     } else if (event === 'needs_action') {
       const code = cleanCode(body.code, 'runner_needs_action');

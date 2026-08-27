@@ -41,7 +41,13 @@ test('Cloudflare operator workflow exposes selection, visible-runner and non-blo
   assert.match(app, /beginLatestRequest\('cloudflare'/);
   assert.match(app, /data-cloudflare-item-focus/);
   assert.match(app, /data-cloudflare-item-reconcile/);
-  assert.match(app, /data-cloudflare-resend-confirmed/);
+  assert.doesNotMatch(app, /data-cloudflare-resend-confirmed/);
+  assert.match(app, /cloudflareTimelineState/);
+  assert.match(app, /data-cloudflare-item-open/);
+  assert.match(app, /mail_rate_limited/);
+  assert.match(app, /pairCloudflareRunner'\)\.hidden = Boolean\(status\.runner\?\.online\)/);
+  assert.match(app, /Browser Runner disconnected/);
+  assert.match(html, /id="cloudflareTimeline"/);
   assert.match(app, /\/api\/cloudflare\/eligible-mailboxes/);
   assert.match(styles, /\.pill\.awaiting_submit/);
 });
