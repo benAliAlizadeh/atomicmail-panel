@@ -160,6 +160,7 @@ test('dashboard describes agent credential model and timing guards', async () =>
       registerTimeoutMs: 180000,
       postSuccessDelayMs: 5000,
     });
+    assert.equal(body.mail.commandTimeoutMs, 60000);
   });
 });
 
@@ -436,7 +437,9 @@ test('advanced mail API supports Sent/search/pagination/actions/attachments with
     const list = await fetch(`${base}/api/mailboxes/${mailboxId}/mail?folder=sent&limit=25&position=25&field=to&search=person%40example.com`);
     assert.equal(list.status, 200);
     assert.equal((await list.json()).total, 41);
-    assert.deepEqual(calls[0].options, { folder: 'sent', limit: 25, position: 25, search: 'person@example.com', field: 'to' });
+    const { signal, ...listOptions } = calls[0].options;
+    assert.ok(signal instanceof AbortSignal);
+    assert.deepEqual(listOptions, { folder: 'sent', limit: 25, position: 25, search: 'person@example.com', field: 'to' });
 
     const action = await fetch(`${base}/api/mailboxes/${mailboxId}/messages/m1/actions`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'trash' }),
