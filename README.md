@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-24)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-33)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -31,6 +31,11 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - Inbox list with sender, subject, preview, unread state and attachment indicator
 - safe plain-text message reader with extracted HTTP/HTTPS links
 - Compose and Reply through the official AgentSkill JMAP send/reply flows
+- Inbox/Sent tabs, provider-side search and position pagination
+- mark read/unread, Archive, safe move-to-Trash and conservative per-mailbox auto-refresh
+- safe attachment upload/download through the AgentSkill JMAP blob flow
+- verification-code and verification-link helpers without executing message HTML
+- encrypted per-job destination-account password vault with CSRF-protected reveal/copy and explicit sensitive export
 
 ## Local run on Windows / PowerShell
 
@@ -94,7 +99,9 @@ Do not delete or overwrite these directories. `credentials.json` contains the AP
 
 ### Important: agent inboxes are not human webmail accounts
 
-This panel uses Atomic Mail's **agent** registration path and creates `@atomicmail.ai` inboxes. That path authenticates with an API key/JWT credential model and does **not** create a human webmail password or a 12-word recovery seed phrase. Password + BIP39 seed phrases belong to Atomic Mail's separate human-facing `@atomicmail.io` account flow. The panel therefore does not ask for a batch password because the agent registration API has no password field to send.
+This panel uses Atomic Mail's **agent** registration path and creates `@atomicmail.ai` inboxes. That path authenticates with an API key/JWT credential model and does **not** create a human webmail password or a 12-word recovery seed phrase. Password + BIP39 seed phrases belong to Atomic Mail's separate human-facing `@atomicmail.io` account flow.
+
+The optional **Destination account password** on the Create page is deliberately separate: it is an encrypted operator vault value shared by every mailbox in that job for use at destination services. It is never sent to Atomic Mail and is not an Atomic Mail credential.
 
 ## Create emails
 
@@ -117,35 +124,47 @@ On SIGINT/SIGTERM the panel stops accepting new work, aborts the active registra
 If the process is force-killed before graceful shutdown finishes, startup recovery handles the remaining `running` item.
 
 
-## Webmail — AM-21 → AM-24
+## Webmail — AM-21 → AM-30
 
 Open **Mailboxes → Open inbox** to use an agent inbox without exposing its API key to the browser. The browser talks only to this panel; the server materializes the encrypted Atomic Mail credential into an isolated OS-temp runtime, invokes the official AgentSkill `jmap_request`, then immediately re-encrypts any refreshed credentials.
 
-Available in this stage:
+Available:
 
-- Inbox list and manual Refresh
+- Inbox and Sent with manual Refresh
+- conservative auto-refresh (only while one mailbox is open and the tab is visible)
+- provider-side sender/recipient/subject search, page size and position pagination
 - open/read a message as sanitized plain text
 - safe `http://` / `https://` links extracted from the message
+- mark read/unread, Archive and move to Trash (no permanent-delete action)
 - Compose / Send
-- Reply
+- Reply, including attachments
+- attachment metadata and guarded download
+- heuristic verification-code/link detection with Copy/Open controls
 
 Message HTML is never rendered directly in the operator page, and scripts are not executed. Message bodies are not written to the panel audit log. Provider API keys, JWTs and credential paths remain server-side.
 
-Webmail is intentionally **on-demand** in AM-21→24: it does not poll every mailbox in the background, so opening the panel does not create continuous AgentSkill/JMAP traffic. Live inbox polling, Sent, search, mail actions and attachments are later tasks.
+Webmail remains **on-demand per mailbox**: it never loops over all stored mailboxes. Auto-refresh runs at a conservative interval only for the currently open mailbox, pauses while the browser tab is hidden, and stops when Webmail is closed.
 
 Default mail guards:
 
 ```env
 MAIL_COMMAND_TIMEOUT_MS=60000
 MAIL_INBOX_LIMIT=50
+MAIL_AUTO_REFRESH_SECONDS=45
 MAIL_MAX_BODY_BYTES=524288
 MAIL_MAX_COMPOSE_BYTES=204800
 MAIL_MAX_SUBJECT_BYTES=2048
+MAIL_MAX_SEARCH_BYTES=256
+MAIL_MAX_ATTACHMENT_COUNT=5
+MAIL_MAX_ATTACHMENT_BYTES=5242880
+MAIL_MAX_TOTAL_ATTACHMENT_BYTES=10485760
 ```
 
 ## Exports
 
-The Mailboxes page exports the current search as CSV or JSON. Provider credentials and credential paths are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS`.
+The Mailboxes page exports the current search as CSV or JSON. Provider credentials, credential paths and destination passwords are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS`.
+
+**Export email + password** is a separate, explicit POST/CSRF-protected action with a warning confirmation. Its CSV contains plaintext destination passwords and must be handled as sensitive data. Reveal/copy actions are likewise explicit and audited without recording the password value.
 
 ## Provider command
 
@@ -223,7 +242,9 @@ The service should report healthy before you use **Create emails**.
 
 ## Live validation status
 
-AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→24 add the first operator Webmail slice: JMAP core, Inbox, safe message read, Compose/Send and Reply.
+AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→30 complete the multi-mailbox JMAP Webmail, actions, live refresh, search/pagination, attachments, verification helpers and mail security controls. AM-31→32 add the encrypted per-job destination-password vault and backup/restore integration. AM-33 adds full regression, security, migration, backup and restart coverage.
+
+The AM-33 production check also completed a read-only live JMAP smoke for both Inbox and Sent against a temporary copy of the existing vault. No message was sent, modified or deleted, and the source data directory was not migrated or rewritten by the smoke.
 
 ## AM-20 — encrypted credential vault, backup and portability
 
@@ -270,6 +291,8 @@ On Linux/macOS, storage directories are hardened to mode `0700` and secret files
 
 Backups are written to `backups/` as authenticated `.ambak` files. Each backup contains a consistent SQLite snapshot plus the encrypted credential vault, then the whole compressed payload is encrypted again with a purpose-derived AES-256-GCM key.
 
+Per-job destination passwords live only as AES-256-GCM ciphertext in SQLite under a separate HKDF purpose and job-bound authenticated data. They are included automatically in the SQLite snapshot and survive restore only when the matching `secrets/data.key` is available.
+
 Defaults:
 
 ```env
@@ -279,7 +302,7 @@ BACKUP_MIN_GAP_MINUTES=5
 BACKUP_RETENTION=14
 ```
 
-A successful mailbox creation requests a debounced backup; scheduled backups run as a second layer, and graceful shutdown creates a final backup when mailboxes exist. A backup is only reported successful after decryption and SQLite `integrity_check` pass.
+A successful mailbox creation or a new destination-password job requests a debounced backup; scheduled backups run as a second layer, and graceful shutdown creates a final backup whenever persisted job/mailbox data exists. A backup is only reported successful after decryption and SQLite `integrity_check` pass.
 
 The **System → Data safety & portability** card can create a backup manually and verify the latest backup without exposing any credential material.
 

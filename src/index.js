@@ -39,7 +39,7 @@ const server = createServer({ store, worker, config, backupManager, vault, mailC
 
 worker.start();
 backupManager.start();
-if (store.countMailboxes() > 0) backupManager.requestBackup('startup-protection');
+if (store.hasBackupData()) backupManager.requestBackup('startup-protection');
 
 server.listen(config.port, config.host, () => {
   console.log(`AtomicMail Panel listening on http://${config.host}:${config.port}`);

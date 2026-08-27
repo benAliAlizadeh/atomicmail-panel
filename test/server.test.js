@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/db.js';
 import { createServer } from '../src/server.js';
+import { CredentialVault } from '../src/credential-vault.js';
 
 function makeConfig(root, adminPassword = '') {
   return {
@@ -296,6 +297,215 @@ test('webmail APIs expose inbox/read/send/reply without leaking credentials or m
     assert.match(auditRaw, /mail\.replied/);
     assert.doesNotMatch(auditRaw, /private sent body 98765|private reply body 54321/);
     assert.doesNotMatch(auditRaw, /credentials\.json|apiKey/i);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('per-job destination passwords are encrypted, CSRF-protected, explicitly exported, and absent from normal APIs', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-password-api-'));
+  const config = {
+    ...makeConfig(root, 'correct-horse-battery-staple'),
+    dataDir: path.join(root, 'data'),
+    runtimeCredentialsRoot: path.join(root, 'runtime'),
+    secretsDir: path.join(root, 'secrets'),
+    encryptionKeyPath: path.join(root, 'secrets', 'data.key'),
+    backupDir: path.join(root, 'backups'),
+    destinationPasswordMaxBytes: 1024,
+  };
+  config.credentialsRoot = path.join(config.dataDir, 'credentials');
+  const vault = new CredentialVault(config);
+  vault.initialize();
+  const store = new Store(path.join(config.dataDir, 'db.sqlite'));
+  const worker = {
+    circuitState() { return { open: false, permanent: false, until: null, reason: null }; },
+    resetCircuit() {},
+  };
+  const server = createServer({ store, worker, config, vault });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const password = 'destination-only-secret-774411';
+  try {
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'correct-horse-battery-staple' }),
+    });
+    const auth = await login.json();
+    const cookie = cookieFrom(login);
+    const headers = { cookie, 'content-type': 'application/json', 'x-atomicmail-csrf': auth.csrf };
+    const created = await fetch(`${base}/api/jobs`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ count: 1, destinationPassword: password }),
+    });
+    assert.equal(created.status, 201);
+    const rawCreated = await created.text();
+    assert.doesNotMatch(rawCreated, new RegExp(password));
+    assert.doesNotMatch(rawCreated, /ciphertext/i);
+    const job = JSON.parse(rawCreated);
+    assert.equal(job.has_destination_password, 1);
+
+    const encrypted = store.db.prepare('SELECT destination_password_ciphertext FROM jobs WHERE id=?').get(job.id).destination_password_ciphertext;
+    assert.ok(encrypted);
+    assert.doesNotMatch(encrypted, new RegExp(password));
+
+    const noCsrf = await fetch(`${base}/api/jobs/${job.id}/destination-password`, { method: 'POST', headers: { cookie } });
+    assert.equal(noCsrf.status, 403);
+    const reveal = await fetch(`${base}/api/jobs/${job.id}/destination-password`, { method: 'POST', headers, body: '{}' });
+    assert.equal(reveal.status, 200);
+    assert.equal((await reveal.json()).password, password);
+
+    const running = store.markItemRunning(job.items[0].id);
+    const mailboxId = store.markItemSucceeded(running.id, {
+      username: running.username,
+      email: `${running.username}@atomicmail.ai`,
+      inboxId: running.username,
+      credentialsPath: path.join(config.credentialsRoot, running.username, 'credentials.json.enc'),
+    });
+    const mailboxes = await (await fetch(`${base}/api/mailboxes`, { headers: { cookie } })).json();
+    assert.equal(mailboxes.items[0].has_destination_password, 1);
+    assert.doesNotMatch(JSON.stringify(mailboxes), new RegExp(password));
+
+    const normalExport = await (await fetch(`${base}/api/mailboxes/export?format=csv`, { headers: { cookie } })).text();
+    assert.doesNotMatch(normalExport, new RegExp(password));
+    const mailboxReveal = await fetch(`${base}/api/mailboxes/${mailboxId}/destination-password`, { method: 'POST', headers, body: '{}' });
+    assert.equal((await mailboxReveal.json()).password, password);
+
+    const sensitive = await fetch(`${base}/api/mailboxes/export-sensitive`, {
+      method: 'POST', headers, body: JSON.stringify({ confirm: 'EXPORT' }),
+    });
+    assert.equal(sensitive.status, 200);
+    assert.match(await sensitive.text(), new RegExp(password));
+
+    const audit = JSON.stringify(store.recentAudit(100));
+    assert.doesNotMatch(audit, new RegExp(password));
+    assert.doesNotMatch(audit, /destination_password_ciphertext/i);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('advanced mail API supports Sent/search/pagination/actions/attachments with resource guards', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-advanced-mail-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const worker = {
+    circuitState() { return { open: false, permanent: false, until: null, reason: null }; },
+    resetCircuit() {},
+  };
+  const calls = [];
+  const mailClient = {
+    async listMailbox(username, options) {
+      calls.push({ kind: 'list', username, options });
+      return { folder: options.folder, position: options.position, limit: options.limit, total: 41, unreadTotal: 2, state: 's1', syncedAt: '2026-08-27T12:00:00Z', items: [] };
+    },
+    async updateMessage(username, messageId, action) {
+      calls.push({ kind: 'action', username, messageId, action });
+      return { id: messageId, action, updated: true };
+    },
+    async downloadAttachment(username, messageId, attachmentId) {
+      calls.push({ kind: 'download', username, messageId, attachmentId });
+      return { data: Buffer.from('PDF'), name: '../report.pdf', type: 'application/pdf', size: 3 };
+    },
+    async send(username, input) {
+      calls.push({ kind: 'send', username, input });
+      return { emailId: 'e1', submissionId: 's1', to: input.to };
+    },
+  };
+  const config = {
+    ...makeConfig(root, ''),
+    mailInboxLimit: 25,
+    mailMaxSearchBytes: 64,
+    mailMaxComposeBytes: 10000,
+    mailMaxAttachmentCount: 2,
+    mailMaxAttachmentBytes: 1024,
+    mailMaxTotalAttachmentBytes: 1536,
+  };
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['advanced111'] });
+  const item = store.markItemRunning(job.items[0].id);
+  const mailboxId = store.markItemSucceeded(item.id, {
+    username: item.username, email: `${item.username}@atomicmail.ai`, inboxId: item.username,
+    credentialsPath: path.join(root, 'credentials', item.username, 'credentials.json.enc'),
+  });
+  const server = createServer({ store, worker, config, mailClient });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const list = await fetch(`${base}/api/mailboxes/${mailboxId}/mail?folder=sent&limit=25&position=25&field=to&search=person%40example.com`);
+    assert.equal(list.status, 200);
+    assert.equal((await list.json()).total, 41);
+    assert.deepEqual(calls[0].options, { folder: 'sent', limit: 25, position: 25, search: 'person@example.com', field: 'to' });
+
+    const action = await fetch(`${base}/api/mailboxes/${mailboxId}/messages/m1/actions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'trash' }),
+    });
+    assert.equal(action.status, 200);
+
+    const download = await fetch(`${base}/api/mailboxes/${mailboxId}/messages/m1/attachments/0`);
+    assert.equal(download.status, 200);
+    assert.equal(await download.text(), 'PDF');
+    assert.match(download.headers.get('content-disposition') || '', /attachment; filename="report\.pdf"/);
+    assert.equal(download.headers.get('x-content-type-options'), 'nosniff');
+
+    const send = await fetch(`${base}/api/mailboxes/${mailboxId}/send`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        to: 'person@example.com', subject: 'File', body: 'private body',
+        attachments: [{ name: '../safe.txt', type: 'text/plain', data: Buffer.from('hello').toString('base64') }],
+      }),
+    });
+    assert.equal(send.status, 201);
+    const sendCall = calls.find((entry) => entry.kind === 'send');
+    assert.equal(sendCall.input.attachments[0].name, 'safe.txt');
+    assert.equal(sendCall.input.attachments[0].data.toString('utf8'), 'hello');
+
+    const oversized = await fetch(`${base}/api/mailboxes/${mailboxId}/send`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        to: 'person@example.com', subject: 'Too big', body: 'body',
+        attachments: [{ name: 'large.bin', type: 'application/octet-stream', data: Buffer.alloc(1025).toString('base64') }],
+      }),
+    });
+    assert.equal(oversized.status, 413);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('mail provider failures return redacted details and never persist them in audit', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-mail-error-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const worker = { circuitState: () => ({ open: false }), resetCircuit() {} };
+  const leakedPath = path.join(root, 'credentials', 'box', 'credentials.json');
+  const mailClient = {
+    async listMailbox() {
+      const error = new Error(`provider failed apiKey="am_private_12345678" at ${leakedPath}`);
+      error.name = 'MailClientError';
+      error.statusCode = 502;
+      error.code = 'mail_provider_error';
+      throw error;
+    },
+  };
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['errorbox111'] });
+  const item = store.markItemRunning(job.items[0].id);
+  const mailboxId = store.markItemSucceeded(item.id, {
+    username: item.username, email: `${item.username}@atomicmail.ai`, inboxId: item.username, credentialsPath: leakedPath,
+  });
+  const server = createServer({ store, worker, config: { ...makeConfig(root, ''), mailMaxSearchBytes: 64 }, mailClient });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const response = await fetch(`${base}/api/mailboxes/${mailboxId}/mail`);
+    assert.equal(response.status, 502);
+    const raw = await response.text();
+    assert.doesNotMatch(raw, /am_private_12345678|credentials\.json/i);
+    assert.match(raw, /API_KEY_REDACTED|CREDENTIAL_PATH_REDACTED/);
+    const audit = JSON.stringify(store.recentAudit(20));
+    assert.doesNotMatch(audit, /am_private_12345678|credentials\.json/i);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     store.close();

@@ -17,6 +17,15 @@ const state = {
   selectedMailbox: null,
   inboxItems: [],
   selectedMessage: null,
+  mailFolder: 'inbox',
+  mailPosition: 0,
+  mailLimit: 25,
+  mailTotal: 0,
+  mailSearch: '',
+  mailSearchField: 'subject',
+  mailRefreshBusy: false,
+  mailAutoTimer: null,
+  jobDestinationPassword: null,
   composeMode: 'new',
   pollBusy: false,
   pollTimer: null,
@@ -243,6 +252,8 @@ function showApp(authStatus) {
 
 function switchView(view) {
   if (!viewMeta[view]) return;
+  if (state.currentView === 'webmail' && view !== 'webmail') stopWebmailAutoRefresh();
+  if (state.currentView === 'jobs' && view !== 'jobs') hideJobPassword();
   state.currentView = view;
   $$('.view').forEach((item) => { item.hidden = item.dataset.view !== view; });
   const navView = view === 'webmail' ? 'mailboxes' : view;
@@ -252,6 +263,7 @@ function switchView(view) {
   if (view === 'jobs') loadJobs().catch(handleError);
   if (view === 'mailboxes') loadMailboxes().catch(handleError);
   if (view === 'system') loadSystem().catch(handleError);
+  if (view === 'webmail') startWebmailAutoRefresh();
 }
 
 function handleError(error) {
@@ -365,6 +377,7 @@ function itemStatusCounts(items) {
 
 async function loadJobDetail(id) {
   const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+  if (state.selectedJobId !== job.id) hideJobPassword();
   state.selectedJobId = job.id;
   state.selectedJob = job;
   $('#jobDetailPanel').hidden = false;
@@ -377,6 +390,8 @@ async function loadJobDetail(id) {
   renderLiveActivity('#jobLiveStatus', job);
   $('#jobDetailError').hidden = !job.last_error;
   $('#jobDetailError').textContent = job.last_error || '';
+  $('#jobPasswordPanel').hidden = !job.has_destination_password;
+  if (!job.has_destination_password) hideJobPassword();
 
   const actions = [];
   if (job.status === 'running') actions.push('<button class="btn ghost small-btn" data-job-action="pause">Pause</button>');
@@ -421,7 +436,7 @@ async function loadMailboxes() {
     <td><span class="pill">API key</span></td>
     <td>${escapeHtml(formatDate(item.created_at))}</td>
     <td class="mono" title="${escapeHtml(item.job_id || '')}">${escapeHtml(item.job_id ? shortId(item.job_id) : '—')}</td>
-    <td><div class="mailbox-action-group"><button class="btn primary small-btn open-inbox-btn" data-open-inbox="${escapeHtml(item.id)}" data-mailbox-email="${escapeHtml(item.email)}">Open inbox</button><button class="copy-btn" data-copy-email="${escapeHtml(item.email)}">Copy</button></div></td>
+    <td><div class="mailbox-action-group"><button class="btn primary small-btn open-inbox-btn" data-open-inbox="${escapeHtml(item.id)}" data-mailbox-email="${escapeHtml(item.email)}">Open inbox</button><button class="copy-btn" data-copy-email="${escapeHtml(item.email)}">Copy email</button>${item.has_destination_password ? `<button class="copy-btn" data-copy-mailbox-password="${escapeHtml(item.id)}">Copy password</button>` : ''}</div></td>
   </tr>`).join('');
   const page = Math.floor(state.mailboxOffset / state.mailboxLimit) + 1;
   const pages = Math.max(1, Math.ceil(state.mailboxTotal / state.mailboxLimit));
@@ -430,50 +445,87 @@ async function loadMailboxes() {
   $('#mailboxNext').disabled = state.mailboxOffset + state.mailboxLimit >= state.mailboxTotal;
 }
 
-function setMailError(message = '') {
+function setMailError(message = '', detail = '') {
   const box = $('#mailError');
-  box.textContent = message;
+  box.replaceChildren();
+  if (message) {
+    const summary = document.createElement('strong');
+    summary.textContent = message;
+    box.append(summary);
+    if (detail && detail !== message) {
+      const details = document.createElement('details');
+      const label = document.createElement('summary');
+      label.textContent = 'Provider details';
+      const content = document.createElement('p');
+      content.textContent = detail;
+      details.append(label, content);
+      box.append(details);
+    }
+  }
   box.hidden = !message;
 }
 
 function renderInbox(items) {
   state.inboxItems = items || [];
   $('#inboxEmpty').hidden = state.inboxItems.length > 0;
-  $('#inboxCountText').textContent = `${state.inboxItems.length} latest message${state.inboxItems.length === 1 ? '' : 's'}`;
+  const first = state.mailTotal ? state.mailPosition + 1 : 0;
+  const last = Math.min(state.mailTotal, state.mailPosition + state.inboxItems.length);
+  $('#inboxCountText').textContent = `${first}–${last} of ${state.mailTotal} message${state.mailTotal === 1 ? '' : 's'}`;
   $('#inboxList').innerHTML = state.inboxItems.map((item) => {
     const active = state.selectedMessage?.id === item.id ? ' active' : '';
     const unread = item.unread ? ' unread' : '';
     return `<button class="mail-row${active}${unread}" type="button" data-message-id="${escapeHtml(item.id)}">
-      <span class="mail-row-top"><span class="mail-from">${item.unread ? '<span class="unread-dot" aria-label="Unread"></span>' : ''}${escapeHtml(item.fromText || 'Unknown sender')}</span><span class="mail-date">${escapeHtml(formatDate(item.receivedAt))}</span></span>
+      <span class="mail-row-top"><span class="mail-from">${item.unread ? '<span class="unread-dot" aria-label="Unread"></span>' : ''}${escapeHtml(state.mailFolder === 'sent' ? (item.toText || 'Unknown recipient') : (item.fromText || 'Unknown sender'))}</span><span class="mail-date">${escapeHtml(formatDate(item.receivedAt || item.sentAt))}</span></span>
       <span class="mail-subject">${escapeHtml(item.subject || '(no subject)')}${item.hasAttachment ? ' · 📎' : ''}</span>
       <span class="mail-preview">${escapeHtml(item.preview || '')}</span>
     </button>`;
   }).join('');
+  const page = Math.floor(state.mailPosition / state.mailLimit) + 1;
+  const pages = Math.max(1, Math.ceil(state.mailTotal / state.mailLimit));
+  $('#mailPageText').textContent = `Page ${page} of ${pages}`;
+  $('#mailPrev').disabled = state.mailPosition <= 0;
+  $('#mailNext').disabled = state.mailPosition + state.mailLimit >= state.mailTotal;
 }
 
 async function loadInbox() {
-  if (!state.selectedMailbox) return;
+  if (!state.selectedMailbox || state.mailRefreshBusy) return;
+  state.mailRefreshBusy = true;
   const loading = $('#inboxLoading');
   loading.hidden = false;
   setMailError('');
   $('#refreshInbox').disabled = true;
   try {
-    const data = await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/inbox?limit=50`);
+    const params = new URLSearchParams({
+      folder: state.mailFolder,
+      limit: state.mailLimit,
+      position: state.mailPosition,
+      field: state.mailSearchField,
+    });
+    if (state.mailSearch) params.set('search', state.mailSearch);
+    const data = await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/mail?${params}`);
     state.selectedMailbox = data.mailbox || state.selectedMailbox;
+    state.mailTotal = Number(data.total || 0);
     $('#webmailAddress').textContent = state.selectedMailbox.email;
-    $('#webmailSyncText').textContent = `Inbox refreshed ${new Date().toLocaleTimeString()}`;
+    $('#webmailSyncText').textContent = `${state.mailFolder === 'sent' ? 'Sent' : 'Inbox'} synced ${formatDate(data.syncedAt || new Date().toISOString())}`;
+    $('#inboxUnreadBadge').textContent = state.mailFolder === 'inbox' && Number(data.unreadTotal || 0) > 0 ? String(data.unreadTotal) : '';
     renderInbox(data.items || []);
   } catch (error) {
-    setMailError(error.message);
+    setMailError(error.message, error.body?.detail || '');
   } finally {
     loading.hidden = true;
     $('#refreshInbox').disabled = false;
+    state.mailRefreshBusy = false;
   }
 }
 
 async function openMailbox(id, email) {
   state.selectedMailbox = { id, email };
   state.selectedMessage = null;
+  state.mailFolder = 'inbox';
+  state.mailPosition = 0;
+  state.mailSearch = '';
+  $('#mailSearch').value = '';
+  selectMailFolder('inbox', false);
   $('#webmailAddress').textContent = email;
   $('#webmailSyncText').textContent = 'Loading on-demand inbox…';
   $('#messageEmpty').hidden = false;
@@ -482,6 +534,76 @@ async function openMailbox(id, email) {
   renderInbox([]);
   switchView('webmail');
   await loadInbox();
+}
+
+function selectMailFolder(folder, refresh = true) {
+  if (!['inbox', 'sent'].includes(folder)) return;
+  state.mailFolder = folder;
+  state.mailPosition = 0;
+  state.selectedMessage = null;
+  $('#messageEmpty').textContent = 'Select an email to read it.';
+  $('#messageEmpty').hidden = false;
+  $('#messageDetail').hidden = true;
+  $('#mailFolderTitle').textContent = folder === 'sent' ? 'Sent' : 'Inbox';
+  $('#inboxEmpty').textContent = folder === 'sent' ? 'No sent messages yet.' : 'No messages in this inbox yet.';
+  $$('[data-mail-folder]').forEach((button) => button.classList.toggle('active', button.dataset.mailFolder === folder));
+  $('#archiveMail').hidden = folder !== 'inbox';
+  if (refresh) loadInbox().catch(handleError);
+}
+
+function stopWebmailAutoRefresh() {
+  clearInterval(state.mailAutoTimer);
+  state.mailAutoTimer = null;
+}
+
+function startWebmailAutoRefresh() {
+  stopWebmailAutoRefresh();
+  if (!state.selectedMailbox || state.currentView !== 'webmail') return;
+  const seconds = Math.max(30, Number(state.dashboard?.mail?.autoRefreshSeconds || 45));
+  state.mailAutoTimer = setInterval(() => {
+    if (state.currentView === 'webmail' && !document.hidden) loadInbox().catch(() => {});
+  }, seconds * 1000);
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function renderCopyItems(target, title, values) {
+  const box = $(target);
+  const safeValues = Array.isArray(values) ? values : [];
+  box.hidden = safeValues.length === 0;
+  box.innerHTML = safeValues.length
+    ? `<strong>${escapeHtml(title)}</strong><div class="helper-items">${safeValues.map((value) => `<span class="helper-item"><code>${escapeHtml(value)}</code><button class="copy-btn" type="button" data-copy-value="${escapeHtml(value)}">Copy</button></span>`).join('')}</div>`
+    : '';
+}
+
+function renderVerificationLinks(links) {
+  const safeLinks = (Array.isArray(links) ? links : []).map(safeHttpUrl).filter(Boolean);
+  const box = $('#verificationLinks');
+  box.hidden = safeLinks.length === 0;
+  box.innerHTML = safeLinks.length
+    ? `<strong>Verification links</strong><div class="helper-items">${safeLinks.map((link) => `<span class="helper-item"><a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">Open</a><button class="copy-btn" type="button" data-copy-value="${escapeHtml(link)}">Copy</button></span>`).join('')}</div>`
+    : '';
+}
+
+function renderAttachments(attachments) {
+  const items = Array.isArray(attachments) ? attachments : [];
+  const box = $('#messageAttachments');
+  box.hidden = items.length === 0;
+  if (!items.length) {
+    box.innerHTML = '';
+    return;
+  }
+  box.innerHTML = `<strong>Attachments</strong><div class="helper-items">${items.map((item) => {
+    const href = `/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(state.selectedMessage.id)}/attachments/${encodeURIComponent(item.id)}`;
+    return `<span class="helper-item attachment-row"><span class="attachment-meta"><span>${escapeHtml(item.name)}</span><small>${escapeHtml(item.type)} · ${escapeHtml(formatBytes(item.size))}</small></span><a class="btn ghost small-btn" href="${href}" download>Download</a></span>`;
+  }).join('')}</div>`;
 }
 
 function renderMessage(message) {
@@ -495,8 +617,13 @@ function renderMessage(message) {
   rows.push(['Received', formatDate(message.receivedAt || message.sentAt)]);
   $('#messageMeta').innerHTML = rows.map(([label, value]) => `<span><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value)}</span>`).join('');
   $('#messageBody').textContent = message.body || '(empty message)';
+  $('#toggleReadMail').textContent = message.unread ? 'Mark read' : 'Mark unread';
+  $('#toggleReadMail').dataset.mailAction = message.unread ? 'mark_read' : 'mark_unread';
   $('#messageTruncated').hidden = !message.bodyTruncated;
-  const links = Array.isArray(message.links) ? message.links : [];
+  renderCopyItems('#verificationCodes', 'Detected verification codes', message.verificationCodes);
+  renderVerificationLinks(message.verificationLinks);
+  renderAttachments(message.attachments);
+  const links = (Array.isArray(message.links) ? message.links : []).map(safeHttpUrl).filter(Boolean);
   const linkBox = $('#messageLinks');
   linkBox.hidden = links.length === 0;
   linkBox.innerHTML = links.length
@@ -505,6 +632,25 @@ function renderMessage(message) {
   $('#messageEmpty').hidden = true;
   $('#messageDetail').hidden = false;
   renderInbox(state.inboxItems);
+}
+
+async function runMailAction(action) {
+  if (!state.selectedMailbox || !state.selectedMessage) return;
+  if (action === 'trash' && !confirm('Move this message to Trash? It will not be permanently deleted.')) return;
+  await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(state.selectedMessage.id)}/actions`, {
+    method: 'POST',
+    body: JSON.stringify({ action }),
+  });
+  showToast(action === 'trash' ? 'Message moved to Trash' : `Message updated: ${action.replaceAll('_', ' ')}`);
+  if (['archive', 'trash'].includes(action)) {
+    state.selectedMessage = null;
+    $('#messageDetail').hidden = true;
+    $('#messageEmpty').hidden = false;
+  } else {
+    state.selectedMessage.unread = action === 'mark_unread';
+  }
+  await loadInbox();
+  if (state.selectedMessage) renderMessage(state.selectedMessage);
 }
 
 async function loadMessage(messageId) {
@@ -517,12 +663,41 @@ async function loadMessage(messageId) {
     const data = await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(messageId)}`);
     renderMessage(data.message);
   } catch (error) {
-    setMailError(error.message);
+    setMailError(error.message, error.body?.detail || '');
     $('#messageEmpty').textContent = 'Could not load this message.';
     $('#messageEmpty').hidden = false;
   } finally {
     $('#messageLoading').hidden = true;
   }
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 32768) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+  }
+  return btoa(binary);
+}
+
+async function serializeComposeAttachments() {
+  const files = [...($('#composeAttachments').files || [])];
+  const limits = state.dashboard?.mail || {};
+  const maxCount = Number(limits.maxAttachmentCount || 5);
+  const maxEach = Number(limits.maxAttachmentBytes || 5242880);
+  const maxTotal = Number(limits.maxTotalAttachmentBytes || 10485760);
+  if (files.length > maxCount) throw new Error(`Choose at most ${maxCount} attachments`);
+  let total = 0;
+  for (const file of files) {
+    if (file.size > maxEach) throw new Error(`${file.name} exceeds the ${formatBytes(maxEach)} per-file limit`);
+    total += file.size;
+  }
+  if (total > maxTotal) throw new Error(`Attachments exceed the ${formatBytes(maxTotal)} total limit`);
+  return Promise.all(files.map(async (file) => ({
+    name: file.name,
+    type: file.type || 'application/octet-stream',
+    data: arrayBufferToBase64(await file.arrayBuffer()),
+  })));
 }
 
 function openCompose(mode = 'new') {
@@ -537,6 +712,9 @@ function openCompose(mode = 'new') {
   $('#composeTo').value = reply ? (state.selectedMessage?.from?.[0]?.email || '') : '';
   $('#composeSubject').value = reply ? `Re: ${state.selectedMessage?.subject || ''}` : '';
   $('#composeBody').value = '';
+  $('#composeAttachments').value = '';
+  const limits = state.dashboard?.mail || {};
+  $('#attachmentLimits').textContent = `Up to ${limits.maxAttachmentCount || 5} files, ${formatBytes(limits.maxAttachmentBytes || 5242880)} each, ${formatBytes(limits.maxTotalAttachmentBytes || 10485760)} total.`;
   $('#composeError').hidden = true;
   $('#composeModal').hidden = false;
   setTimeout(() => (reply ? $('#composeBody') : $('#composeTo')).focus(), 0);
@@ -545,6 +723,7 @@ function openCompose(mode = 'new') {
 function closeCompose() {
   $('#composeModal').hidden = true;
   $('#composeError').hidden = true;
+  $('#composeAttachments').value = '';
 }
 
 async function submitCompose() {
@@ -554,17 +733,18 @@ async function submitCompose() {
   button.disabled = true;
   errorBox.hidden = true;
   try {
+    const attachments = await serializeComposeAttachments();
     if (state.composeMode === 'reply') {
       if (!state.selectedMessage?.id) throw new Error('No message selected for reply');
       await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(state.selectedMessage.id)}/reply`, {
         method: 'POST',
-        body: JSON.stringify({ body: $('#composeBody').value }),
+        body: JSON.stringify({ body: $('#composeBody').value, attachments }),
       });
       showToast('Reply sent');
     } else {
       await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/send`, {
         method: 'POST',
-        body: JSON.stringify({ to: $('#composeTo').value, subject: $('#composeSubject').value, body: $('#composeBody').value }),
+        body: JSON.stringify({ to: $('#composeTo').value, subject: $('#composeSubject').value, body: $('#composeBody').value, attachments }),
       });
       showToast('Email sent');
     }
@@ -575,6 +755,62 @@ async function submitCompose() {
   } finally {
     button.disabled = false;
   }
+}
+
+function hideJobPassword() {
+  state.jobDestinationPassword = null;
+  const value = $('#jobPasswordValue');
+  if (!value) return;
+  value.textContent = '************';
+  $('#copyJobPassword').disabled = true;
+  $('#hideJobPassword').hidden = true;
+  $('#revealJobPassword').hidden = false;
+}
+
+async function revealJobPassword() {
+  if (!state.selectedJobId) return;
+  const result = await api(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/destination-password`, { method: 'POST', body: '{}' });
+  state.jobDestinationPassword = result.password;
+  $('#jobPasswordValue').textContent = result.password;
+  $('#copyJobPassword').disabled = false;
+  $('#hideJobPassword').hidden = false;
+  $('#revealJobPassword').hidden = true;
+}
+
+async function copyText(value, successMessage = 'Copied') {
+  try {
+    await navigator.clipboard.writeText(String(value));
+    showToast(successMessage);
+  } catch {
+    showToast('Clipboard access failed', true);
+  }
+}
+
+async function downloadSensitiveExport() {
+  if (!confirm('This export contains plaintext destination passwords. Store it securely and delete it when finished. Continue?')) return;
+  const response = await fetch('/api/mailboxes/export-sensitive', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {
+      'content-type': 'application/json',
+      ...(state.csrf ? { 'x-atomicmail-csrf': state.csrf } : {}),
+    },
+    body: JSON.stringify({ confirm: 'EXPORT', search: state.mailboxSearch }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `Sensitive export failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  const href = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = href;
+  anchor.download = 'atomicmail-email-destination-passwords.csv';
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(href);
+  showToast('Sensitive export downloaded');
 }
 
 function renderCircuit(circuit) {
@@ -688,6 +924,8 @@ $('#loginForm').addEventListener('submit', async (event) => {
 
 $('#logoutButton').addEventListener('click', async () => {
   try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch {}
+  stopWebmailAutoRefresh();
+  hideJobPassword();
   state.csrf = null;
   state.authenticated = false;
   showLogin();
@@ -710,8 +948,15 @@ $('#createForm').addEventListener('submit', async (event) => {
   try {
     const job = await api('/api/jobs', {
       method: 'POST',
-      body: JSON.stringify({ count: Number($('#batchCount').value), prefix: $('#batchPrefix').value }),
+      body: JSON.stringify({
+        count: Number($('#batchCount').value),
+        prefix: $('#batchPrefix').value,
+        destinationPassword: $('#destinationPassword').value,
+      }),
     });
+    $('#destinationPassword').value = '';
+    $('#destinationPassword').type = 'password';
+    $('#toggleDestinationPassword').textContent = 'Show';
     state.selectedJobId = job.id;
     showToast(`Batch created: ${job.requested_count} email${job.requested_count === 1 ? '' : 's'}`);
     switchView('jobs');
@@ -771,6 +1016,16 @@ $('#mailboxesBody').addEventListener('click', async (event) => {
     await openMailbox(openButton.dataset.openInbox, openButton.dataset.mailboxEmail).catch(handleError);
     return;
   }
+  const passwordButton = event.target.closest('[data-copy-mailbox-password]');
+  if (passwordButton) {
+    try {
+      const result = await api(`/api/mailboxes/${encodeURIComponent(passwordButton.dataset.copyMailboxPassword)}/destination-password`, { method: 'POST', body: '{}' });
+      await copyText(result.password, 'Destination password copied');
+    } catch (error) {
+      handleError(error);
+    }
+    return;
+  }
   const button = event.target.closest('[data-copy-email]');
   if (!button) return;
   try {
@@ -783,11 +1038,45 @@ $('#mailboxesBody').addEventListener('click', async (event) => {
 
 $('#backToMailboxes').addEventListener('click', () => switchView('mailboxes'));
 $('#refreshInbox').addEventListener('click', () => loadInbox().catch(handleError));
+$$('[data-mail-folder]').forEach((button) => button.addEventListener('click', () => selectMailFolder(button.dataset.mailFolder)));
+$('#mailSearchForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  state.mailSearch = $('#mailSearch').value.trim();
+  state.mailSearchField = $('#mailSearchField').value;
+  state.mailPosition = 0;
+  loadInbox().catch(handleError);
+});
+$('#clearMailSearch').addEventListener('click', () => {
+  $('#mailSearch').value = '';
+  state.mailSearch = '';
+  state.mailPosition = 0;
+  loadInbox().catch(handleError);
+});
+$('#mailPageSize').addEventListener('change', () => {
+  state.mailLimit = Number($('#mailPageSize').value) || 25;
+  state.mailPosition = 0;
+  loadInbox().catch(handleError);
+});
+$('#mailPrev').addEventListener('click', () => {
+  state.mailPosition = Math.max(0, state.mailPosition - state.mailLimit);
+  loadInbox().catch(handleError);
+});
+$('#mailNext').addEventListener('click', () => {
+  if (state.mailPosition + state.mailLimit < state.mailTotal) state.mailPosition += state.mailLimit;
+  loadInbox().catch(handleError);
+});
 $('#composeMail').addEventListener('click', () => openCompose('new'));
 $('#replyMail').addEventListener('click', () => openCompose('reply'));
+$('#toggleReadMail').addEventListener('click', (event) => runMailAction(event.currentTarget.dataset.mailAction).catch(handleError));
+$('#archiveMail').addEventListener('click', () => runMailAction('archive').catch(handleError));
+$('#trashMail').addEventListener('click', () => runMailAction('trash').catch(handleError));
 $('#inboxList').addEventListener('click', (event) => {
   const row = event.target.closest('[data-message-id]');
   if (row) loadMessage(row.dataset.messageId).catch(handleError);
+});
+$('#messageDetail').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-copy-value]');
+  if (button) copyText(button.dataset.copyValue).catch(handleError);
 });
 $('#closeCompose').addEventListener('click', closeCompose);
 $('#cancelCompose').addEventListener('click', closeCompose);
@@ -801,6 +1090,17 @@ $('#composeForm').addEventListener('submit', (event) => {
 
 $('#exportCsv').addEventListener('click', () => downloadExport('csv').catch(handleError));
 $('#exportJson').addEventListener('click', () => downloadExport('json').catch(handleError));
+$('#exportSensitiveCsv').addEventListener('click', () => downloadSensitiveExport().catch(handleError));
+$('#toggleDestinationPassword').addEventListener('click', () => {
+  const input = $('#destinationPassword');
+  input.type = input.type === 'password' ? 'text' : 'password';
+  $('#toggleDestinationPassword').textContent = input.type === 'password' ? 'Show' : 'Hide';
+});
+$('#revealJobPassword').addEventListener('click', () => revealJobPassword().catch(handleError));
+$('#hideJobPassword').addEventListener('click', hideJobPassword);
+$('#copyJobPassword').addEventListener('click', () => {
+  if (state.jobDestinationPassword != null) copyText(state.jobDestinationPassword, 'Destination password copied').catch(handleError);
+});
 $('#refreshAudit').addEventListener('click', () => loadSystem().catch(handleError));
 $('#createBackup').addEventListener('click', async () => {
   const button = $('#createBackup');
@@ -845,6 +1145,10 @@ $('#resetCircuit').addEventListener('click', async (event) => {
   } catch (error) {
     handleError(error);
   }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && state.currentView === 'webmail' && state.selectedMailbox) loadInbox().catch(() => {});
 });
 
 async function boot() {

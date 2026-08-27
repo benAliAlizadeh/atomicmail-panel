@@ -148,6 +148,24 @@ export class CredentialVault {
     }
   }
 
+  sealJobPassword(password, jobId) {
+    const plaintext = Buffer.from(String(password), 'utf8');
+    if (plaintext.length === 0) throw new Error('Destination password cannot be empty');
+    return this.encryptBuffer(plaintext, {
+      purpose: 'job-destination-password',
+      aad: `job:${String(jobId)}`,
+    }).toString('base64');
+  }
+
+  openJobPassword(ciphertext, jobId) {
+    if (typeof ciphertext !== 'string' || !ciphertext) throw new Error('Destination password is not configured');
+    const envelope = Buffer.from(ciphertext, 'base64');
+    return this.decryptBuffer(envelope, {
+      purpose: 'job-destination-password',
+      aad: `job:${String(jobId)}`,
+    }).toString('utf8');
+  }
+
   vaultDir(username) {
     return path.join(this.config.credentialsRoot, safeUsername(username));
   }

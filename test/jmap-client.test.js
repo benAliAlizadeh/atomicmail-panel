@@ -3,7 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AtomicMailJmapClient, MailClientError, extractSafeLinks, htmlToSafeText } from '../src/jmap-client.js';
+import {
+  AtomicMailJmapClient,
+  MailClientError,
+  extractSafeLinks,
+  extractVerificationCodes,
+  extractVerificationLinks,
+  htmlToSafeText,
+} from '../src/jmap-client.js';
 
 function config() {
   return {
@@ -13,6 +20,8 @@ function config() {
     mailMaxBodyBytes: 524288,
     mailMaxComposeBytes: 204800,
     mailMaxSubjectBytes: 2048,
+    mailMaxSearchBytes: 256,
+    mailMaxAttachmentBytes: 5242880,
   };
 }
 
@@ -179,4 +188,148 @@ test('same-mailbox JMAP requests are serialized to avoid refreshed-token races',
 test('HTML helpers never expose javascript links', () => {
   assert.equal(htmlToSafeText('<b>Hello</b><script>bad()</script>'), 'Hello');
   assert.deepEqual(extractSafeLinks('https://ok.example/a', '<a href="javascript:bad()">x</a>'), ['https://ok.example/a']);
+});
+
+test('Sent listing uses provider-side search, position pagination, total and unread count', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-jmap-sent-'));
+  try {
+    const vault = fakeVault(root);
+    let call = 0;
+    const runner = async (_command, args) => {
+      call += 1;
+      const ops = JSON.parse(args[args.indexOf('--ops') + 1]);
+      if (call === 1) {
+        assert.equal(ops.methodCalls[0][0], 'Mailbox/query');
+        assert.deepEqual(ops.methodCalls[0][1].filter, { role: 'sent' });
+        return response([['Mailbox/query', { ids: ['sent-mailbox'] }, 'mq0']]);
+      }
+      const query = ops.methodCalls[0][1];
+      assert.equal(query.filter.inMailbox, 'sent-mailbox');
+      assert.equal(query.filter.to, 'person@example.com');
+      assert.equal(query.position, 25);
+      assert.equal(query.limit, 25);
+      assert.equal(query.calculateTotal, true);
+      return response([
+        ['Email/query', { ids: ['s1'], total: 51, queryState: 'sent-state' }, 'q0'],
+        ['Email/get', { list: [{
+          id: 's1', to: [{ email: 'person@example.com' }], from: [{ email: 'box@atomicmail.ai' }],
+          subject: 'Sent subject', sentAt: '2026-08-27T12:00:00Z', receivedAt: '2026-08-27T12:00:00Z',
+          preview: 'hello', keywords: { '$seen': true },
+        }] }, 'g0'],
+        ['Email/query', { ids: [], total: 3 }, 'uq0'],
+      ]);
+    };
+    const client = new AtomicMailJmapClient(config(), vault, { runner });
+    const page = await client.listMailbox('boxname111', {
+      folder: 'sent', limit: 25, position: 25, search: 'person@example.com', field: 'to',
+    });
+    assert.equal(page.total, 51);
+    assert.equal(page.unreadTotal, 3);
+    assert.equal(page.position, 25);
+    assert.equal(page.items[0].toText, 'person@example.com');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('message actions use safe JMAP patches and Trash role resolution', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-jmap-actions-'));
+  try {
+    const vault = fakeVault(root);
+    const seen = [];
+    const runner = async (_command, args) => {
+      const ops = JSON.parse(args[args.indexOf('--ops') + 1]);
+      const method = ops.methodCalls[0][0];
+      seen.push(ops);
+      if (method === 'Mailbox/query') {
+        const role = ops.methodCalls[0][1].filter.role;
+        return response([['Mailbox/query', { ids: [role === 'archive' ? 'archive-folder' : 'trash-folder'] }, 'mq0']]);
+      }
+      const id = Object.keys(ops.methodCalls[0][1].update)[0];
+      return response([['Email/set', { updated: [id] }, 'u0']]);
+    };
+    const client = new AtomicMailJmapClient(config(), vault, { runner });
+    await client.updateMessage('boxname111', 'm1', 'mark_read');
+    await client.updateMessage('boxname111', 'm1', 'archive');
+    await client.updateMessage('boxname111', 'm1', 'trash');
+    assert.deepEqual(seen[0].methodCalls[0][1].update.m1, { 'keywords/$seen': true });
+    assert.equal(seen[1].methodCalls[0][0], 'Mailbox/query');
+    assert.deepEqual(seen[2].methodCalls[0][1].update.m1, { mailboxIds: { 'archive-folder': true } });
+    assert.equal(seen[3].methodCalls[0][0], 'Mailbox/query');
+    assert.deepEqual(seen[4].methodCalls[0][1].update.m1, { mailboxIds: { 'trash-folder': true } });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('attachments are uploaded from private temporary files and downloaded through Blob/get', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-jmap-attachments-'));
+  try {
+    const vault = fakeVault(root);
+    const cfg = { ...config(), runtimeCredentialsRoot: path.join(root, 'runtime') };
+    let call = 0;
+    const runner = async (_command, args) => {
+      call += 1;
+      const ops = JSON.parse(args[args.indexOf('--ops') + 1]);
+      if (call === 1) {
+        const attachmentPath = args[args.indexOf('--attachment') + 1];
+        assert.equal(fs.readFileSync(attachmentPath, 'utf8'), 'hello attachment');
+        assert.equal(path.basename(attachmentPath), 'notes.txt');
+        assert.equal(ops.methodCalls[0][0], 'Email/set');
+        assert.equal(ops.methodCalls[0][1].create.m1.attachments[0].blobId, '$ATTACHMENT_0_BLOB_ID');
+        return response([
+          ['Email/set', { created: { m1: { id: 'mail-with-file' } } }, 'm0'],
+          ['EmailSubmission/set', { created: { s1: { id: 'submission-with-file' } } }, 's0'],
+        ]);
+      }
+      if (call === 2) {
+        return response([['Email/get', { list: [{
+          id: 'mail-with-file', attachments: [{ blobId: 'blob-1', name: '../unsafe.txt', type: 'text/plain', size: 3 }],
+        }] }, 'g0']]);
+      }
+      assert.equal(ops.methodCalls[0][0], 'Blob/get');
+      return response([['Blob/get', { list: [{ id: 'blob-1', size: 3, 'data:asBase64': 'QUJD' }] }, 'b0']]);
+    };
+    const client = new AtomicMailJmapClient(cfg, vault, { runner });
+    const sent = await client.send('boxname111', {
+      to: 'person@example.com', subject: 'Attachment', body: 'See file',
+      attachments: [{ name: '../notes.txt', type: 'text/plain', data: Buffer.from('hello attachment') }],
+    });
+    assert.equal(sent.submissionId, 'submission-with-file');
+    const downloaded = await client.downloadAttachment('boxname111', 'mail-with-file', '0');
+    assert.equal(downloaded.name, 'unsafe.txt');
+    assert.equal(downloaded.data.toString('utf8'), 'ABC');
+    assert.equal(fs.readdirSync(cfg.runtimeCredentialsRoot).length, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('verification helpers are heuristic and only return safe HTTP links', () => {
+  assert.deepEqual(extractVerificationCodes('Your verification code is 483921. Order 998877.'), ['483921']);
+  assert.deepEqual(
+    extractVerificationLinks(['https://example.com/verify?token=abc', 'https://example.com/news', 'javascript:alert(1)']),
+    ['https://example.com/verify?token=abc'],
+  );
+});
+
+test('mail headers reject CRLF injection and provider errors redact private compose values', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-jmap-redaction-'));
+  try {
+    const vault = fakeVault(root);
+    const runner = async () => ({
+      code: 1, signal: null, timedOut: false, stdout: '', stderr: 'failed request body private-body-778899',
+    });
+    const client = new AtomicMailJmapClient(config(), vault, { runner });
+    await assert.rejects(
+      () => client.send('boxname111', { to: 'person@example.com', subject: 'ok\r\nBcc: bad@example.com', body: 'body' }),
+      (error) => error.code === 'invalid_header',
+    );
+    await assert.rejects(
+      () => client.send('boxname111', { to: 'person@example.com', subject: 'Safe', body: 'private-body-778899' }),
+      (error) => !error.message.includes('private-body-778899') && /REQUEST_VALUE_REDACTED/.test(error.message),
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

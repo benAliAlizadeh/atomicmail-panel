@@ -28,6 +28,7 @@ export class Store {
         id TEXT PRIMARY KEY,
         requested_count INTEGER NOT NULL,
         prefix TEXT NOT NULL DEFAULT '',
+        destination_password_ciphertext TEXT,
         status TEXT NOT NULL,
         success_count INTEGER NOT NULL DEFAULT 0,
         failed_count INTEGER NOT NULL DEFAULT 0,
@@ -95,6 +96,10 @@ export class Store {
     `);
 
     // Additive migration for databases created by earlier panel stages.
+    const jobColumns = new Set(this.db.prepare(`PRAGMA table_info(jobs)`).all().map((row) => row.name));
+    if (!jobColumns.has('destination_password_ciphertext')) {
+      this.db.exec(`ALTER TABLE jobs ADD COLUMN destination_password_ciphertext TEXT`);
+    }
     const jobItemColumns = new Set(this.db.prepare(`PRAGMA table_info(job_items)`).all().map((row) => row.name));
     const additions = [
       ['phase', `TEXT NOT NULL DEFAULT 'queued'`],
@@ -236,15 +241,14 @@ export class Store {
     return Boolean(row);
   }
 
-  createJob({ count, prefix, usernames }) {
-    const id = newId('job');
+  createJob({ count, prefix, usernames, id = newId('job'), destinationPasswordCiphertext = null }) {
     const now = nowIso();
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare(`
-        INSERT INTO jobs(id, requested_count, prefix, status, created_at, updated_at)
-        VALUES(?, ?, ?, 'running', ?, ?)
-      `).run(id, count, prefix, now, now);
+        INSERT INTO jobs(id, requested_count, prefix, destination_password_ciphertext, status, created_at, updated_at)
+        VALUES(?, ?, ?, ?, 'running', ?, ?)
+      `).run(id, count, prefix, destinationPasswordCiphertext, now, now);
 
       const insert = this.db.prepare(`
         INSERT INTO job_items(id, job_id, position, username, status, attempts, next_attempt_at, created_at, updated_at)
@@ -263,7 +267,12 @@ export class Store {
   }
 
   getJob(id) {
-    const job = this.db.prepare('SELECT * FROM jobs WHERE id=?').get(id);
+    const job = this.db.prepare(`
+      SELECT id, requested_count, prefix, status, success_count, failed_count,
+             created_at, updated_at, started_at, completed_at, last_error,
+             destination_password_ciphertext IS NOT NULL AS has_destination_password
+      FROM jobs WHERE id=?
+    `).get(id);
     if (!job) return null;
     const items = this.db.prepare(`
       SELECT id, position, username, status, attempts, next_attempt_at, mailbox_id, last_error,
@@ -287,7 +296,12 @@ export class Store {
   }
 
   listJobs(limit = 50) {
-    return this.db.prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?`).all(limit);
+    return this.db.prepare(`
+      SELECT id, requested_count, prefix, status, success_count, failed_count,
+             created_at, updated_at, started_at, completed_at, last_error,
+             destination_password_ciphertext IS NOT NULL AS has_destination_password
+      FROM jobs ORDER BY created_at DESC LIMIT ?
+    `).all(limit);
   }
 
   getDashboardStats() {
@@ -481,8 +495,9 @@ export class Store {
 
   getMailbox(id) {
     return this.db.prepare(`
-      SELECT id, username, email, status, created_at, job_id
-      FROM mailboxes WHERE id=?
+      SELECT m.id, m.username, m.email, m.status, m.created_at, m.job_id,
+             j.destination_password_ciphertext IS NOT NULL AS has_destination_password
+      FROM mailboxes m LEFT JOIN jobs j ON j.id=m.job_id WHERE m.id=?
     `).get(String(id || '')) || null;
   }
 
@@ -490,15 +505,18 @@ export class Store {
     const pattern = searchPattern(search);
     if (!pattern) {
       return this.db.prepare(`
-        SELECT id, username, email, status, created_at, job_id
-        FROM mailboxes ORDER BY created_at DESC LIMIT ? OFFSET ?
+        SELECT m.id, m.username, m.email, m.status, m.created_at, m.job_id,
+               j.destination_password_ciphertext IS NOT NULL AS has_destination_password
+        FROM mailboxes m LEFT JOIN jobs j ON j.id=m.job_id
+        ORDER BY m.created_at DESC LIMIT ? OFFSET ?
       `).all(limit, offset);
     }
     return this.db.prepare(`
-      SELECT id, username, email, status, created_at, job_id
-      FROM mailboxes
-      WHERE username LIKE ? OR email LIKE ?
-      ORDER BY created_at DESC LIMIT ? OFFSET ?
+      SELECT m.id, m.username, m.email, m.status, m.created_at, m.job_id,
+             j.destination_password_ciphertext IS NOT NULL AS has_destination_password
+      FROM mailboxes m LEFT JOIN jobs j ON j.id=m.job_id
+      WHERE m.username LIKE ? OR m.email LIKE ?
+      ORDER BY m.created_at DESC LIMIT ? OFFSET ?
     `).all(pattern, pattern, limit, offset);
   }
 
@@ -510,8 +528,34 @@ export class Store {
     `).get(pattern, pattern)?.count ?? 0);
   }
 
+  hasBackupData() {
+    const row = this.db.prepare(`
+      SELECT EXISTS(SELECT 1 FROM jobs LIMIT 1)
+          OR EXISTS(SELECT 1 FROM mailboxes LIMIT 1) AS found
+    `).get();
+    return Boolean(row?.found);
+  }
+
   exportMailboxes(search = '', limit = 50000) {
     return this.listMailboxes(limit, 0, search);
+  }
+
+  getJobPasswordCiphertext(jobId) {
+    const row = this.db.prepare(`
+      SELECT id, destination_password_ciphertext
+      FROM jobs WHERE id=?
+    `).get(String(jobId || ''));
+    return row || null;
+  }
+
+  getMailboxPasswordCiphertext(mailboxId) {
+    const row = this.db.prepare(`
+      SELECT m.id AS mailbox_id, m.email, m.job_id, j.destination_password_ciphertext
+      FROM mailboxes m
+      LEFT JOIN jobs j ON j.id=m.job_id
+      WHERE m.id=?
+    `).get(String(mailboxId || ''));
+    return row || null;
   }
 
   getState(key, fallback = null) {

@@ -24,12 +24,20 @@ function makeConfig(root) {
   };
 }
 
-function createMailbox(store, vault, username) {
+function createMailbox(store, vault, username, destinationPassword = '') {
   vault.writeEncryptedFile(username, 'credentials.json', Buffer.from(JSON.stringify({
     inboxId: `${username}@atomicmail.ai`,
     apiKey: `secret-${username}`,
   })));
-  const job = store.createJob({ count: 1, prefix: '', usernames: [username] });
+  const jobId = `job_test_${username}`;
+  const destinationPasswordCiphertext = destinationPassword ? vault.sealJobPassword(destinationPassword, jobId) : null;
+  const job = store.createJob({
+    id: jobId,
+    count: 1,
+    prefix: '',
+    usernames: [username],
+    destinationPasswordCiphertext,
+  });
   const item = store.markItemRunning(job.items[0].id);
   store.markItemSucceeded(item.id, {
     username,
@@ -111,6 +119,36 @@ test('wrong encryption key cannot decrypt credential vault', () => {
   }
 });
 
+test('restart recovery reseals credentials left in a Webmail runtime and discards orphan attachment workspaces', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-webmail-restart-'));
+  try {
+    const config = makeConfig(root);
+    const vault = new CredentialVault(config);
+    vault.initialize();
+    const username = 'restart1111';
+    vault.writeEncryptedFile(username, 'credentials.json', Buffer.from(JSON.stringify({
+      inboxId: username, apiKey: 'restart-secret',
+    })));
+    const runtime = vault.materialize(username);
+    fs.writeFileSync(path.join(runtime, 'session.jwt'), 'refreshed-session-token');
+    const orphanAttachmentDir = path.join(config.runtimeCredentialsRoot, 'mail-attachments-orphan');
+    fs.mkdirSync(orphanAttachmentDir, { recursive: true });
+    fs.writeFileSync(path.join(orphanAttachmentDir, 'private.txt'), 'temporary attachment');
+
+    const restartedVault = new CredentialVault(config);
+    restartedVault.initialize();
+    const recovery = restartedVault.recoverRuntimeDirectories();
+    assert.deepEqual(recovery, { recovered: 1, discarded: 1 });
+    assert.equal(fs.existsSync(runtime), false);
+    assert.equal(fs.existsSync(orphanAttachmentDir), false);
+    assert.equal(restartedVault.readCredentials(username).apiKey, 'restart-secret');
+    assert.equal(restartedVault.readEncryptedFile(username, 'session.jwt').toString('utf8'), 'refreshed-session-token');
+    assert.equal(restartedVault.status().plaintextCredentialFiles, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('encrypted backup verifies and restores portably onto a different path', async () => {
   const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-backup-src-'));
   const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-backup-dst-'));
@@ -119,7 +157,7 @@ test('encrypted backup verifies and restores portably onto a different path', as
     const sourceVault = new CredentialVault(sourceConfig);
     sourceVault.initialize();
     const sourceStore = new Store(sourceConfig.dbPath);
-    createMailbox(sourceStore, sourceVault, 'portable1111');
+    createMailbox(sourceStore, sourceVault, 'portable1111', 'destination-secret-4477');
     const manager = new BackupManager({ config: sourceConfig, store: sourceStore, vault: sourceVault });
     const backup = await manager.createBackup('test');
     assert.equal(backup.verified, true);
@@ -146,6 +184,11 @@ test('encrypted backup verifies and restores portably onto a different path', as
     assert.equal(targetStore.countMailboxes(), 1);
     const mailbox = targetStore.listMailboxes(1)[0];
     assert.equal(mailbox.email, 'portable1111@atomicmail.ai');
+    const restoredPassword = targetStore.getJobPasswordCiphertext('job_test_portable1111');
+    assert.equal(
+      targetVault.openJobPassword(restoredPassword.destination_password_ciphertext, restoredPassword.id),
+      'destination-secret-4477',
+    );
     assert.equal(targetVault.readCredentials('portable1111').apiKey, 'secret-portable1111');
     assert.equal(targetVault.status().plaintextCredentialFiles, 0);
     targetStore.close();
@@ -170,6 +213,33 @@ test('tampered encrypted backup is rejected before restore', async () => {
     bytes[Math.floor(bytes.length / 2)] ^= 0x01;
     fs.writeFileSync(file, bytes);
     assert.throws(() => manager.verifyBackup(backup.name), /authenticated|corrupted|invalid/i);
+    store.close();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('shutdown backup protects a destination-password job even before its first mailbox exists', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-password-only-backup-'));
+  try {
+    const config = makeConfig(root);
+    const vault = new CredentialVault(config);
+    vault.initialize();
+    const store = new Store(config.dbPath);
+    const jobId = 'job_password_only';
+    store.createJob({
+      id: jobId,
+      count: 1,
+      prefix: '',
+      usernames: ['password111'],
+      destinationPasswordCiphertext: vault.sealJobPassword('not-yet-used-8822', jobId),
+    });
+    assert.equal(store.countMailboxes(), 0);
+    assert.equal(store.hasBackupData(), true);
+    const manager = new BackupManager({ config, store, vault });
+    const backup = await manager.stop({ finalBackup: true });
+    assert.equal(backup.verified, true);
+    assert.equal(manager.verifyBackup(backup.name).verified, true);
     store.close();
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

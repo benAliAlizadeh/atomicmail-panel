@@ -274,6 +274,8 @@ test('existing pre-progress databases receive additive live-progress columns', (
       mailbox_id TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       UNIQUE(job_id, position), UNIQUE(job_id, username)
     );
+    INSERT INTO jobs(id, requested_count, prefix, status, created_at, updated_at)
+    VALUES('job_legacy', 1, 'old', 'completed', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
   `);
   oldDb.close();
 
@@ -282,6 +284,10 @@ test('existing pre-progress databases receive additive live-progress columns', (
   for (const name of ['phase', 'phase_message', 'phase_updated_at', 'attempt_started_at', 'finished_at']) {
     assert.ok(columns.has(name), `missing migrated column ${name}`);
   }
+  const jobColumns = new Set(store.db.prepare(`PRAGMA table_info(jobs)`).all().map((row) => row.name));
+  assert.ok(jobColumns.has('destination_password_ciphertext'));
+  assert.equal(store.getJob('job_legacy').prefix, 'old');
+  assert.equal(store.getJob('job_legacy').has_destination_password, 0);
   store.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
