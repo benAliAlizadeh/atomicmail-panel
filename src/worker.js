@@ -4,6 +4,10 @@ import { retryDelay, redactSecrets } from './utils.js';
 const CIRCUIT_KEY = 'worker.circuit';
 const NOT_BEFORE_KEY = 'worker.not_before';
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class JobWorker {
   constructor({ store, provider, config }) {
     this.store = store;
@@ -11,11 +15,13 @@ export class JobWorker {
     this.config = config;
     this.timer = null;
     this.busy = false;
+    this.stopping = false;
     this.consecutiveTransientFailures = 0;
   }
 
   start() {
     if (this.timer || !this.config.workerEnabled) return;
+    this.stopping = false;
     this.store.recoverInterruptedWork();
     this.timer = setInterval(() => this.tick().catch((error) => {
       this.store.audit('error', 'worker.tick_error', redactSecrets(error?.stack || String(error)));
@@ -24,9 +30,28 @@ export class JobWorker {
     this.tick().catch(() => {});
   }
 
-  stop() {
+  async stop({ abortActive = true, waitMs = this.config.shutdownGraceMs || 15000 } = {}) {
+    this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+
+    if (abortActive && this.busy && typeof this.provider.abortActive === 'function') {
+      try {
+        this.provider.abortActive();
+      } catch (error) {
+        this.store.audit('warn', 'worker.abort_failed', redactSecrets(error?.message || String(error)));
+      }
+    }
+
+    return this.waitForIdle(waitMs);
+  }
+
+  async waitForIdle(timeoutMs = 15000) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    while (this.busy && Date.now() < deadline) {
+      await sleep(25);
+    }
+    return !this.busy;
   }
 
   circuitState() {
@@ -84,7 +109,7 @@ export class JobWorker {
   }
 
   async tick() {
-    if (this.busy) return;
+    if (this.busy || this.stopping) return;
     const circuit = this.circuitState();
     if (circuit.open) return;
     if (this.notBefore() > Date.now()) return;
@@ -116,6 +141,12 @@ export class JobWorker {
     const kind = error?.kind || 'permanent';
     const raw = redactSecrets(error?.raw || error?.message || String(error));
     const safeMessage = raw || 'Provider registration failed';
+
+    if (kind === 'interrupted') {
+      this.store.rescheduleInterruptedItem(item.id, 'Registration interrupted during controlled shutdown; safe to retry');
+      this.store.audit('info', 'mailbox.interrupted', 'Registration interrupted by worker shutdown and returned to pending', item.job_id, item.id);
+      return;
+    }
 
     if (kind === 'username_conflict') {
       const replacement = this.newUniqueUsername(this.store.getJob(item.job_id)?.prefix || '');

@@ -92,8 +92,88 @@ export class Store {
 
   recoverInterruptedWork() {
     const now = nowIso();
-    this.db.prepare(`UPDATE job_items SET status='pending', updated_at=? WHERE status='running'`).run(now);
-    this.db.prepare(`UPDATE jobs SET status='running', updated_at=? WHERE status='pending'`).run(now);
+    this.db.exec('BEGIN IMMEDIATE');
+    let interruptedItems = 0;
+    let cancelledItems = 0;
+    let reopenedJobs = 0;
+    try {
+      const cancelled = this.db.prepare(`
+        UPDATE job_items
+        SET status='cancelled', updated_at=?
+        WHERE status='running'
+          AND job_id IN (SELECT id FROM jobs WHERE status='cancelled')
+      `).run(now);
+      cancelledItems = Number(cancelled.changes || 0);
+
+      const reopened = this.db.prepare(`
+        UPDATE jobs
+        SET status='running', completed_at=NULL, updated_at=?
+        WHERE status IN ('completed','failed')
+          AND id IN (SELECT DISTINCT job_id FROM job_items WHERE status='running')
+      `).run(now);
+      reopenedJobs = Number(reopened.changes || 0);
+
+      const recovered = this.db.prepare(`
+        UPDATE job_items
+        SET status='pending',
+            attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+            next_attempt_at=?,
+            last_error=COALESCE(last_error, 'Recovered after interrupted worker process'),
+            updated_at=?
+        WHERE status='running'
+      `).run(now, now);
+      interruptedItems = Number(recovered.changes || 0);
+
+      this.db.prepare(`
+        UPDATE jobs
+        SET status='running', updated_at=?
+        WHERE status='pending'
+      `).run(now);
+
+      this.db.prepare(`
+        UPDATE jobs
+        SET success_count=(
+              SELECT COUNT(*) FROM job_items ji
+              WHERE ji.job_id=jobs.id AND ji.status='succeeded'
+            ),
+            failed_count=(
+              SELECT COUNT(*) FROM job_items ji
+              WHERE ji.job_id=jobs.id AND ji.status='failed'
+            ),
+            updated_at=?
+      `).run(now);
+
+      this.db.prepare(`
+        UPDATE jobs
+        SET status=CASE WHEN failed_count > 0 THEN 'failed' ELSE 'completed' END,
+            completed_at=COALESCE(completed_at, ?),
+            updated_at=?
+        WHERE status='running'
+          AND NOT EXISTS (
+            SELECT 1 FROM job_items ji
+            WHERE ji.job_id=jobs.id AND ji.status IN ('pending','running')
+          )
+      `).run(now, now);
+
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    const summary = { interruptedItems, cancelledItems, reopenedJobs };
+    if (interruptedItems || cancelledItems || reopenedJobs) {
+      this.audit(
+        'warn',
+        'worker.recovered',
+        `Recovered ${interruptedItems} interrupted item(s), ${cancelledItems} cancelled in-flight item(s), ${reopenedJobs} inconsistent terminal job(s)`,
+      );
+    }
+    return summary;
+  }
+
+  checkpoint() {
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
   }
 
   isUsernameTaken(username) {
@@ -211,6 +291,22 @@ export class Store {
     this.db.prepare(`
       UPDATE job_items SET status='pending', next_attempt_at=?, last_error=?, updated_at=? WHERE id=?
     `).run(next, errorMessage || null, now.toISOString(), id);
+  }
+
+  rescheduleInterruptedItem(id, errorMessage = 'Worker stopped before registration completed') {
+    const now = nowIso();
+    this.db.prepare(`
+      UPDATE job_items
+      SET status=CASE
+            WHEN (SELECT status FROM jobs WHERE jobs.id=job_items.job_id)='cancelled' THEN 'cancelled'
+            ELSE 'pending'
+          END,
+          attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+          next_attempt_at=?,
+          last_error=?,
+          updated_at=?
+      WHERE id=? AND status='running'
+    `).run(now, errorMessage, now, id);
   }
 
   replaceItemUsername(id, username, delayMs = 1000, errorMessage = null) {

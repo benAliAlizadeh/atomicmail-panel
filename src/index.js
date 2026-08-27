@@ -19,18 +19,43 @@ server.listen(config.port, config.host, () => {
   console.log(`AtomicMail Panel listening on http://${config.host}:${config.port}`);
   console.log(`Worker: ${config.workerEnabled ? 'enabled (concurrency=1)' : 'disabled'}`);
   console.log(`Admin auth: ${config.adminPassword ? 'enabled' : 'disabled'}`);
+  console.log(`Atomic Mail watch mode: ${config.atomicWatchMode}`);
   if (!config.adminPassword) console.log('Security note: keep the panel bound to localhost/private access while ADMIN_PASSWORD is empty.');
 });
 
-function shutdown(signal) {
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log(`${signal}: shutting down`);
-  worker.stop();
-  server.close(() => {
-    store.close();
-    process.exit(0);
+
+  const hardExit = setTimeout(() => {
+    console.error('Shutdown grace period exceeded; exiting so restart recovery can safely resume pending work.');
+    process.exit(1);
+  }, config.shutdownGraceMs + 5000);
+  hardExit.unref();
+
+  const serverClosed = new Promise((resolve) => {
+    server.close(() => resolve());
   });
-  setTimeout(() => process.exit(1), 5000).unref();
+
+  const idle = await worker.stop({ abortActive: true, waitMs: config.shutdownGraceMs });
+  if (!idle) {
+    console.error('Worker did not become idle before shutdown deadline.');
+    return;
+  }
+
+  await serverClosed;
+  try {
+    store.checkpoint();
+  } catch (error) {
+    console.warn(`SQLite checkpoint warning: ${error?.message || error}`);
+  }
+  store.close();
+  clearTimeout(hardExit);
+  process.exit(0);
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => { void shutdown('SIGINT'); });
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });

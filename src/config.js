@@ -31,12 +31,26 @@ function jsonArrayEnv(name, fallback) {
   return parsed;
 }
 
+function enumEnv(name, fallback, allowed) {
+  const raw = String(process.env[name] || fallback).trim().toLowerCase();
+  if (!allowed.includes(raw)) {
+    throw new Error(`${name} must be one of: ${allowed.join(', ')}`);
+  }
+  return raw;
+}
+
 export function loadConfig() {
   const cwd = process.cwd();
   const dataDir = path.resolve(cwd, process.env.DATA_DIR || './data');
   const adminPassword = process.env.ADMIN_PASSWORD || '';
   if (adminPassword && adminPassword.length < 12) {
     throw new Error('ADMIN_PASSWORD must be at least 12 characters when admin authentication is enabled');
+  }
+
+  const usernameMinLength = intEnv('USERNAME_MIN_LENGTH', 10, 5, 21);
+  const usernameMaxLength = intEnv('USERNAME_MAX_LENGTH', 14, 5, 21);
+  if (usernameMinLength > usernameMaxLength) {
+    throw new Error('USERNAME_MIN_LENGTH must be less than or equal to USERNAME_MAX_LENGTH');
   }
 
   return Object.freeze({
@@ -47,8 +61,8 @@ export function loadConfig() {
     credentialsRoot: path.join(dataDir, 'credentials'),
 
     maxBatchSize: intEnv('MAX_BATCH_SIZE', 100, 1, 5000),
-    usernameMinLength: intEnv('USERNAME_MIN_LENGTH', 10, 5, 21),
-    usernameMaxLength: intEnv('USERNAME_MAX_LENGTH', 14, 5, 21),
+    usernameMinLength,
+    usernameMaxLength,
     exportMaxRows: intEnv('EXPORT_MAX_ROWS', 50000, 1, 200000),
 
     workerEnabled: boolEnv('WORKER_ENABLED', true),
@@ -61,6 +75,7 @@ export function loadConfig() {
     transientCircuitThreshold: intEnv('TRANSIENT_CIRCUIT_THRESHOLD', 5, 1, 100),
     transientCircuitCooldownMs: intEnv('TRANSIENT_CIRCUIT_COOLDOWN_MS', 600000, 1000, 86400000),
     registerTimeoutMs: intEnv('REGISTER_TIMEOUT_MS', 180000, 30000, 1800000),
+    shutdownGraceMs: intEnv('SHUTDOWN_GRACE_MS', 15000, 1000, 120000),
 
     adminUsername: process.env.ADMIN_USERNAME || 'admin',
     adminPassword,
@@ -71,6 +86,7 @@ export function loadConfig() {
 
     atomicAuthUrl: process.env.ATOMICMAIL_AUTH_URL || 'https://auth.atomicmail.ai',
     atomicApiUrl: process.env.ATOMICMAIL_API_URL || 'https://api.atomicmail.ai',
+    atomicWatchMode: enumEnv('ATOMICMAIL_WATCH_MODE', 'on-demand', ['on-demand', 'scheduled']),
     atomicCliCommand: process.env.ATOMICMAIL_CLI_COMMAND || 'npx',
     atomicCliPrefixArgs: jsonArrayEnv(
       'ATOMICMAIL_CLI_PREFIX_ARGS_JSON',

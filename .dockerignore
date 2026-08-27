@@ -1,0 +1,15 @@
+# Never copy operator secrets/state into the image context.
+.git
+.env
+.env.*
+data/
+backups/
+node_modules/
+coverage/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.patch
+*.zip
+npm-debug.log*
+.DS_Store

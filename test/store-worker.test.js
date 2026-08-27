@@ -94,3 +94,133 @@ test('cancelled job is not overwritten as completed when an in-flight item succe
   store.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+
+test('restart recovery returns interrupted work to pending without consuming a retry', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-recovery-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const job = store.createJob({ count: 2, prefix: '', usernames: ['recover1111', 'recover2222'] });
+
+  const first = store.markItemRunning(job.items[0].id);
+  store.markItemSucceeded(first.id, {
+    username: first.username,
+    email: `${first.username}@atomicmail.ai`,
+    inboxId: `${first.username}@atomicmail.ai`,
+    credentialsPath: path.join(root, 'credentials', first.username, 'credentials.json'),
+  });
+
+  const second = store.markItemRunning(job.items[1].id);
+  assert.equal(second.attempts, 1);
+  store.setJobStatus(job.id, 'paused');
+
+  // Simulate stale counters from an interrupted process.
+  store.db.prepare(`UPDATE jobs SET success_count=99, failed_count=77 WHERE id=?`).run(job.id);
+
+  const summary = store.recoverInterruptedWork();
+  const recovered = store.getJob(job.id);
+  const recoveredSecond = recovered.items.find((item) => item.id === second.id);
+
+  assert.equal(summary.interruptedItems, 1);
+  assert.equal(recovered.status, 'paused');
+  assert.equal(recovered.success_count, 1);
+  assert.equal(recovered.failed_count, 0);
+  assert.equal(recoveredSecond.status, 'pending');
+  assert.equal(recoveredSecond.attempts, 0);
+
+  store.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('restart recovery keeps cancelled jobs terminal and cancels in-flight items', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-recovery-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['cancel2222'] });
+  const item = store.markItemRunning(job.items[0].id);
+  store.setJobStatus(job.id, 'cancelled');
+
+  const summary = store.recoverInterruptedWork();
+  const recovered = store.getJob(job.id);
+
+  assert.equal(summary.cancelledItems, 1);
+  assert.equal(recovered.status, 'cancelled');
+  assert.equal(recovered.items[0].id, item.id);
+  assert.equal(recovered.items[0].status, 'cancelled');
+
+  store.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('controlled worker shutdown aborts active registration and returns item to pending', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-shutdown-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+
+  let rejectRegistration;
+  const provider = {
+    abortActive() {
+      const error = new Error('shutdown');
+      error.kind = 'interrupted';
+      error.raw = 'shutdown';
+      rejectRegistration?.(error);
+    },
+    register() {
+      return new Promise((_, reject) => {
+        rejectRegistration = reject;
+      });
+    },
+  };
+
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['stopper111'] });
+  const worker = new JobWorker({ store, provider, config: { ...config(root), shutdownGraceMs: 1000 } });
+
+  const tick = worker.tick();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const idle = await worker.stop({ abortActive: true, waitMs: 1000 });
+  await tick;
+
+  const result = store.getJob(job.id);
+  assert.equal(idle, true);
+  assert.equal(result.status, 'running');
+  assert.equal(result.items[0].status, 'pending');
+  assert.equal(result.items[0].attempts, 0);
+
+  store.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+
+test('controlled shutdown does not resurrect a cancelled in-flight item', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-shutdown-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+
+  let rejectRegistration;
+  const provider = {
+    abortActive() {
+      const error = new Error('shutdown');
+      error.kind = 'interrupted';
+      error.raw = 'shutdown';
+      rejectRegistration?.(error);
+    },
+    register() {
+      return new Promise((_, reject) => {
+        rejectRegistration = reject;
+      });
+    },
+  };
+
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['stopcancel1'] });
+  const worker = new JobWorker({ store, provider, config: { ...config(root), shutdownGraceMs: 1000 } });
+
+  const tick = worker.tick();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  store.setJobStatus(job.id, 'cancelled');
+  const idle = await worker.stop({ abortActive: true, waitMs: 1000 });
+  await tick;
+
+  const result = store.getJob(job.id);
+  assert.equal(idle, true);
+  assert.equal(result.status, 'cancelled');
+  assert.equal(result.items[0].status, 'cancelled');
+
+  store.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});

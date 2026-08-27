@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyProviderError } from '../src/provider.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { AtomicMailProvider, classifyProviderError } from '../src/provider.js';
 import { redactSecrets, retryDelay } from '../src/utils.js';
 
 test('classifies rate limiting', () => {
@@ -30,4 +33,60 @@ test('retry delay remains capped with jitter', () => {
     const delay = retryDelay(10, 1000, 10000);
     assert.ok(delay >= 8000 && delay <= 12000);
   }
+});
+
+
+test('provider reuses matching credentials after a crash instead of registering again', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-provider-'));
+  const username = 'reuse11111';
+  const dir = path.join(root, username);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({
+    inboxId: `${username}@atomicmail.ai`,
+    apiKey: 'am_test_secret',
+  }));
+
+  const provider = new AtomicMailProvider({
+    credentialsRoot: root,
+    atomicAuthUrl: 'https://auth.atomicmail.ai',
+    atomicApiUrl: 'https://api.atomicmail.ai',
+    atomicWatchMode: 'on-demand',
+    atomicCliCommand: 'this-command-must-not-run',
+    atomicCliPrefixArgs: [],
+    registerTimeoutMs: 30000,
+  });
+
+  const mailbox = await provider.register(username);
+  assert.equal(mailbox.email, `${username}@atomicmail.ai`);
+  assert.equal(mailbox.credentialsPath, path.join(dir, 'credentials.json'));
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('provider refuses to overwrite a credential directory for a different inbox', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-provider-'));
+  const username = 'wanted1111';
+  const dir = path.join(root, username);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({
+    inboxId: 'different111@atomicmail.ai',
+    apiKey: 'am_test_secret',
+  }));
+
+  const provider = new AtomicMailProvider({
+    credentialsRoot: root,
+    atomicAuthUrl: 'https://auth.atomicmail.ai',
+    atomicApiUrl: 'https://api.atomicmail.ai',
+    atomicWatchMode: 'on-demand',
+    atomicCliCommand: 'this-command-must-not-run',
+    atomicCliPrefixArgs: [],
+    registerTimeoutMs: 30000,
+  });
+
+  await assert.rejects(
+    provider.register(username),
+    (error) => error?.kind === 'policy' && /does not match/i.test(error.message),
+  );
+
+  fs.rmSync(root, { recursive: true, force: true });
 });

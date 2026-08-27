@@ -1,16 +1,19 @@
-# AtomicMail Panel — Web Operator Stage (AM-01 → AM-14)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-17)
 
-A conservative Atomic Mail batch-registration panel. Registration stays sequential and delegates provider PoW/registration behavior to the configured Atomic Mail AgentSkill CLI rather than attempting to bypass provider controls.
+A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
 ## Included
 
-- persistent SQLite jobs and restart recovery
+- persistent SQLite jobs with restart reconciliation
 - isolated credential directory per inbox
+- crash-safe credential reuse to avoid duplicate signup after a DB-commit interruption
 - valid random usernames with duplicate prevention
 - strictly sequential worker (`concurrency = 1`)
 - post-success cooldown, retry/backoff+jitter, rate-limit cooldown
 - temporary and permanent circuit breakers
 - automatic username regeneration on conflicts
+- controlled shutdown: active provider process is stopped and the item is safely returned to pending
+- job counter/state reconciliation after restart
 - web dashboard and create-batch form
 - live job progress with pause/resume/cancel
 - searchable mailbox list with copy and pagination
@@ -19,12 +22,14 @@ A conservative Atomic Mail batch-registration panel. Registration stays sequenti
 - HttpOnly/SameSite session cookie, CSRF protection, login attempt throttling
 - restrictive browser security headers/CSP
 - no credential file path, API key or JWT exposure through mailbox APIs
+- hardened Docker defaults: non-root, read-only root filesystem, dropped capabilities, healthcheck and graceful stop
 
-## Run on Windows / PowerShell
+## Local run on Windows / PowerShell
 
 Requirements: Node.js 22.9+.
 
 ```powershell
+npm.cmd run verify
 npm.cmd start
 ```
 
@@ -34,7 +39,7 @@ Open:
 http://127.0.0.1:8787
 ```
 
-`npm start` now automatically reads `.env` when it exists.
+`npm start` automatically reads `.env` when it exists.
 
 ## Enable admin login
 
@@ -49,31 +54,63 @@ Restart the app. The browser will show the login screen.
 
 When the panel remains strictly on `127.0.0.1`, authentication can be left disabled for local-only operation. Before exposing it on a LAN, public interface, tunnel, or reverse proxy, enable `ADMIN_PASSWORD` and put the panel behind HTTPS. Set `ADMIN_COOKIE_SECURE=true` only when the browser actually reaches it over HTTPS.
 
+## Atomic Mail registration mode
+
+The current AgentSkill registration flow requires an operator-selected `--watch` mode. This panel creates and stores inboxes but does not schedule inbox polling, so the default is:
+
+```env
+ATOMICMAIL_WATCH_MODE=on-demand
+```
+
+The generated registration command is equivalent to:
+
+```bash
+atomicmail register --username <name> --watch on-demand
+```
+
+`scheduled` is accepted through configuration for compatibility, but this panel does not create the external agent scheduler described by Atomic Mail. Do not select `scheduled` unless you separately implement and own that scheduler.
+
+Each inbox receives a separate credential directory under:
+
+```text
+data/credentials/<username>/
+```
+
+Do not delete or overwrite these directories. `credentials.json` contains access credentials for the inbox.
+
 ## Create emails
 
 Use **Create emails** in the web panel, enter a count and optional prefix, then create the batch. The server reserves final usernames and the worker processes them one by one.
 
-A policy/abuse-protection response opens a permanent circuit and pauses the affected job. The panel does not automatically reset a permanent circuit; an operator must review the provider response and explicitly reset it from **System**.
+A policy/abuse-protection response opens a permanent circuit and pauses the affected job. The panel never automatically resets a permanent circuit; an operator must review the provider response and explicitly reset it from **System**.
+
+## Restart and shutdown safety
+
+On startup the database is reconciled before work resumes:
+
+- an interrupted `running` item is returned to `pending`
+- its interrupted attempt is not counted as a provider failure
+- cancelled jobs remain cancelled
+- job success/failure counters are recomputed from item state
+- inconsistent terminal jobs with an in-flight item are reopened for recovery
+
+On SIGINT/SIGTERM the panel stops accepting new work, aborts the active registration process, returns that item to `pending`, waits for the worker to become idle, checkpoints SQLite WAL, and exits. Docker uses a matching stop grace period.
+
+If the process is force-killed before graceful shutdown finishes, startup recovery handles the remaining `running` item.
 
 ## Exports
 
-The Mailboxes page exports the current search as CSV or JSON. Provider credentials and credential paths are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS` to avoid accidental oversized responses.
+The Mailboxes page exports the current search as CSV or JSON. Provider credentials and credential paths are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS`.
 
 ## Provider command
 
 Default local command:
 
 ```bash
-npx -y --package=@atomicmail/agent-skill@0.3.26 atomicmail register --username <name>
+npx -y --package=@atomicmail/agent-skill@0.3.26 atomicmail register --username <name> --watch on-demand
 ```
 
-Each inbox receives a separate `ATOMIC_MAIL_CREDENTIALS_DIR` under:
-
-```text
-data/credentials/<username>/
-```
-
-Do not delete or overwrite these directories; they contain access credentials for the inboxes.
+Docker installs the same version globally for reproducible builds.
 
 ## API authentication
 
@@ -88,20 +125,56 @@ When `ADMIN_PASSWORD` is enabled, `/api/*` endpoints require the admin session e
 ## Tests
 
 ```powershell
-npm.cmd test
-npm.cmd run check
+npm.cmd run verify
 ```
 
-Tests do not create live Atomic Mail inboxes.
+This runs syntax checks plus the full Node test suite. Automated tests do not create live Atomic Mail inboxes.
 
 ## Docker
 
+Build and run:
+
 ```bash
 docker compose up -d --build
+docker compose ps
 ```
 
-The default compose mapping remains loopback-only (`127.0.0.1:8787`). For non-loopback deployment, enable admin authentication and HTTPS before changing that binding.
+The default compose mapping is loopback-only:
 
-## Next
+```text
+127.0.0.1:8787:8787
+```
 
-AM-15 → AM-18: recovery edge-case hardening, broader regression tests, production/TLS deployment polish, and a small operator-approved live registration validation.
+Production hardening enabled by default:
+
+- container init process
+- non-root application user
+- read-only root filesystem
+- writable persistent `/app/data` only
+- tmpfs `/tmp`
+- all Linux capabilities dropped
+- `no-new-privileges`
+- PID limit
+- application/container healthcheck
+- graceful stop window
+
+Before exposing the service beyond localhost:
+
+1. Set a strong `ADMIN_PASSWORD`.
+2. Terminate TLS in a reverse proxy you control.
+3. Set `ADMIN_COOKIE_SECURE=true`.
+4. Keep the application port private/loopback where possible.
+5. Back up the entire `data/` directory securely; it contains both SQLite state and mailbox credentials.
+
+## Verification after deployment
+
+```bash
+curl --fail http://127.0.0.1:8787/health
+docker compose ps
+```
+
+The service should report healthy before you use **Create emails**.
+
+## Remaining task
+
+**AM-18 — Live Validation:** perform one operator-approved real inbox registration, confirm the credential files are created, confirm the mailbox appears in the panel, then stop. Do not use a large batch as the first live validation.

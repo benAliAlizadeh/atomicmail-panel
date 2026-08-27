@@ -16,7 +16,7 @@
 | AM-12 | Mailbox Management | ✅ Done — search/copy/pagination |
 | AM-13 | Export | ✅ Done — safe CSV/JSON export |
 | AM-14 | Secret Protection / Admin Auth | ✅ Done — optional session auth + CSRF + security headers |
-| AM-15 | Recovery hardening | 🟡 Core recovery done; final edge-case polish next |
-| AM-16 | Tests | 🟡 Core + panel API/auth tests; live provider validation pending |
-| AM-17 | Production Docker | 🟡 Docker works; deployment/TLS hardening next |
-| AM-18 | Live Validation | ⬜ Requires real outbound access and an operator-approved test inbox |
+| AM-15 | Recovery hardening | ✅ Done — restart reconciliation + controlled-shutdown recovery |
+| AM-16 | Tests | ✅ Done — recovery/provider/auth/API regression coverage |
+| AM-17 | Production Docker | ✅ Done — healthcheck + read-only root + reduced privileges + graceful stop |
+| AM-18 | Live Validation | ⬜ Pending — one operator-approved real inbox registration |

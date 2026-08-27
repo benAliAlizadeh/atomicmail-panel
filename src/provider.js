@@ -34,7 +34,7 @@ export function classifyProviderError(rawInput) {
   return { kind: 'permanent', retryAfterMs: null, message: 'Atomic Mail registration failed' };
 }
 
-function runProcess(command, args, { env, timeoutMs, outputLimit = 131072 }) {
+function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 131072 }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env,
@@ -46,35 +46,59 @@ function runProcess(command, args, { env, timeoutMs, outputLimit = 131072 }) {
     let stdout = '';
     let stderr = '';
     let settled = false;
-  let timedOut = false;
+    let timedOut = false;
+    let aborted = false;
+    let forceKillTimer = null;
 
     const append = (current, chunk) => {
       if (current.length >= outputLimit) return current;
       return (current + chunk.toString('utf8')).slice(0, outputLimit);
     };
 
+    const cleanup = () => {
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    };
+
+    const terminate = (reason) => {
+      if (settled) return;
+      if (reason === 'timeout') timedOut = true;
+      if (reason === 'abort') aborted = true;
+      try { child.kill('SIGTERM'); } catch {}
+      forceKillTimer = setTimeout(() => {
+        if (settled) return;
+        try { child.kill('SIGKILL'); } catch {}
+      }, 2000);
+      forceKillTimer.unref();
+    };
+
+    const onAbort = () => terminate('abort');
+
     child.stdout.on('data', (chunk) => { stdout = append(stdout, chunk); });
     child.stderr.on('data', (chunk) => { stderr = append(stderr, chunk); });
 
-    const timer = setTimeout(() => {
-      if (settled) return;
-      timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 2000).unref();
-    }, timeoutMs);
+    const timer = setTimeout(() => terminate('timeout'), timeoutMs);
+    timer.unref?.();
+
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     child.on('error', (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanup();
       reject(error);
     });
 
-    child.on('close', (code, signal) => {
+    child.on('close', (code, closeSignal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ code, signal, stdout, stderr, timedOut });
+      cleanup();
+      resolve({ code, signal: closeSignal, stdout, stderr, timedOut, aborted });
     });
   });
 }
@@ -82,10 +106,15 @@ function runProcess(command, args, { env, timeoutMs, outputLimit = 131072 }) {
 export class AtomicMailProvider {
   constructor(config) {
     this.config = config;
+    this.activeAbortController = null;
   }
 
   credentialsDir(username) {
     return path.join(this.config.credentialsRoot, username);
+  }
+
+  abortActive() {
+    this.activeAbortController?.abort();
   }
 
   async register(username) {
@@ -118,13 +147,24 @@ export class AtomicMailProvider {
       ATOMIC_MAIL_API_URL: this.config.atomicApiUrl,
       NO_COLOR: '1',
     };
-    const args = [...this.config.atomicCliPrefixArgs, 'register', '--username', username];
+    const args = [
+      ...this.config.atomicCliPrefixArgs,
+      'register',
+      '--username',
+      username,
+      '--watch',
+      this.config.atomicWatchMode || 'on-demand',
+    ];
+
+    const controller = new AbortController();
+    this.activeAbortController = controller;
 
     let result;
     try {
       result = await runProcess(this.config.atomicCliCommand, args, {
         env,
         timeoutMs: this.config.registerTimeoutMs,
+        signal: controller.signal,
       });
     } catch (error) {
       const classified = classifyProviderError(error?.message || String(error));
@@ -132,9 +172,17 @@ export class AtomicMailProvider {
         ...classified,
         raw: redactSecrets(error?.message || String(error)),
       });
+    } finally {
+      if (this.activeAbortController === controller) this.activeAbortController = null;
     }
 
     const combined = redactSecrets(`${result.stdout}\n${result.stderr}`.trim());
+    if (result.aborted) {
+      throw new ProviderError('Atomic Mail registration was interrupted by controlled shutdown', {
+        kind: 'interrupted',
+        raw: 'registration interrupted by operator shutdown',
+      });
+    }
     if (result.timedOut) {
       throw new ProviderError('Atomic Mail registration process timed out', {
         kind: 'transient',
