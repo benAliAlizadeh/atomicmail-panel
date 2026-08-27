@@ -15,12 +15,16 @@ function currentWindowsSid() {
 }
 
 function hardenWindowsDirectory(target, sid) {
+  // Do not recursively remove inheritance on Windows. Applying directory-only
+  // inheritance flags to every child file can leave existing files unreadable.
+  // Encryption is the primary protection; here we preserve the parent ACL and
+  // add inheritable Full Control for the current user and SYSTEM.
   execFileSync('icacls', [
     target,
-    '/inheritance:r',
+    '/inheritance:e',
     '/grant:r', `*${sid}:(OI)(CI)F`,
     '/grant:r', '*S-1-5-18:(OI)(CI)F',
-    '/T', '/C', '/Q',
+    '/C', '/Q',
   ], { windowsHide: true, stdio: 'ignore' });
 }
 
@@ -45,7 +49,7 @@ export function hardenStoragePaths(config) {
       const sid = currentWindowsSid();
       for (const target of targets) hardenWindowsDirectory(target, sid);
       hardenWindowsFile(config.encryptionKeyPath, sid);
-      return { platform: 'windows', hardened: true, method: 'NTFS ACL inheritance removed; current user + SYSTEM granted', warning: null };
+      return { platform: 'windows', hardened: true, method: 'NTFS ACL inheritance preserved; current user + SYSTEM granted', warning: null };
     } catch (error) {
       return {
         platform: 'windows',
