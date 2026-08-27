@@ -39,7 +39,10 @@
     <main class="main">
       <header class="topbar">
         <div><h1 id="pageTitle">Dashboard</h1><p id="pageSubtitle" class="muted">Mailbox creation overview</p></div>
-        <div class="top-actions"><span id="currentUser" class="user-chip"></span><button id="logoutButton" class="btn ghost small-btn" hidden>Log out</button></div>
+        <div class="top-actions">
+          <div id="globalActivity" class="global-activity" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="globalActivityText">Working</span><time id="globalActivityTime">0s</time></div>
+          <span id="currentUser" class="user-chip"></span><button id="logoutButton" class="btn ghost small-btn" hidden>Log out</button>
+        </div>
       </header>
 
       <div id="circuitBanner" class="banner danger" hidden></div>
@@ -110,7 +113,7 @@
       </section>
 
       <section class="view" data-view="jobs" hidden>
-        <div class="panel table-panel">
+        <div id="jobsPanel" class="panel table-panel">
           <div class="panel-head"><div><h2>Jobs</h2><p class="muted">Recent mailbox creation batches</p></div><button id="refreshJobs" class="btn ghost small-btn">Refresh</button></div>
           <div class="table-wrap"><table><thead><tr><th>Created</th><th>Job</th><th>Status</th><th>Progress</th><th>Prefix</th></tr></thead><tbody id="jobsBody"></tbody></table></div>
           <div id="jobsEmpty" class="empty" hidden>No jobs yet.</div>
@@ -131,7 +134,7 @@
       </section>
 
       <section class="view" data-view="mailboxes" hidden>
-        <div class="panel table-panel">
+        <div id="mailboxesPanel" class="panel table-panel">
           <div class="panel-head mailbox-head">
             <div><h2>Mailboxes</h2><p id="mailboxCountText" class="muted">Stored inboxes</p></div>
             <div class="button-row"><button id="exportCsv" class="btn ghost small-btn">Export CSV</button><button id="exportJson" class="btn ghost small-btn">Export JSON</button><button id="exportSensitiveCsv" class="btn danger-btn small-btn" title="Explicitly exports destination passwords">Export email + password</button></div>
@@ -157,7 +160,7 @@
         </div>
         <div id="mailError" class="banner danger" hidden></div>
         <div class="webmail-grid">
-          <article class="panel mail-list-panel">
+          <article id="mailListPanel" class="panel mail-list-panel">
             <div class="mail-tabs" role="tablist"><button class="mail-tab active" type="button" data-mail-folder="inbox">Inbox <span id="inboxUnreadBadge"></span></button><button class="mail-tab" type="button" data-mail-folder="sent">Sent</button></div>
             <form id="mailSearchForm" class="mail-search-row">
               <select id="mailSearchField" aria-label="Search field"><option value="subject">Subject</option><option value="from">Sender</option><option value="to">Recipient</option></select>
@@ -165,14 +168,14 @@
               <button class="btn ghost small-btn" type="submit">Search</button><button id="clearMailSearch" class="btn ghost small-btn" type="button">Clear</button>
             </form>
             <div class="panel-head mail-list-heading"><div><h2 id="mailFolderTitle">Inbox</h2><p id="inboxCountText" class="muted">Latest messages</p></div><label class="page-size-label">Per page<select id="mailPageSize"><option>10</option><option selected>25</option><option>50</option><option>100</option></select></label></div>
-            <div id="inboxLoading" class="mail-loading" hidden><span class="activity-dot"></span><span>Loading inbox from Atomic Mail…</span></div>
+            <div id="inboxLoading" class="mail-loading" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="inboxLoadingText">Loading inbox from Atomic Mail…</span></div>
             <div id="inboxEmpty" class="empty" hidden>No messages in this inbox yet.</div>
             <div id="inboxList" class="mail-list"></div>
             <div class="mail-pagination"><button id="mailPrev" class="btn ghost small-btn" type="button">Previous</button><span id="mailPageText" class="muted">Page 1</span><button id="mailNext" class="btn ghost small-btn" type="button">Next</button></div>
           </article>
-          <article class="panel message-panel">
+          <article id="messagePanel" class="panel message-panel">
             <div id="messageEmpty" class="empty">Select an email to read it.</div>
-            <div id="messageLoading" class="mail-loading" hidden><span class="activity-dot"></span><span>Loading message…</span></div>
+            <div id="messageLoading" class="mail-loading" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="messageLoadingText">Loading message…</span></div>
             <div id="messageDetail" hidden>
               <div class="message-head">
                 <div>
@@ -181,6 +184,7 @@
                 </div>
                 <div class="message-actions"><button id="replyMail" class="btn ghost small-btn" type="button">Reply</button><button id="toggleReadMail" class="btn ghost small-btn" type="button">Mark read</button><button id="archiveMail" class="btn ghost small-btn" type="button">Archive</button><button id="trashMail" class="btn danger-btn small-btn" type="button">Move to trash</button></div>
               </div>
+              <div id="messageOperation" class="operation-status compact" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><span id="messageOperationText">Updating message…</span></div>
               <div id="messageBody" class="message-body"></div>
               <div id="verificationCodes" class="message-helper" hidden></div>
               <div id="verificationLinks" class="message-helper" hidden></div>
@@ -222,19 +226,20 @@
   </div>
 
 
-  <div id="composeModal" class="modal-backdrop" hidden>
-    <form id="composeForm" class="compose-card">
+  <div id="composeModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="composeTitle" hidden>
+    <form id="composeForm" class="compose-card" aria-busy="false">
       <div class="compose-head"><div><h2 id="composeTitle">New message</h2><p id="composeFrom" class="muted"></p></div><button id="closeCompose" class="icon-btn" type="button" aria-label="Close">×</button></div>
       <label id="composeToRow">To<input id="composeTo" type="email" maxlength="320" autocomplete="off" required /></label>
       <label id="composeSubjectRow">Subject<input id="composeSubject" type="text" maxlength="500" autocomplete="off" /></label>
       <label>Message<textarea id="composeBody" rows="10" maxlength="200000" required></textarea></label>
       <label>Attachments<input id="composeAttachments" type="file" multiple /><small id="attachmentLimits" class="muted"></small></label>
+      <div id="composeProgress" class="operation-status" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><strong id="composeProgressTitle">Sending email</strong><span id="composeProgressDetail">Elapsed 0s</span></div></div>
       <p id="composeError" class="form-error" hidden></p>
       <div class="compose-actions"><button id="cancelCompose" class="btn ghost" type="button">Cancel</button><button id="sendCompose" class="btn primary" type="submit">Send</button></div>
     </form>
   </div>
 
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/app.js" defer></script>
 </body>
 </html>

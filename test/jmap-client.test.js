@@ -185,6 +185,33 @@ test('same-mailbox JMAP requests are serialized to avoid refreshed-token races',
   }
 });
 
+test('cancelled read requests stop before commit and discard their temporary credentials', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-jmap-cancel-'));
+  try {
+    const vault = fakeVault(root);
+    const controller = new AbortController();
+    let markStarted;
+    const started = new Promise((resolve) => { markStarted = resolve; });
+    const runner = async (_command, _args, options) => {
+      markStarted();
+      await new Promise((resolve) => options.signal.addEventListener('abort', resolve, { once: true }));
+      return { code: null, signal: 'SIGTERM', timedOut: false, aborted: true, stdout: '', stderr: '' };
+    };
+    const client = new AtomicMailJmapClient(config(), vault, { runner });
+    const operation = client.listInbox('boxname111', { signal: controller.signal });
+    await started;
+    controller.abort();
+    await assert.rejects(
+      operation,
+      (error) => error instanceof MailClientError && error.code === 'mail_cancelled' && error.statusCode === 499,
+    );
+    assert.equal(vault.committed.length, 0);
+    assert.equal(vault.discarded.length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('HTML helpers never expose javascript links', () => {
   assert.equal(htmlToSafeText('<b>Hello</b><script>bad()</script>'), 'Hello');
   assert.deepEqual(extractSafeLinks('https://ok.example/a', '<a href="javascript:bad()">x</a>'), ['https://ok.example/a']);

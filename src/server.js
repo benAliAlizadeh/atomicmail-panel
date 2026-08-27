@@ -75,6 +75,17 @@ function boundedInt(value, fallback, min, max) {
   return Math.min(max, Math.max(min, parsed));
 }
 
+function clientAbortSignal(req, res) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  req.once('aborted', abort);
+  res.once('close', () => {
+    if (!res.writableEnded) abort();
+  });
+  if (req.aborted || res.destroyed) abort();
+  return controller.signal;
+}
+
 function requestLooksCrossSite(req) {
   if (req.headers['sec-fetch-site'] === 'cross-site') return true;
   const origin = req.headers.origin;
@@ -284,6 +295,7 @@ export function createServer({ store, worker, config, backupManager = null, vaul
             postSuccessDelayMs: config.postSuccessDelayMs,
           },
           mail: {
+            commandTimeoutMs: Number(config.mailCommandTimeoutMs || 60000),
             autoRefreshSeconds: Number(config.mailAutoRefreshSeconds || 45),
             pageSize: Number(config.mailInboxLimit || 50),
             maxComposeBytes: Number(config.mailMaxComposeBytes || 204800),
@@ -443,7 +455,7 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
         if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
         const limit = boundedInt(url.searchParams.get('limit'), config.mailInboxLimit || 50, 1, 100);
-        const inbox = await mailClient.listInbox(mailbox.username, { limit });
+        const inbox = await mailClient.listInbox(mailbox.username, { limit, signal: clientAbortSignal(req, res) });
         return json(res, 200, { mailbox, ...inbox });
       }
 
@@ -461,7 +473,9 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         if (Buffer.byteLength(search, 'utf8') > Number(config.mailMaxSearchBytes || 256)) {
           return json(res, 413, { error: 'Search query is too large' });
         }
-        const mail = await mailClient.listMailbox(mailbox.username, { folder, limit, position, search, field });
+        const mail = await mailClient.listMailbox(mailbox.username, {
+          folder, limit, position, search, field, signal: clientAbortSignal(req, res),
+        });
         return json(res, 200, { mailbox, ...mail });
       }
 
@@ -471,7 +485,11 @@ export function createServer({ store, worker, config, backupManager = null, vaul
         const mailbox = store.getMailbox(messageMatch.id);
         if (!mailbox) return json(res, 404, { error: 'Mailbox not found' });
         if (mailbox.status !== 'active') return json(res, 409, { error: 'Mailbox is not active' });
-        const message = await mailClient.getMessage(mailbox.username, messageMatch.messageId);
+        const message = await mailClient.getMessage(
+          mailbox.username,
+          messageMatch.messageId,
+          { signal: clientAbortSignal(req, res) },
+        );
         return json(res, 200, { mailbox, message });
       }
 
@@ -485,6 +503,7 @@ export function createServer({ store, worker, config, backupManager = null, vaul
           mailbox.username,
           attachmentMatch.messageId,
           attachmentMatch.attachmentId,
+          { signal: clientAbortSignal(req, res) },
         );
         return send(res, 200, attachment.data, attachment.type || 'application/octet-stream', {
           'cache-control': 'no-store',
@@ -599,6 +618,10 @@ export function createServer({ store, worker, config, backupManager = null, vaul
     } catch (error) {
       const status = Number(error?.statusCode) || 500;
       if (error?.name === 'MailClientError') {
+        if (error.code === 'mail_cancelled') {
+          if (res.destroyed || res.writableEnded) return;
+          return json(res, 499, { error: 'Mail request was cancelled', code: 'mail_cancelled' });
+        }
         store.audit('error', 'mail.operation_failed', `Mail operation failed (${String(error.code || 'mail_provider_error').slice(0, 80)}, HTTP ${status})`);
         return json(res, status, mailErrorPayload(error, status));
       }

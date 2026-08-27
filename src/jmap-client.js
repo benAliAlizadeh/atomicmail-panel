@@ -18,7 +18,7 @@ export class MailClientError extends Error {
   }
 }
 
-function runCliProcess(command, args, { env, timeoutMs, outputLimit = DEFAULT_OUTPUT_LIMIT } = {}) {
+function runCliProcess(command, args, { env, timeoutMs, outputLimit = DEFAULT_OUTPUT_LIMIT, signal = null } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env,
@@ -30,6 +30,7 @@ function runCliProcess(command, args, { env, timeoutMs, outputLimit = DEFAULT_OU
     let stderr = '';
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let forceKillTimer = null;
 
     const append = (current, chunk) => {
@@ -39,19 +40,30 @@ function runCliProcess(command, args, { env, timeoutMs, outputLimit = DEFAULT_OU
     const cleanup = () => {
       clearTimeout(timer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      signal?.removeEventListener('abort', abortProcess);
     };
-    const timer = setTimeout(() => {
+    const terminate = () => {
       if (settled) return;
-      timedOut = true;
       try { child.kill('SIGTERM'); } catch {}
+      if (forceKillTimer) return;
       forceKillTimer = setTimeout(() => {
         if (!settled) {
           try { child.kill('SIGKILL'); } catch {}
         }
       }, 2000);
       forceKillTimer.unref?.();
+    };
+    const abortProcess = () => {
+      aborted = true;
+      terminate();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminate();
     }, timeoutMs);
     timer.unref?.();
+    signal?.addEventListener('abort', abortProcess, { once: true });
+    if (signal?.aborted) abortProcess();
 
     child.stdout.on('data', (chunk) => { stdout = append(stdout, chunk); });
     child.stderr.on('data', (chunk) => { stderr = append(stderr, chunk); });
@@ -65,7 +77,7 @@ function runCliProcess(command, args, { env, timeoutMs, outputLimit = DEFAULT_OU
       if (settled) return;
       settled = true;
       cleanup();
-      resolve({ code, signal, stdout, stderr, timedOut });
+      resolve({ code, signal, stdout, stderr, timedOut, aborted });
     });
   });
 }
@@ -340,8 +352,11 @@ export class AtomicMailJmapClient {
     return tracked;
   }
 
-  async request(username, { ops = null, opsFile = null, vars = null, attachments = [], outputLimit = DEFAULT_OUTPUT_LIMIT }) {
+  async request(username, { ops = null, opsFile = null, vars = null, attachments = [], outputLimit = DEFAULT_OUTPUT_LIMIT, signal = null }) {
     return this.enqueue(username, async () => {
+      if (signal?.aborted) {
+        throw new MailClientError('Mail request was cancelled', { statusCode: 499, code: 'mail_cancelled' });
+      }
       const runtimeDir = this.vault.materialize(username);
       let attachmentDir = null;
       const cleanupAttachments = () => {
@@ -395,14 +410,25 @@ export class AtomicMailJmapClient {
           env,
           timeoutMs: this.config.mailCommandTimeoutMs,
           outputLimit,
+          signal,
         });
       } catch (error) {
+        if (signal?.aborted) {
+          this.vault.discardRuntime(runtimeDir);
+          cleanupAttachments();
+          throw new MailClientError('Mail request was cancelled', { statusCode: 499, code: 'mail_cancelled' });
+        }
         const detail = safeProviderDetail(error?.message || String(error), { vars, paths: [runtimeDir, attachmentDir] });
         this.vault.discardRuntime(runtimeDir);
         cleanupAttachments();
         throw new MailClientError(`Could not start Atomic Mail mail command: ${detail}`);
       }
 
+      if (result.aborted || signal?.aborted) {
+        this.vault.discardRuntime(runtimeDir);
+        cleanupAttachments();
+        throw new MailClientError('Mail request was cancelled', { statusCode: 499, code: 'mail_cancelled' });
+      }
       if (result.timedOut) {
         this.vault.discardRuntime(runtimeDir);
         cleanupAttachments();
@@ -446,7 +472,7 @@ export class AtomicMailJmapClient {
     });
   }
 
-  async mailboxIdForRole(username, role, { required = true } = {}) {
+  async mailboxIdForRole(username, role, { required = true, signal = null } = {}) {
     const safeRole = String(role || '').toLowerCase();
     if (!['inbox', 'sent', 'trash', 'archive'].includes(safeRole)) {
       throw new MailClientError('Mailbox folder is invalid', { statusCode: 400, code: 'invalid_mailbox' });
@@ -461,7 +487,7 @@ export class AtomicMailJmapClient {
         limit: 1,
       }, 'mq0']],
     };
-    const result = await this.request(username, { ops });
+    const result = await this.request(username, { ops, signal });
     const payload = methodResponse(result, 'Mailbox/query', 'mq0') || {};
     const id = Array.isArray(payload.ids) ? String(payload.ids[0] || '') : '';
     if (!id && required) throw new MailClientError(`${safeRole} mailbox is unavailable`, { statusCode: 422, code: 'mailbox_unavailable' });
@@ -469,7 +495,7 @@ export class AtomicMailJmapClient {
     return id;
   }
 
-  async listMailbox(username, { folder = 'inbox', limit = 50, position = 0, search = '', field = 'subject' } = {}) {
+  async listMailbox(username, { folder = 'inbox', limit = 50, position = 0, search = '', field = 'subject', signal = null } = {}) {
     const safeFolder = String(folder || 'inbox').toLowerCase();
     if (!['inbox', 'sent'].includes(safeFolder)) {
       throw new MailClientError('Mailbox folder is invalid', { statusCode: 400, code: 'invalid_mailbox' });
@@ -484,7 +510,7 @@ export class AtomicMailJmapClient {
       max: this.config.mailMaxSearchBytes || 256,
       required: false,
     }).trim();
-    const mailboxId = safeFolder === 'inbox' ? '$INBOX_MAILBOX_ID' : await this.mailboxIdForRole(username, 'sent');
+    const mailboxId = safeFolder === 'inbox' ? '$INBOX_MAILBOX_ID' : await this.mailboxIdForRole(username, 'sent', { signal });
     const filter = { inMailbox: mailboxId };
     if (safeSearch) filter[safeField] = safeSearch;
     const ops = {
@@ -511,7 +537,7 @@ export class AtomicMailJmapClient {
         }, 'uq0'],
       ],
     };
-    const result = await this.request(username, { ops });
+    const result = await this.request(username, { ops, signal });
     const query = methodResponse(result, 'Email/query', 'q0') || {};
     const get = methodResponse(result, 'Email/get', 'g0') || {};
     const unreadQuery = methodResponse(result, 'Email/query', 'uq0') || {};
@@ -531,7 +557,7 @@ export class AtomicMailJmapClient {
     return this.listMailbox(username, { ...options, folder: 'inbox' });
   }
 
-  async getMessage(username, messageId) {
+  async getMessage(username, messageId, { signal = null } = {}) {
     const id = assertText(messageId, 'messageId', { max: 1024 });
     const ops = {
       using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
@@ -552,7 +578,7 @@ export class AtomicMailJmapClient {
         'g0',
       ]],
     };
-    const result = await this.request(username, { ops, vars: { MAIL_ID: id } });
+    const result = await this.request(username, { ops, vars: { MAIL_ID: id }, signal });
     const payload = methodResponse(result, 'Email/get') || {};
     const row = Array.isArray(payload.list) ? payload.list[0] : null;
     if (!row) throw new MailClientError('Email message was not found', { statusCode: 404, code: 'message_not_found' });
@@ -666,7 +692,7 @@ export class AtomicMailJmapClient {
     return { id, action: safeAction, updated: Array.isArray(payload.updated) ? payload.updated.includes(id) : true };
   }
 
-  async downloadAttachment(username, messageId, attachmentId) {
+  async downloadAttachment(username, messageId, attachmentId, { signal = null } = {}) {
     const id = assertText(messageId, 'messageId', { max: 1024 });
     const index = Number.parseInt(String(attachmentId), 10);
     if (!Number.isInteger(index) || index < 0 || index > 99) {
@@ -678,7 +704,7 @@ export class AtomicMailJmapClient {
         accountId: '$ACCOUNT_ID', ids: ['$MAIL_ID'], properties: ['id', 'attachments'],
       }, 'g0']],
     };
-    const messageResult = await this.request(username, { ops, vars: { MAIL_ID: id } });
+    const messageResult = await this.request(username, { ops, vars: { MAIL_ID: id }, signal });
     const row = methodResponse(messageResult, 'Email/get', 'g0')?.list?.[0];
     const attachment = Array.isArray(row?.attachments) ? row.attachments[index] : null;
     const blobId = typeof attachment?.blobId === 'string' ? attachment.blobId : '';
@@ -695,7 +721,7 @@ export class AtomicMailJmapClient {
       }, 'b0']],
     };
     const outputLimit = Math.max(DEFAULT_OUTPUT_LIMIT, Math.ceil(maximum * 4 / 3) + 1048576);
-    const blobResult = await this.request(username, { ops: blobOps, vars: { BLOB_ID: blobId }, outputLimit });
+    const blobResult = await this.request(username, { ops: blobOps, vars: { BLOB_ID: blobId }, outputLimit, signal });
     const blob = methodResponse(blobResult, 'Blob/get', 'b0')?.list?.[0];
     const encoded = typeof blob?.['data:asBase64'] === 'string' ? blob['data:asBase64'] : '';
     const data = Buffer.from(encoded, 'base64');

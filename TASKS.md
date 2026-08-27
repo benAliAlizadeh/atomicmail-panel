@@ -35,3 +35,4 @@
 | AM-31 | Per-job destination account password vault | ✅ Done — job-bound AES-256-GCM, protected reveal/copy and explicit sensitive CSV |
 | AM-32 | Webmail/password backup integration | ✅ Done — additive migration and verified portable restore coverage |
 | AM-33 | Full mail regression / production validation | ✅ Done — 50 automated mail/security/backup/restart/migration regressions plus read-only live Inbox/Sent smoke |
+| AM-34 | Responsive Operator UX | ✅ Done — end-to-end stale read cancellation, adaptive polling, progress/elapsed states, guarded Compose delivery and accessible async feedback |

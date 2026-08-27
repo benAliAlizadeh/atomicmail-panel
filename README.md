@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-33)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-34)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -15,6 +15,7 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - controlled shutdown: active provider process is stopped and the item is safely returned to pending
 - job counter/state reconciliation after restart
 - web dashboard and create-batch form
+- responsive operator UX with end-to-end stale read cancellation, adaptive non-overlapping polling and persistent progress feedback for slow operations
 - live job progress with provider phase, heartbeat, elapsed time, rolling ETA, pause/resume/cancel
 - searchable mailbox list with copy and pagination
 - CSV and JSON export
@@ -242,7 +243,7 @@ The service should report healthy before you use **Create emails**.
 
 ## Live validation status
 
-AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→30 complete the multi-mailbox JMAP Webmail, actions, live refresh, search/pagination, attachments, verification helpers and mail security controls. AM-31→32 add the encrypted per-job destination-password vault and backup/restore integration. AM-33 adds full regression, security, migration, backup and restart coverage.
+AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→30 complete the multi-mailbox JMAP Webmail, actions, live refresh, search/pagination, attachments, verification helpers and mail security controls. AM-31→32 add the encrypted per-job destination-password vault and backup/restore integration. AM-33 adds full regression, security, migration, backup and restart coverage. AM-34 removes stale-response races all the way through safe JMAP read-process cancellation, replaces aggressive polling with an adaptive non-overlapping scheduler, and gives every long operator action immediate progress, elapsed-time and accessible busy feedback. Send/Reply remain deliberately non-cancellable after submission so delivery state can never become ambiguous.
 
 The AM-33 production check also completed a read-only live JMAP smoke for both Inbox and Sent against a temporary copy of the existing vault. No message was sent, modified or deleted, and the source data directory was not migrated or rewritten by the smoke.
 

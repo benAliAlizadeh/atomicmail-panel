@@ -25,8 +25,20 @@ const state = {
   mailSearchField: 'subject',
   mailRefreshBusy: false,
   mailAutoTimer: null,
+  selectedMessageId: null,
+  messageLoadingId: null,
+  mailActionBusy: false,
+  composeBusy: false,
+  composeStartedAt: null,
+  composeStage: '',
+  composeDetail: '',
+  composeReturnFocus: null,
   jobDestinationPassword: null,
   composeMode: 'new',
+  previewInitialized: false,
+  requestScopes: new Map(),
+  requestSequences: new Map(),
+  activities: new Map(),
   pollBusy: false,
   pollTimer: null,
   clockTimer: null,
@@ -159,6 +171,8 @@ function refreshLiveTimers() {
   if (state.activeJob) renderLiveActivity('#currentJobActivity', state.activeJob);
   if (state.selectedJob && state.currentView === 'jobs') renderLiveActivity('#jobLiveStatus', state.selectedJob);
   updateElapsedCells();
+  renderGlobalActivity();
+  renderComposeProgress();
 }
 
 function statusPill(status) {
@@ -179,6 +193,103 @@ function showToast(message, error = false) {
   toast.hidden = false;
   clearTimeout(state.toastTimer);
   state.toastTimer = setTimeout(() => { toast.hidden = true; }, 3800);
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError';
+}
+
+function beginLatestRequest(scope, { skipIfBusy = false } = {}) {
+  const current = state.requestScopes.get(scope);
+  if (skipIfBusy && current) return null;
+  current?.controller.abort();
+  const controller = new AbortController();
+  const sequence = (state.requestSequences.get(scope) || 0) + 1;
+  const request = { controller, sequence };
+  state.requestSequences.set(scope, sequence);
+  state.requestScopes.set(scope, request);
+  return {
+    signal: controller.signal,
+    isCurrent: () => state.requestScopes.get(scope) === request,
+    finish: () => {
+      if (state.requestScopes.get(scope) === request) state.requestScopes.delete(scope);
+    },
+  };
+}
+
+function cancelRequest(scope) {
+  state.requestScopes.get(scope)?.controller.abort();
+  state.requestScopes.delete(scope);
+}
+
+function setButtonBusy(button, busy, busyLabel = 'Working') {
+  if (!button) return;
+  if (busy) {
+    if (button.dataset.busy === 'true') return;
+    button.dataset.busy = 'true';
+    button.dataset.idleHtml = button.innerHTML;
+    button.dataset.idleDisabled = button.disabled ? 'true' : 'false';
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.innerHTML = `<span class="spinner" aria-hidden="true"></span><span>${escapeHtml(busyLabel)}</span>`;
+    return;
+  }
+  if (button.dataset.busy !== 'true') return;
+  button.innerHTML = button.dataset.idleHtml || '';
+  button.disabled = button.dataset.idleDisabled === 'true';
+  button.removeAttribute('aria-busy');
+  delete button.dataset.busy;
+  delete button.dataset.idleHtml;
+  delete button.dataset.idleDisabled;
+}
+
+function beginActivity(key, label, { immediate = false } = {}) {
+  const token = `${Date.now()}-${Math.random()}`;
+  const activity = { token, label, startedAt: Date.now(), visible: immediate, timer: null };
+  clearTimeout(state.activities.get(key)?.timer);
+  state.activities.delete(key);
+  if (!immediate) {
+    activity.timer = setTimeout(() => {
+      const current = state.activities.get(key);
+      if (current?.token === token) {
+        current.visible = true;
+        renderGlobalActivity();
+      }
+    }, 180);
+  }
+  state.activities.set(key, activity);
+  renderGlobalActivity();
+  return () => {
+    const current = state.activities.get(key);
+    if (current?.token !== token) return;
+    clearTimeout(current.timer);
+    state.activities.delete(key);
+    renderGlobalActivity();
+  };
+}
+
+function renderGlobalActivity() {
+  const box = $('#globalActivity');
+  if (!box) return;
+  const active = [...state.activities.values()].filter((item) => item.visible).at(-1);
+  if (!active) {
+    box.hidden = true;
+    return;
+  }
+  $('#globalActivityText').textContent = active.label;
+  $('#globalActivityTime').textContent = formatDuration((Date.now() - active.startedAt) / 1000);
+  box.hidden = false;
+}
+
+async function withBusyButton(button, busyLabel, activityLabel, task) {
+  setButtonBusy(button, true, busyLabel);
+  const endActivity = beginActivity(button?.id || busyLabel, activityLabel || busyLabel);
+  try {
+    return await task();
+  } finally {
+    endActivity();
+    setButtonBusy(button, false);
+  }
 }
 
 async function api(path, options = {}) {
@@ -234,9 +345,20 @@ async function downloadExport(format) {
 }
 
 function showLogin() {
+  stopWebmailAutoRefresh();
+  clearInterval(state.clockTimer);
+  state.clockTimer = null;
   $('#appShell').hidden = true;
   $('#authGate').hidden = false;
   $('#loginPassword').value = '';
+  clearTimeout(state.pollTimer);
+  state.pollTimer = null;
+  for (const request of state.requestScopes.values()) request.controller.abort();
+  state.requestScopes.clear();
+  for (const activity of state.activities.values()) clearTimeout(activity.timer);
+  state.activities.clear();
+  $$('[data-busy="true"]').forEach((button) => setButtonBusy(button, false));
+  renderGlobalActivity();
   setTimeout(() => $('#loginPassword').focus(), 0);
 }
 
@@ -250,7 +372,7 @@ function showApp(authStatus) {
   $('#logoutButton').hidden = !authStatus.authRequired;
 }
 
-function switchView(view) {
+function switchView(view, { load = true } = {}) {
   if (!viewMeta[view]) return;
   if (state.currentView === 'webmail' && view !== 'webmail') stopWebmailAutoRefresh();
   if (state.currentView === 'jobs' && view !== 'jobs') hideJobPassword();
@@ -260,9 +382,9 @@ function switchView(view) {
   $$('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.viewTarget === navView));
   $('#pageTitle').textContent = viewMeta[view][0];
   $('#pageSubtitle').textContent = viewMeta[view][1];
-  if (view === 'jobs') loadJobs().catch(handleError);
-  if (view === 'mailboxes') loadMailboxes().catch(handleError);
-  if (view === 'system') loadSystem().catch(handleError);
+  if (load && view === 'jobs') loadJobs().catch(handleError);
+  if (load && view === 'mailboxes') loadMailboxes().catch(handleError);
+  if (load && view === 'system') loadSystem().catch(handleError);
   if (view === 'webmail') startWebmailAutoRefresh();
 }
 
@@ -323,7 +445,7 @@ function renderDashboard(data) {
   } else {
     banner.hidden = true;
   }
-  $('#createButton').disabled = Boolean(circuit.open) || !data.workerEnabled;
+  if ($('#createButton').dataset.busy !== 'true') $('#createButton').disabled = Boolean(circuit.open) || !data.workerEnabled;
 
   const job = data.activeJob;
   state.activeJob = job || null;
@@ -342,7 +464,10 @@ function renderDashboard(data) {
   } else {
     renderLiveActivity('#currentJobActivity', null);
   }
-  refreshNamePreview();
+  if (!state.previewInitialized) {
+    state.previewInitialized = true;
+    refreshNamePreview();
+  }
 }
 
 async function loadDashboard() {
@@ -363,10 +488,27 @@ function renderJobs(jobs) {
   }).join('');
 }
 
-async function loadJobs() {
-  const data = await api('/api/jobs?limit=75');
-  renderJobs(data.jobs || []);
-  if (state.selectedJobId) await loadJobDetail(state.selectedJobId);
+async function loadJobs({ background = false } = {}) {
+  const request = beginLatestRequest('jobs', { skipIfBusy: background });
+  if (!request) return;
+  const endActivity = background ? () => {} : beginActivity('jobs-list', 'Loading jobs');
+  if (!background) setButtonBusy($('#refreshJobs'), true, 'Refreshing');
+  $('#jobsPanel').setAttribute('aria-busy', 'true');
+  try {
+    const data = await api('/api/jobs?limit=75', { signal: request.signal });
+    if (!request.isCurrent()) return;
+    renderJobs(data.jobs || []);
+    if (state.selectedJobId) await loadJobDetail(state.selectedJobId, { background });
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+  } finally {
+    if (request.isCurrent()) {
+      request.finish();
+      $('#jobsPanel').removeAttribute('aria-busy');
+      if (!background) setButtonBusy($('#refreshJobs'), false);
+    }
+    endActivity();
+  }
 }
 
 function itemStatusCounts(items) {
@@ -375,10 +517,32 @@ function itemStatusCounts(items) {
   return counts;
 }
 
-async function loadJobDetail(id) {
-  const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
-  if (state.selectedJobId !== job.id) hideJobPassword();
-  state.selectedJobId = job.id;
+async function loadJobDetail(id, { background = false } = {}) {
+  const nextId = String(id || '');
+  if (!nextId) return;
+  if (state.selectedJobId !== nextId) hideJobPassword();
+  state.selectedJobId = nextId;
+  const request = beginLatestRequest('job-detail', { skipIfBusy: background });
+  if (!request) return;
+  const endActivity = background ? () => {} : beginActivity('job-detail', 'Loading job details');
+  if (!background) {
+    $('#jobDetailPanel').setAttribute('aria-busy', 'true');
+    $$('#jobActions button').forEach((button) => { button.disabled = true; });
+  }
+  let job;
+  try {
+    job = await api(`/api/jobs/${encodeURIComponent(nextId)}`, { signal: request.signal });
+    if (!request.isCurrent() || state.selectedJobId !== nextId) return;
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+    return;
+  } finally {
+    if (request.isCurrent()) {
+      request.finish();
+      if (!background) $('#jobDetailPanel').removeAttribute('aria-busy');
+    }
+    endActivity();
+  }
   state.selectedJob = job;
   $('#jobDetailPanel').hidden = false;
   $('#jobDetailTitle').textContent = `Job ${shortId(job.id)}`;
@@ -414,18 +578,39 @@ async function loadJobDetail(id) {
   }).join('');
 }
 
-async function runJobAction(action) {
+async function runJobAction(action, sourceButton) {
   if (!state.selectedJobId) return;
   if (action === 'cancel' && !confirm('Cancel all pending items in this job? A registration already in progress cannot be interrupted safely.')) return;
-  await api(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/${action}`, { method: 'POST', body: '{}' });
-  showToast(`Job ${action} requested`);
-  await Promise.all([loadJobDetail(state.selectedJobId), loadJobs(), loadDashboard()]);
+  const jobId = state.selectedJobId;
+  await withBusyButton(sourceButton, `${action[0].toUpperCase()}${action.slice(1)}…`, `Requesting job ${action}`, async () => {
+    $$('#jobActions button').forEach((button) => { button.disabled = true; });
+    await api(`/api/jobs/${encodeURIComponent(jobId)}/${action}`, { method: 'POST', body: '{}' });
+    showToast(`Job ${action} requested`);
+    await Promise.all([loadJobs(), loadDashboard()]);
+  });
 }
 
-async function loadMailboxes() {
+async function loadMailboxes({ background = false } = {}) {
+  const request = beginLatestRequest('mailboxes', { skipIfBusy: background });
+  if (!request) return;
+  const endActivity = background ? () => {} : beginActivity('mailbox-list', 'Loading mailboxes');
+  $('#mailboxesPanel').setAttribute('aria-busy', 'true');
   const params = new URLSearchParams({ limit: state.mailboxLimit, offset: state.mailboxOffset });
   if (state.mailboxSearch) params.set('search', state.mailboxSearch);
-  const data = await api(`/api/mailboxes?${params}`);
+  let data;
+  try {
+    data = await api(`/api/mailboxes?${params}`, { signal: request.signal });
+    if (!request.isCurrent()) return;
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+    return;
+  } finally {
+    if (request.isCurrent()) {
+      request.finish();
+      $('#mailboxesPanel').removeAttribute('aria-busy');
+    }
+    endActivity();
+  }
   state.mailboxTotal = Number(data.total || 0);
   const items = data.items || [];
   $('#mailboxesEmpty').hidden = items.length > 0;
@@ -472,9 +657,10 @@ function renderInbox(items) {
   const last = Math.min(state.mailTotal, state.mailPosition + state.inboxItems.length);
   $('#inboxCountText').textContent = `${first}–${last} of ${state.mailTotal} message${state.mailTotal === 1 ? '' : 's'}`;
   $('#inboxList').innerHTML = state.inboxItems.map((item) => {
-    const active = state.selectedMessage?.id === item.id ? ' active' : '';
+    const active = state.selectedMessageId === item.id ? ' active' : '';
+    const loading = state.messageLoadingId === item.id ? ' loading' : '';
     const unread = item.unread ? ' unread' : '';
-    return `<button class="mail-row${active}${unread}" type="button" data-message-id="${escapeHtml(item.id)}">
+    return `<button class="mail-row${active}${loading}${unread}" type="button" data-message-id="${escapeHtml(item.id)}"${active ? ' aria-current="true"' : ''}${loading ? ' aria-busy="true"' : ''}>
       <span class="mail-row-top"><span class="mail-from">${item.unread ? '<span class="unread-dot" aria-label="Unread"></span>' : ''}${escapeHtml(state.mailFolder === 'sent' ? (item.toText || 'Unknown recipient') : (item.fromText || 'Unknown sender'))}</span><span class="mail-date">${escapeHtml(formatDate(item.receivedAt || item.sentAt))}</span></span>
       <span class="mail-subject">${escapeHtml(item.subject || '(no subject)')}${item.hasAttachment ? ' · 📎' : ''}</span>
       <span class="mail-preview">${escapeHtml(item.preview || '')}</span>
@@ -487,22 +673,31 @@ function renderInbox(items) {
   $('#mailNext').disabled = state.mailPosition + state.mailLimit >= state.mailTotal;
 }
 
-async function loadInbox() {
-  if (!state.selectedMailbox || state.mailRefreshBusy) return;
+async function loadInbox({ background = false, statusText = 'Syncing mailbox' } = {}) {
+  if (!state.selectedMailbox) return;
+  const request = beginLatestRequest('inbox', { skipIfBusy: background });
+  if (!request) return;
+  const mailboxId = state.selectedMailbox.id;
+  const folder = state.mailFolder;
   state.mailRefreshBusy = true;
   const loading = $('#inboxLoading');
   loading.hidden = false;
+  $('#inboxLoadingText').textContent = background ? 'Checking for new mail…' : `${statusText}…`;
+  $('#mailListPanel').setAttribute('aria-busy', 'true');
+  $('#inboxList').classList.add('is-refreshing');
   setMailError('');
-  $('#refreshInbox').disabled = true;
+  setButtonBusy($('#refreshInbox'), true, 'Syncing');
+  const endActivity = background ? () => {} : beginActivity('mail-sync', statusText);
   try {
     const params = new URLSearchParams({
-      folder: state.mailFolder,
+      folder,
       limit: state.mailLimit,
       position: state.mailPosition,
       field: state.mailSearchField,
     });
     if (state.mailSearch) params.set('search', state.mailSearch);
-    const data = await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/mail?${params}`);
+    const data = await api(`/api/mailboxes/${encodeURIComponent(mailboxId)}/mail?${params}`, { signal: request.signal });
+    if (!request.isCurrent() || state.selectedMailbox?.id !== mailboxId || state.mailFolder !== folder) return;
     state.selectedMailbox = data.mailbox || state.selectedMailbox;
     state.mailTotal = Number(data.total || 0);
     $('#webmailAddress').textContent = state.selectedMailbox.email;
@@ -510,17 +705,26 @@ async function loadInbox() {
     $('#inboxUnreadBadge').textContent = state.mailFolder === 'inbox' && Number(data.unreadTotal || 0) > 0 ? String(data.unreadTotal) : '';
     renderInbox(data.items || []);
   } catch (error) {
-    setMailError(error.message, error.body?.detail || '');
+    if (!isAbortError(error) && request.isCurrent()) setMailError(error.message, error.body?.detail || '');
   } finally {
-    loading.hidden = true;
-    $('#refreshInbox').disabled = false;
-    state.mailRefreshBusy = false;
+    if (request.isCurrent()) {
+      request.finish();
+      loading.hidden = true;
+      $('#mailListPanel').removeAttribute('aria-busy');
+      $('#inboxList').classList.remove('is-refreshing');
+      setButtonBusy($('#refreshInbox'), false);
+      state.mailRefreshBusy = false;
+    }
+    endActivity();
   }
 }
 
 async function openMailbox(id, email) {
   state.selectedMailbox = { id, email };
   state.selectedMessage = null;
+  state.selectedMessageId = null;
+  state.messageLoadingId = null;
+  cancelRequest('message');
   state.mailFolder = 'inbox';
   state.mailPosition = 0;
   state.mailSearch = '';
@@ -533,7 +737,7 @@ async function openMailbox(id, email) {
   $('#messageLoading').hidden = true;
   renderInbox([]);
   switchView('webmail');
-  await loadInbox();
+  await loadInbox({ statusText: 'Opening inbox' });
 }
 
 function selectMailFolder(folder, refresh = true) {
@@ -541,6 +745,11 @@ function selectMailFolder(folder, refresh = true) {
   state.mailFolder = folder;
   state.mailPosition = 0;
   state.selectedMessage = null;
+  state.selectedMessageId = null;
+  state.messageLoadingId = null;
+  cancelRequest('message');
+  $('#messageLoading').hidden = true;
+  $('#messagePanel').removeAttribute('aria-busy');
   $('#messageEmpty').textContent = 'Select an email to read it.';
   $('#messageEmpty').hidden = false;
   $('#messageDetail').hidden = true;
@@ -548,7 +757,7 @@ function selectMailFolder(folder, refresh = true) {
   $('#inboxEmpty').textContent = folder === 'sent' ? 'No sent messages yet.' : 'No messages in this inbox yet.';
   $$('[data-mail-folder]').forEach((button) => button.classList.toggle('active', button.dataset.mailFolder === folder));
   $('#archiveMail').hidden = folder !== 'inbox';
-  if (refresh) loadInbox().catch(handleError);
+  if (refresh) loadInbox({ statusText: `Opening ${folder === 'sent' ? 'Sent' : 'Inbox'}` }).catch(handleError);
 }
 
 function stopWebmailAutoRefresh() {
@@ -561,7 +770,7 @@ function startWebmailAutoRefresh() {
   if (!state.selectedMailbox || state.currentView !== 'webmail') return;
   const seconds = Math.max(30, Number(state.dashboard?.mail?.autoRefreshSeconds || 45));
   state.mailAutoTimer = setInterval(() => {
-    if (state.currentView === 'webmail' && !document.hidden) loadInbox().catch(() => {});
+    if (state.currentView === 'webmail' && !document.hidden) loadInbox({ background: true }).catch(() => {});
   }, seconds * 1000);
 }
 
@@ -608,6 +817,7 @@ function renderAttachments(attachments) {
 
 function renderMessage(message) {
   state.selectedMessage = message;
+  state.selectedMessageId = message.id;
   $('#messageSubject').textContent = message.subject || '(no subject)';
   const rows = [
     ['From', message.fromText || 'Unknown sender'],
@@ -635,52 +845,95 @@ function renderMessage(message) {
 }
 
 async function runMailAction(action) {
-  if (!state.selectedMailbox || !state.selectedMessage) return;
+  if (!state.selectedMailbox || !state.selectedMessage || state.mailActionBusy) return;
   if (action === 'trash' && !confirm('Move this message to Trash? It will not be permanently deleted.')) return;
-  await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(state.selectedMessage.id)}/actions`, {
-    method: 'POST',
-    body: JSON.stringify({ action }),
-  });
-  showToast(action === 'trash' ? 'Message moved to Trash' : `Message updated: ${action.replaceAll('_', ' ')}`);
-  if (['archive', 'trash'].includes(action)) {
-    state.selectedMessage = null;
-    $('#messageDetail').hidden = true;
-    $('#messageEmpty').hidden = false;
-  } else {
-    state.selectedMessage.unread = action === 'mark_unread';
+  const mailboxId = state.selectedMailbox.id;
+  const messageId = state.selectedMessage.id;
+  const operation = action === 'trash' ? 'Moving message to Trash' : `${action.replaceAll('_', ' ')} message`;
+  const endActivity = beginActivity('mail-action', operation);
+  state.mailActionBusy = true;
+  $('#messagePanel').setAttribute('aria-busy', 'true');
+  $('#inboxList').setAttribute('aria-busy', 'true');
+  $('#messageOperationText').textContent = `${operation}…`;
+  $('#messageOperation').hidden = false;
+  $$('.message-actions button').forEach((button) => { button.disabled = true; });
+  try {
+    await api(`/api/mailboxes/${encodeURIComponent(mailboxId)}/messages/${encodeURIComponent(messageId)}/actions`, {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    });
+    showToast(action === 'trash' ? 'Message moved to Trash' : `Message updated: ${action.replaceAll('_', ' ')}`);
+    if (state.selectedMessageId === messageId && ['archive', 'trash'].includes(action)) {
+      state.selectedMessage = null;
+      state.selectedMessageId = null;
+      $('#messageDetail').hidden = true;
+      $('#messageEmpty').hidden = false;
+    } else if (state.selectedMessage?.id === messageId) {
+      state.selectedMessage.unread = action === 'mark_unread';
+    }
+    await loadInbox({ statusText: 'Updating folder' });
+    if (state.selectedMessage?.id === messageId) renderMessage(state.selectedMessage);
+  } finally {
+    state.mailActionBusy = false;
+    $('#messagePanel').removeAttribute('aria-busy');
+    $('#inboxList').removeAttribute('aria-busy');
+    $('#messageOperation').hidden = true;
+    $$('.message-actions button').forEach((button) => { button.disabled = false; });
+    endActivity();
   }
-  await loadInbox();
-  if (state.selectedMessage) renderMessage(state.selectedMessage);
 }
 
 async function loadMessage(messageId) {
   if (!state.selectedMailbox) return;
+  const request = beginLatestRequest('message');
+  const mailboxId = state.selectedMailbox.id;
+  state.selectedMessageId = messageId;
+  state.messageLoadingId = messageId;
+  state.selectedMessage = null;
+  renderInbox(state.inboxItems);
   setMailError('');
   $('#messageEmpty').hidden = true;
   $('#messageDetail').hidden = true;
   $('#messageLoading').hidden = false;
+  $('#messageLoadingText').textContent = 'Loading the selected message…';
+  $('#messagePanel').setAttribute('aria-busy', 'true');
+  const endActivity = beginActivity('message-read', 'Loading message');
   try {
-    const data = await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(messageId)}`);
+    const data = await api(`/api/mailboxes/${encodeURIComponent(mailboxId)}/messages/${encodeURIComponent(messageId)}`, { signal: request.signal });
+    if (!request.isCurrent() || state.selectedMailbox?.id !== mailboxId || state.selectedMessageId !== messageId) return;
     renderMessage(data.message);
   } catch (error) {
-    setMailError(error.message, error.body?.detail || '');
-    $('#messageEmpty').textContent = 'Could not load this message.';
-    $('#messageEmpty').hidden = false;
+    if (!isAbortError(error) && request.isCurrent()) {
+      setMailError(error.message, error.body?.detail || '');
+      $('#messageEmpty').textContent = 'Could not load this message.';
+      $('#messageEmpty').hidden = false;
+    }
   } finally {
-    $('#messageLoading').hidden = true;
+    if (request.isCurrent()) {
+      request.finish();
+      state.messageLoadingId = null;
+      $('#messageLoading').hidden = true;
+      $('#messagePanel').removeAttribute('aria-busy');
+      renderInbox(state.inboxItems);
+    }
+    endActivity();
   }
 }
 
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += 32768) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
-  }
-  return btoa(binary);
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener('load', () => {
+      const result = String(reader.result || '');
+      resolve(result.slice(result.indexOf(',') + 1));
+    }, { once: true });
+    reader.addEventListener('error', () => reject(new Error(`Could not read ${file.name}`)), { once: true });
+    reader.addEventListener('abort', () => reject(new Error(`Reading ${file.name} was cancelled`)), { once: true });
+    reader.readAsDataURL(file);
+  });
 }
 
-async function serializeComposeAttachments() {
+async function serializeComposeAttachments(onProgress = () => {}) {
   const files = [...($('#composeAttachments').files || [])];
   const limits = state.dashboard?.mail || {};
   const maxCount = Number(limits.maxAttachmentCount || 5);
@@ -693,15 +946,53 @@ async function serializeComposeAttachments() {
     total += file.size;
   }
   if (total > maxTotal) throw new Error(`Attachments exceed the ${formatBytes(maxTotal)} total limit`);
-  return Promise.all(files.map(async (file) => ({
-    name: file.name,
-    type: file.type || 'application/octet-stream',
-    data: arrayBufferToBase64(await file.arrayBuffer()),
-  })));
+  const attachments = [];
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    onProgress(index + 1, files.length, file.name);
+    attachments.push({
+      name: file.name,
+      type: file.type || 'application/octet-stream',
+      data: await fileToBase64(file),
+    });
+  }
+  return attachments;
+}
+
+function setComposeProgress(stage, detail = '') {
+  state.composeStage = stage;
+  state.composeDetail = detail;
+  renderComposeProgress();
+}
+
+function renderComposeProgress() {
+  const box = $('#composeProgress');
+  if (!box || !state.composeBusy) return;
+  const elapsed = Math.max(0, (Date.now() - state.composeStartedAt) / 1000);
+  $('#composeProgressTitle').textContent = state.composeStage || 'Working…';
+  $('#composeProgressDetail').textContent = `${state.composeDetail}${state.composeDetail ? ' · ' : ''}Elapsed ${formatDuration(elapsed)}`;
+  const buttonLabel = $('#sendCompose').querySelector('span:last-child');
+  if (buttonLabel) buttonLabel.textContent = `${state.composeStage.startsWith('Preparing') ? 'Preparing' : 'Sending'} · ${formatDuration(elapsed)}`;
+}
+
+function setComposeBusy(busy) {
+  state.composeBusy = busy;
+  $('#composeForm').setAttribute('aria-busy', busy ? 'true' : 'false');
+  ['#composeTo', '#composeSubject', '#composeBody', '#composeAttachments', '#closeCompose', '#cancelCompose'].forEach((selector) => {
+    $(selector).disabled = busy;
+  });
+  setButtonBusy($('#sendCompose'), busy, 'Sending · 0s');
+  $('#composeProgress').hidden = !busy;
+  if (!busy) {
+    state.composeStartedAt = null;
+    state.composeStage = '';
+    state.composeDetail = '';
+  }
 }
 
 function openCompose(mode = 'new') {
   if (!state.selectedMailbox) return;
+  state.composeReturnFocus = document.activeElement;
   state.composeMode = mode;
   const reply = mode === 'reply';
   $('#composeTitle').textContent = reply ? 'Reply' : 'New message';
@@ -720,20 +1011,30 @@ function openCompose(mode = 'new') {
   setTimeout(() => (reply ? $('#composeBody') : $('#composeTo')).focus(), 0);
 }
 
-function closeCompose() {
+function closeCompose(force = false) {
+  if (state.composeBusy && !force) return;
   $('#composeModal').hidden = true;
   $('#composeError').hidden = true;
   $('#composeAttachments').value = '';
+  if (state.composeReturnFocus?.isConnected) state.composeReturnFocus.focus();
+  state.composeReturnFocus = null;
 }
 
 async function submitCompose() {
-  if (!state.selectedMailbox) return;
-  const button = $('#sendCompose');
+  if (!state.selectedMailbox || state.composeBusy) return;
   const errorBox = $('#composeError');
-  button.disabled = true;
   errorBox.hidden = true;
+  state.composeStartedAt = Date.now();
+  setComposeBusy(true);
+  setComposeProgress('Preparing message', 'Checking size and attachments');
+  const endActivity = beginActivity('compose', state.composeMode === 'reply' ? 'Sending reply' : 'Sending email', { immediate: true });
+  let sent = false;
   try {
-    const attachments = await serializeComposeAttachments();
+    const attachments = await serializeComposeAttachments((position, count, name) => {
+      setComposeProgress(`Preparing attachment ${position}/${count}`, name);
+    });
+    const timeoutSeconds = Math.ceil(Number(state.dashboard?.mail?.commandTimeoutMs || 60000) / 1000);
+    setComposeProgress(state.composeMode === 'reply' ? 'Sending reply' : 'Sending email', `Keep this window open while Atomic Mail processes the request (timeout guard ${timeoutSeconds}s)`);
     if (state.composeMode === 'reply') {
       if (!state.selectedMessage?.id) throw new Error('No message selected for reply');
       await api(`/api/mailboxes/${encodeURIComponent(state.selectedMailbox.id)}/messages/${encodeURIComponent(state.selectedMessage.id)}/reply`, {
@@ -748,12 +1049,17 @@ async function submitCompose() {
       });
       showToast('Email sent');
     }
-    closeCompose();
+    sent = true;
   } catch (error) {
     errorBox.textContent = error.message;
     errorBox.hidden = false;
   } finally {
-    button.disabled = false;
+    endActivity();
+    setComposeBusy(false);
+  }
+  if (sent) {
+    closeCompose(true);
+    if (state.mailFolder === 'sent') await loadInbox({ statusText: 'Refreshing Sent' });
   }
 }
 
@@ -767,14 +1073,16 @@ function hideJobPassword() {
   $('#revealJobPassword').hidden = false;
 }
 
-async function revealJobPassword() {
+async function revealJobPassword(sourceButton) {
   if (!state.selectedJobId) return;
-  const result = await api(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/destination-password`, { method: 'POST', body: '{}' });
-  state.jobDestinationPassword = result.password;
-  $('#jobPasswordValue').textContent = result.password;
-  $('#copyJobPassword').disabled = false;
-  $('#hideJobPassword').hidden = false;
-  $('#revealJobPassword').hidden = true;
+  await withBusyButton(sourceButton, 'Decrypting', 'Decrypting destination password', async () => {
+    const result = await api(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/destination-password`, { method: 'POST', body: '{}' });
+    state.jobDestinationPassword = result.password;
+    $('#jobPasswordValue').textContent = result.password;
+    $('#copyJobPassword').disabled = false;
+    $('#hideJobPassword').hidden = false;
+    $('#revealJobPassword').hidden = true;
+  });
 }
 
 async function copyText(value, successMessage = 'Copied') {
@@ -869,23 +1177,50 @@ function renderDataSafety(data) {
   if (permissionWarning) warnings.push(`OS file-permission hardening warning: ${permissionWarning}`);
   warning.hidden = warnings.length === 0;
   warning.textContent = warnings.join(' ');
-  $('#verifyBackup').disabled = !latest;
+  if ($('#verifyBackup').dataset.busy !== 'true') $('#verifyBackup').disabled = !latest;
 }
 
 async function loadSystem() {
-  const [circuit, audit, dataSafety] = await Promise.all([
-    api('/api/system/circuit'),
-    api('/api/audit?limit=80'),
-    api('/api/system/data-safety'),
-  ]);
-  renderCircuit(circuit);
-  renderAudit(audit.items || []);
-  renderDataSafety(dataSafety);
+  const request = beginLatestRequest('system');
+  const endActivity = beginActivity('system-load', 'Loading system status');
+  setButtonBusy($('#refreshAudit'), true, 'Refreshing');
+  try {
+    const [circuit, audit, dataSafety] = await Promise.all([
+      api('/api/system/circuit', { signal: request.signal }),
+      api('/api/audit?limit=80', { signal: request.signal }),
+      api('/api/system/data-safety', { signal: request.signal }),
+    ]);
+    if (!request.isCurrent()) return;
+    renderCircuit(circuit);
+    renderAudit(audit.items || []);
+    renderDataSafety(dataSafety);
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+  } finally {
+    if (request.isCurrent()) {
+      request.finish();
+      setButtonBusy($('#refreshAudit'), false);
+    }
+    endActivity();
+  }
 }
 
 function startPolling() {
-  if (!state.pollTimer) state.pollTimer = setInterval(poll, 2000);
+  schedulePoll(state.activeJob ? 2500 : 8000);
   if (!state.clockTimer) state.clockTimer = setInterval(refreshLiveTimers, 1000);
+}
+
+function schedulePoll(delay) {
+  clearTimeout(state.pollTimer);
+  state.pollTimer = setTimeout(async () => {
+    await poll();
+    if (!state.authenticated) {
+      state.pollTimer = null;
+      return;
+    }
+    const active = ['pending', 'running'].includes(state.activeJob?.status);
+    schedulePoll(active ? 2500 : 10000);
+  }, delay);
 }
 
 async function poll() {
@@ -893,11 +1228,9 @@ async function poll() {
   state.pollBusy = true;
   try {
     await loadDashboard();
-    if (state.currentView === 'jobs') await loadJobs();
-    if (state.currentView === 'mailboxes') await loadMailboxes();
-    if (state.currentView === 'system') await loadSystem();
+    if (state.currentView === 'jobs' && state.activeJob) await loadJobs({ background: true });
   } catch (error) {
-    if (error?.status !== 401) console.warn(error);
+    if (!isAbortError(error) && error?.status !== 401) console.warn(error);
   } finally {
     state.pollBusy = false;
   }
@@ -906,7 +1239,9 @@ async function poll() {
 $('#loginForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   const errorBox = $('#loginError');
+  const button = event.currentTarget.querySelector('button[type="submit"]');
   errorBox.hidden = true;
+  setButtonBusy(button, true, 'Signing in');
   try {
     const auth = await api('/api/auth/login', {
       method: 'POST',
@@ -919,16 +1254,20 @@ $('#loginForm').addEventListener('submit', async (event) => {
   } catch (error) {
     errorBox.textContent = error.message;
     errorBox.hidden = false;
+  } finally {
+    setButtonBusy(button, false);
   }
 });
 
-$('#logoutButton').addEventListener('click', async () => {
-  try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch {}
-  stopWebmailAutoRefresh();
-  hideJobPassword();
-  state.csrf = null;
-  state.authenticated = false;
-  showLogin();
+$('#logoutButton').addEventListener('click', async (event) => {
+  await withBusyButton(event.currentTarget, 'Signing out', 'Signing out', async () => {
+    try { await api('/api/auth/logout', { method: 'POST', body: '{}' }); } catch {}
+    stopWebmailAutoRefresh();
+    hideJobPassword();
+    state.csrf = null;
+    state.authenticated = false;
+    showLogin();
+  });
 });
 
 $('#nav').addEventListener('click', (event) => {
@@ -944,7 +1283,8 @@ $('#createForm').addEventListener('submit', async (event) => {
   const errorBox = $('#createError');
   errorBox.hidden = true;
   const button = $('#createButton');
-  button.disabled = true;
+  setButtonBusy(button, true, 'Creating batch');
+  const endActivity = beginActivity('create-batch', 'Creating batch', { immediate: true });
   try {
     const job = await api('/api/jobs', {
       method: 'POST',
@@ -959,13 +1299,14 @@ $('#createForm').addEventListener('submit', async (event) => {
     $('#toggleDestinationPassword').textContent = 'Show';
     state.selectedJobId = job.id;
     showToast(`Batch created: ${job.requested_count} email${job.requested_count === 1 ? '' : 's'}`);
-    switchView('jobs');
+    switchView('jobs', { load: false });
     await Promise.all([loadJobs(), loadDashboard()]);
-    await loadJobDetail(job.id);
   } catch (error) {
     errorBox.textContent = error.message;
     errorBox.hidden = false;
   } finally {
+    endActivity();
+    setButtonBusy(button, false);
     button.disabled = Boolean(state.dashboard?.circuit?.open) || !state.dashboard?.workerEnabled;
   }
 });
@@ -977,7 +1318,7 @@ $('#jobsBody').addEventListener('click', (event) => {
 
 $('#jobActions').addEventListener('click', (event) => {
   const button = event.target.closest('[data-job-action]');
-  if (button) runJobAction(button.dataset.jobAction).catch(handleError);
+  if (button) runJobAction(button.dataset.jobAction, button).catch(handleError);
 });
 
 $('#refreshJobs').addEventListener('click', () => loadJobs().catch(handleError));
@@ -1013,14 +1354,16 @@ $('#mailboxNext').addEventListener('click', () => {
 $('#mailboxesBody').addEventListener('click', async (event) => {
   const openButton = event.target.closest('[data-open-inbox]');
   if (openButton) {
-    await openMailbox(openButton.dataset.openInbox, openButton.dataset.mailboxEmail).catch(handleError);
+    await withBusyButton(openButton, 'Opening', 'Opening mailbox', () => openMailbox(openButton.dataset.openInbox, openButton.dataset.mailboxEmail)).catch(handleError);
     return;
   }
   const passwordButton = event.target.closest('[data-copy-mailbox-password]');
   if (passwordButton) {
     try {
-      const result = await api(`/api/mailboxes/${encodeURIComponent(passwordButton.dataset.copyMailboxPassword)}/destination-password`, { method: 'POST', body: '{}' });
-      await copyText(result.password, 'Destination password copied');
+      await withBusyButton(passwordButton, 'Copying', 'Decrypting destination password', async () => {
+        const result = await api(`/api/mailboxes/${encodeURIComponent(passwordButton.dataset.copyMailboxPassword)}/destination-password`, { method: 'POST', body: '{}' });
+        await copyText(result.password, 'Destination password copied');
+      });
     } catch (error) {
       handleError(error);
     }
@@ -1037,33 +1380,33 @@ $('#mailboxesBody').addEventListener('click', async (event) => {
 });
 
 $('#backToMailboxes').addEventListener('click', () => switchView('mailboxes'));
-$('#refreshInbox').addEventListener('click', () => loadInbox().catch(handleError));
+$('#refreshInbox').addEventListener('click', () => loadInbox({ statusText: 'Refreshing mailbox' }).catch(handleError));
 $$('[data-mail-folder]').forEach((button) => button.addEventListener('click', () => selectMailFolder(button.dataset.mailFolder)));
 $('#mailSearchForm').addEventListener('submit', (event) => {
   event.preventDefault();
   state.mailSearch = $('#mailSearch').value.trim();
   state.mailSearchField = $('#mailSearchField').value;
   state.mailPosition = 0;
-  loadInbox().catch(handleError);
+  loadInbox({ statusText: 'Searching mail' }).catch(handleError);
 });
 $('#clearMailSearch').addEventListener('click', () => {
   $('#mailSearch').value = '';
   state.mailSearch = '';
   state.mailPosition = 0;
-  loadInbox().catch(handleError);
+  loadInbox({ statusText: 'Clearing search' }).catch(handleError);
 });
 $('#mailPageSize').addEventListener('change', () => {
   state.mailLimit = Number($('#mailPageSize').value) || 25;
   state.mailPosition = 0;
-  loadInbox().catch(handleError);
+  loadInbox({ statusText: 'Changing page size' }).catch(handleError);
 });
 $('#mailPrev').addEventListener('click', () => {
   state.mailPosition = Math.max(0, state.mailPosition - state.mailLimit);
-  loadInbox().catch(handleError);
+  loadInbox({ statusText: 'Loading previous page' }).catch(handleError);
 });
 $('#mailNext').addEventListener('click', () => {
   if (state.mailPosition + state.mailLimit < state.mailTotal) state.mailPosition += state.mailLimit;
-  loadInbox().catch(handleError);
+  loadInbox({ statusText: 'Loading next page' }).catch(handleError);
 });
 $('#composeMail').addEventListener('click', () => openCompose('new'));
 $('#replyMail').addEventListener('click', () => openCompose('reply'));
@@ -1078,8 +1421,8 @@ $('#messageDetail').addEventListener('click', (event) => {
   const button = event.target.closest('[data-copy-value]');
   if (button) copyText(button.dataset.copyValue).catch(handleError);
 });
-$('#closeCompose').addEventListener('click', closeCompose);
-$('#cancelCompose').addEventListener('click', closeCompose);
+$('#closeCompose').addEventListener('click', () => closeCompose());
+$('#cancelCompose').addEventListener('click', () => closeCompose());
 $('#composeModal').addEventListener('click', (event) => {
   if (event.target === event.currentTarget) closeCompose();
 });
@@ -1088,15 +1431,15 @@ $('#composeForm').addEventListener('submit', (event) => {
   submitCompose().catch(handleError);
 });
 
-$('#exportCsv').addEventListener('click', () => downloadExport('csv').catch(handleError));
-$('#exportJson').addEventListener('click', () => downloadExport('json').catch(handleError));
-$('#exportSensitiveCsv').addEventListener('click', () => downloadSensitiveExport().catch(handleError));
+$('#exportCsv').addEventListener('click', (event) => withBusyButton(event.currentTarget, 'Exporting', 'Preparing CSV export', () => downloadExport('csv')).catch(handleError));
+$('#exportJson').addEventListener('click', (event) => withBusyButton(event.currentTarget, 'Exporting', 'Preparing JSON export', () => downloadExport('json')).catch(handleError));
+$('#exportSensitiveCsv').addEventListener('click', (event) => withBusyButton(event.currentTarget, 'Exporting', 'Preparing sensitive export', () => downloadSensitiveExport()).catch(handleError));
 $('#toggleDestinationPassword').addEventListener('click', () => {
   const input = $('#destinationPassword');
   input.type = input.type === 'password' ? 'text' : 'password';
   $('#toggleDestinationPassword').textContent = input.type === 'password' ? 'Show' : 'Hide';
 });
-$('#revealJobPassword').addEventListener('click', () => revealJobPassword().catch(handleError));
+$('#revealJobPassword').addEventListener('click', (event) => revealJobPassword(event.currentTarget).catch(handleError));
 $('#hideJobPassword').addEventListener('click', hideJobPassword);
 $('#copyJobPassword').addEventListener('click', () => {
   if (state.jobDestinationPassword != null) copyText(state.jobDestinationPassword, 'Destination password copied').catch(handleError);
@@ -1104,28 +1447,26 @@ $('#copyJobPassword').addEventListener('click', () => {
 $('#refreshAudit').addEventListener('click', () => loadSystem().catch(handleError));
 $('#createBackup').addEventListener('click', async () => {
   const button = $('#createBackup');
-  button.disabled = true;
   try {
-    const result = await api('/api/system/backups', { method: 'POST', body: '{}' });
-    showToast(`Encrypted backup created and verified: ${result.name}`);
-    await loadSystem();
+    await withBusyButton(button, 'Creating', 'Creating and verifying encrypted backup', async () => {
+      const result = await api('/api/system/backups', { method: 'POST', body: '{}' });
+      showToast(`Encrypted backup created and verified: ${result.name}`);
+      await loadSystem();
+    });
   } catch (error) {
     handleError(error);
-  } finally {
-    button.disabled = false;
   }
 });
 $('#verifyBackup').addEventListener('click', async () => {
   const button = $('#verifyBackup');
-  button.disabled = true;
   try {
-    const result = await api('/api/system/backups/verify', { method: 'POST', body: '{}' });
-    showToast(`Backup verified: ${result.name}`);
-    await loadSystem();
+    await withBusyButton(button, 'Verifying', 'Verifying latest encrypted backup', async () => {
+      const result = await api('/api/system/backups/verify', { method: 'POST', body: '{}' });
+      showToast(`Backup verified: ${result.name}`);
+      await loadSystem();
+    });
   } catch (error) {
     handleError(error);
-  } finally {
-    button.disabled = false;
   }
 });
 
@@ -1136,19 +1477,31 @@ $('#resetCircuit').addEventListener('click', async (event) => {
     : 'Reset the temporary circuit now? Normal cooldown is safer unless the underlying issue is resolved.';
   if (!confirm(message)) return;
   try {
-    await api('/api/system/circuit/reset', {
-      method: 'POST',
-      body: JSON.stringify({ confirm: permanent ? 'RESET' : 'TEMPORARY' }),
+    await withBusyButton(event.currentTarget, 'Resetting', 'Resetting circuit breaker', async () => {
+      await api('/api/system/circuit/reset', {
+        method: 'POST',
+        body: JSON.stringify({ confirm: permanent ? 'RESET' : 'TEMPORARY' }),
+      });
+      showToast('Circuit reset');
+      await Promise.all([loadSystem(), loadDashboard()]);
     });
-    showToast('Circuit reset');
-    await Promise.all([loadSystem(), loadDashboard()]);
   } catch (error) {
     handleError(error);
   }
 });
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && state.currentView === 'webmail' && state.selectedMailbox) loadInbox().catch(() => {});
+  if (!document.hidden && state.currentView === 'webmail' && state.selectedMailbox) loadInbox({ background: true }).catch(() => {});
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('#composeModal').hidden) closeCompose();
+});
+
+window.addEventListener('beforeunload', (event) => {
+  if (!state.composeBusy) return;
+  event.preventDefault();
+  event.returnValue = '';
 });
 
 async function boot() {
