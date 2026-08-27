@@ -1,0 +1,15 @@
+services:
+  atomicmail-panel:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      MAX_BATCH_SIZE: 100
+      POST_SUCCESS_DELAY_MS: 5000
+      MAX_RETRIES: 3
+      RATE_LIMIT_COOLDOWN_MS: 300000
+    volumes:
+      - ./data:/app/data

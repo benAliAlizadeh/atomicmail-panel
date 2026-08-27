@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AtomicMail Panel — Core</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:760px;margin:64px auto;padding:0 20px;color:#171717;background:#fafafa}
+    .card{background:#fff;border:1px solid #e6e6e6;border-radius:16px;padding:24px;box-shadow:0 8px 30px rgba(0,0,0,.04)}
+    code{background:#f1f1f1;padding:2px 6px;border-radius:6px} .ok{color:#087a45;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>AtomicMail Panel</h1>
+    <p class="ok">AM-01 → AM-08 core is running.</p>
+    <p>This stage intentionally exposes only the operator API. The production dashboard is the next stage.</p>
+    <p>Health: <code>GET /health</code></p>
+    <p>Create batch: <code>POST /api/jobs</code></p>
+  </div>
+</body>
+</html>
