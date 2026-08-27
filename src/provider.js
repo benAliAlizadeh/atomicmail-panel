@@ -34,6 +34,32 @@ export function classifyProviderError(rawInput) {
   return { kind: 'permanent', retryAfterMs: null, message: 'Atomic Mail registration failed' };
 }
 
+export function resolveProviderInvocation(command, args, {
+  platform = process.platform,
+  execPath = process.execPath,
+  existsSync = fs.existsSync,
+} = {}) {
+  const normalized = String(command || '').trim().toLowerCase();
+
+  // On Windows, npm/npx are .cmd shims. child_process.spawn(..., shell:false)
+  // cannot reliably execute those shims directly. Use the Node executable and
+  // npm's real npx JavaScript entrypoint instead; this avoids shell quoting and
+  // does not depend on PATHEXT/PATH behavior.
+  if (platform === 'win32' && (normalized === 'npx' || normalized === 'npx.cmd')) {
+    const pathApi = path.win32;
+    const npxCliPath = pathApi.join(pathApi.dirname(execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js');
+    if (!existsSync(npxCliPath)) {
+      throw new ProviderError(
+        `Windows npx launcher was not found at ${npxCliPath}. Reinstall Node.js with npm or configure ATOMICMAIL_CLI_COMMAND explicitly.`,
+        { kind: 'permanent', raw: 'Local npx launcher is unavailable; provider was not contacted' },
+      );
+    }
+    return { command: execPath, args: [npxCliPath, ...args] };
+  }
+
+  return { command, args };
+}
+
 function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 131072 }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -161,7 +187,8 @@ export class AtomicMailProvider {
 
     let result;
     try {
-      result = await runProcess(this.config.atomicCliCommand, args, {
+      const invocation = resolveProviderInvocation(this.config.atomicCliCommand, args);
+      result = await runProcess(invocation.command, invocation.args, {
         env,
         timeoutMs: this.config.registerTimeoutMs,
         signal: controller.signal,

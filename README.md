@@ -54,6 +54,12 @@ Restart the app. The browser will show the login screen.
 
 When the panel remains strictly on `127.0.0.1`, authentication can be left disabled for local-only operation. Before exposing it on a LAN, public interface, tunnel, or reverse proxy, enable `ADMIN_PASSWORD` and put the panel behind HTTPS. Set `ADMIN_COOKIE_SECURE=true` only when the browser actually reaches it over HTTPS.
 
+## Windows npx compatibility
+
+On Windows, `npm`/`npx` are command shims (`.cmd`) rather than native executables. The provider automatically resolves the installed npm `npx-cli.js` beside `node.exe` and launches it through Node directly. This keeps `shell: false`, avoids command-shell quoting, and prevents `spawn npx ENOENT` on standard Node.js MSI/winget installations.
+
+If the npm files beside `node.exe` are missing, the job now fails with an explicit local configuration error before contacting Atomic Mail.
+
 ## Atomic Mail registration mode
 
 The current AgentSkill registration flow requires an operator-selected `--watch` mode. This panel creates and stores inboxes but does not schedule inbox polling, so the default is:

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AtomicMailProvider, classifyProviderError } from '../src/provider.js';
+import { AtomicMailProvider, classifyProviderError, resolveProviderInvocation } from '../src/provider.js';
 import { redactSecrets, retryDelay } from '../src/utils.js';
 
 test('classifies rate limiting', () => {
@@ -89,4 +89,36 @@ test('provider refuses to overwrite a credential directory for a different inbox
   );
 
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+
+test('Windows npx invocation bypasses the .cmd shim and runs npx-cli.js with node.exe', () => {
+  const execPath = 'C:\\Program Files\\nodejs\\node.exe';
+  const expectedNpxCli = path.win32.join(
+    path.win32.dirname(execPath),
+    'node_modules',
+    'npm',
+    'bin',
+    'npx-cli.js',
+  );
+
+  const invocation = resolveProviderInvocation('npx', ['-y', 'atomicmail'], {
+    platform: 'win32',
+    execPath,
+    existsSync: (candidate) => candidate === expectedNpxCli,
+  });
+
+  assert.equal(invocation.command, execPath);
+  assert.deepEqual(invocation.args, [expectedNpxCli, '-y', 'atomicmail']);
+});
+
+test('Windows npx resolution fails clearly before contacting the provider when npm files are missing', () => {
+  assert.throws(
+    () => resolveProviderInvocation('npx', [], {
+      platform: 'win32',
+      execPath: 'C:\\Program Files\\nodejs\\node.exe',
+      existsSync: () => false,
+    }),
+    (error) => error?.kind === 'permanent' && /npx launcher was not found/i.test(error.message),
+  );
 });
