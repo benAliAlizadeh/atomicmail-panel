@@ -76,3 +76,21 @@ test('policy response opens permanent circuit and pauses job', async () => {
   store.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+test('cancelled job is not overwritten as completed when an in-flight item succeeds', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['cancel1111'] });
+  const item = store.markItemRunning(job.items[0].id);
+  store.setJobStatus(job.id, 'cancelled');
+  store.markItemSucceeded(item.id, {
+    username: item.username,
+    email: `${item.username}@atomicmail.ai`,
+    inboxId: `${item.username}@atomicmail.ai`,
+    credentialsPath: path.join(root, 'credentials', item.username, 'credentials.json'),
+  });
+  assert.equal(store.getJob(job.id).status, 'cancelled');
+  assert.equal(store.getJob(job.id).success_count, 1);
+  store.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});

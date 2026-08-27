@@ -16,8 +16,10 @@ const server = createServer({ store, worker, config });
 worker.start();
 
 server.listen(config.port, config.host, () => {
-  console.log(`AtomicMail Panel core listening on http://${config.host}:${config.port}`);
+  console.log(`AtomicMail Panel listening on http://${config.host}:${config.port}`);
   console.log(`Worker: ${config.workerEnabled ? 'enabled (concurrency=1)' : 'disabled'}`);
+  console.log(`Admin auth: ${config.adminPassword ? 'enabled' : 'disabled'}`);
+  if (!config.adminPassword) console.log('Security note: keep the panel bound to localhost/private access while ADMIN_PASSWORD is empty.');
 });
 
 function shutdown(signal) {

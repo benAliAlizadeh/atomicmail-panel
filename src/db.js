@@ -5,6 +5,11 @@ import { newId, nowIso } from './utils.js';
 
 const JOB_STATUSES = new Set(['pending', 'running', 'paused', 'completed', 'cancelled', 'failed']);
 
+function searchPattern(value) {
+  const clean = String(value || '').trim().slice(0, 100);
+  return clean ? `%${clean}%` : '';
+}
+
 export class Store {
   constructor(dbPath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
@@ -63,6 +68,9 @@ export class Store {
         job_id TEXT,
         job_item_id TEXT
       );
+
+      CREATE INDEX IF NOT EXISTS idx_mailboxes_created_at ON mailboxes(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_mailboxes_username ON mailboxes(username);
 
       CREATE TABLE IF NOT EXISTS system_state (
         key TEXT PRIMARY KEY,
@@ -136,6 +144,24 @@ export class Store {
 
   listJobs(limit = 50) {
     return this.db.prepare(`SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?`).all(limit);
+  }
+
+  getDashboardStats() {
+    const totalMailboxes = this.countMailboxes();
+    const todayStart = `${nowIso().slice(0, 10)}T00:00:00.000Z`;
+    const createdToday = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM mailboxes WHERE created_at>=?`).get(todayStart)?.count ?? 0);
+    const failedItems = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM job_items WHERE status='failed'`).get()?.count ?? 0);
+    const statusRows = this.db.prepare(`SELECT status, COUNT(*) AS count FROM jobs GROUP BY status`).all();
+    const jobs = { running: 0, paused: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 };
+    for (const row of statusRows) jobs[row.status] = Number(row.count);
+    const activeJob = this.db.prepare(`
+      SELECT id, requested_count, prefix, status, success_count, failed_count, created_at, updated_at, last_error
+      FROM jobs
+      WHERE status IN ('running','paused')
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get() || null;
+    return { totalMailboxes, createdToday, failedItems, jobs, activeJob };
   }
 
   setJobStatus(id, status) {
@@ -238,21 +264,39 @@ export class Store {
     const remaining = this.db.prepare(`
       SELECT COUNT(*) AS count FROM job_items WHERE job_id=? AND status IN ('pending','running')
     `).get(jobId)?.count ?? 0;
-    if (remaining === 0) {
-      const failed = this.db.prepare(`SELECT failed_count FROM jobs WHERE id=?`).get(jobId)?.failed_count ?? 0;
-      this.setJobStatus(jobId, failed > 0 ? 'failed' : 'completed');
+    if (remaining !== 0) return;
+
+    const job = this.db.prepare(`SELECT status, failed_count FROM jobs WHERE id=?`).get(jobId);
+    if (!job || job.status === 'cancelled') return;
+    this.setJobStatus(jobId, Number(job.failed_count) > 0 ? 'failed' : 'completed');
+  }
+
+  listMailboxes(limit = 100, offset = 0, search = '') {
+    const pattern = searchPattern(search);
+    if (!pattern) {
+      return this.db.prepare(`
+        SELECT id, username, email, status, created_at, job_id
+        FROM mailboxes ORDER BY created_at DESC LIMIT ? OFFSET ?
+      `).all(limit, offset);
     }
-  }
-
-  listMailboxes(limit = 100, offset = 0) {
     return this.db.prepare(`
-      SELECT id, username, email, inbox_id, credentials_path, status, created_at, job_id
-      FROM mailboxes ORDER BY created_at DESC LIMIT ? OFFSET ?
-    `).all(limit, offset);
+      SELECT id, username, email, status, created_at, job_id
+      FROM mailboxes
+      WHERE username LIKE ? OR email LIKE ?
+      ORDER BY created_at DESC LIMIT ? OFFSET ?
+    `).all(pattern, pattern, limit, offset);
   }
 
-  countMailboxes() {
-    return Number(this.db.prepare('SELECT COUNT(*) AS count FROM mailboxes').get()?.count ?? 0);
+  countMailboxes(search = '') {
+    const pattern = searchPattern(search);
+    if (!pattern) return Number(this.db.prepare('SELECT COUNT(*) AS count FROM mailboxes').get()?.count ?? 0);
+    return Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM mailboxes WHERE username LIKE ? OR email LIKE ?
+    `).get(pattern, pattern)?.count ?? 0);
+  }
+
+  exportMailboxes(search = '', limit = 50000) {
+    return this.listMailboxes(limit, 0, search);
   }
 
   getState(key, fallback = null) {

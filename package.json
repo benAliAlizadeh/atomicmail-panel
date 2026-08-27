@@ -1,15 +1,15 @@
 {
   "name": "atomicmail-panel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.9"
   },
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
+    "start": "node --env-file-if-exists=.env src/index.js",
+    "dev": "node --env-file-if-exists=.env --watch src/index.js",
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/server.js && node --check src/worker.js && node --check src/provider.js"
+    "check": "node --check src/index.js && node --check src/server.js && node --check src/auth.js && node --check src/worker.js && node --check src/provider.js && node --check public/app.js"
   }
 }

@@ -3,20 +3,148 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AtomicMail Panel — Core</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:760px;margin:64px auto;padding:0 20px;color:#171717;background:#fafafa}
-    .card{background:#fff;border:1px solid #e6e6e6;border-radius:16px;padding:24px;box-shadow:0 8px 30px rgba(0,0,0,.04)}
-    code{background:#f1f1f1;padding:2px 6px;border-radius:6px} .ok{color:#087a45;font-weight:700}
-  </style>
+  <meta name="color-scheme" content="light" />
+  <title>AtomicMail Panel</title>
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div class="card">
-    <h1>AtomicMail Panel</h1>
-    <p class="ok">AM-01 → AM-08 core is running.</p>
-    <p>This stage intentionally exposes only the operator API. The production dashboard is the next stage.</p>
-    <p>Health: <code>GET /health</code></p>
-    <p>Create batch: <code>POST /api/jobs</code></p>
+  <div id="authGate" class="auth-gate" hidden>
+    <form id="loginForm" class="login-card" autocomplete="on">
+      <div class="brand-mark">AM</div>
+      <h1>AtomicMail Panel</h1>
+      <p class="muted">Sign in to manage mailbox creation jobs.</p>
+      <label>Username<input id="loginUsername" name="username" autocomplete="username" value="admin" required /></label>
+      <label>Password<input id="loginPassword" name="password" type="password" autocomplete="current-password" required /></label>
+      <p id="loginError" class="form-error" hidden></p>
+      <button class="btn primary full" type="submit">Sign in</button>
+    </form>
   </div>
+
+  <div id="appShell" class="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark small">AM</span><div><strong>AtomicMail</strong><small>Operator Panel</small></div></div>
+      <nav id="nav">
+        <button class="nav-item active" data-view-target="dashboard">Dashboard</button>
+        <button class="nav-item" data-view-target="create">Create emails</button>
+        <button class="nav-item" data-view-target="jobs">Jobs</button>
+        <button class="nav-item" data-view-target="mailboxes">Mailboxes</button>
+        <button class="nav-item" data-view-target="system">System</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="workerBadge" class="status-dot"></span>
+        <span id="workerText">Worker</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div><h1 id="pageTitle">Dashboard</h1><p id="pageSubtitle" class="muted">Mailbox creation overview</p></div>
+        <div class="top-actions"><span id="currentUser" class="user-chip"></span><button id="logoutButton" class="btn ghost small-btn" hidden>Log out</button></div>
+      </header>
+
+      <div id="circuitBanner" class="banner danger" hidden></div>
+
+      <section class="view" data-view="dashboard">
+        <div class="stats-grid">
+          <article class="stat-card"><span>Total mailboxes</span><strong id="statTotal">—</strong><small>stored inboxes</small></article>
+          <article class="stat-card"><span>Created today</span><strong id="statToday">—</strong><small>UTC day</small></article>
+          <article class="stat-card"><span>Running jobs</span><strong id="statRunning">—</strong><small>currently processing</small></article>
+          <article class="stat-card"><span>Failed items</span><strong id="statFailed">—</strong><small>needs review</small></article>
+        </div>
+
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><h2>Current job</h2><p class="muted">Latest running or paused batch</p></div><button id="openCurrentJob" class="btn ghost small-btn" hidden>Open job</button></div>
+            <div id="currentJobEmpty" class="empty">No active job.</div>
+            <div id="currentJob" hidden>
+              <div class="job-summary-line"><strong id="currentJobId"></strong><span id="currentJobStatus" class="pill"></span></div>
+              <div class="progress-track"><div id="currentJobProgress" class="progress-bar"></div></div>
+              <div id="currentJobNumbers" class="progress-numbers"></div>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><h2>Safety status</h2><p class="muted">Worker and provider protection</p></div></div>
+            <dl class="kv-list">
+              <div><dt>Worker</dt><dd id="safetyWorker">—</dd></div>
+              <div><dt>Concurrency</dt><dd>1 (sequential)</dd></div>
+              <div><dt>Circuit breaker</dt><dd id="safetyCircuit">—</dd></div>
+              <div><dt>Batch limit</dt><dd id="safetyBatchLimit">—</dd></div>
+            </dl>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" data-view="create" hidden>
+        <div class="two-col create-layout">
+          <article class="panel">
+            <div class="panel-head"><div><h2>Create a batch</h2><p class="muted">Jobs are processed sequentially by the safe worker.</p></div></div>
+            <form id="createForm" class="form-stack">
+              <label>Number of emails<input id="batchCount" type="number" min="1" value="5" required /></label>
+              <label>Optional prefix<input id="batchPrefix" type="text" maxlength="12" placeholder="e.g. lab" autocomplete="off" /></label>
+              <div><span class="label-text">Preview</span><div id="namePreview" class="chips"></div><small class="muted">Preview only. Final names are reserved server-side when the job is created.</small></div>
+              <p id="createError" class="form-error" hidden></p>
+              <button id="createButton" class="btn primary" type="submit">Create batch</button>
+            </form>
+          </article>
+          <article class="panel info-panel">
+            <h2>Safe processing</h2>
+            <ul class="plain-list">
+              <li>One registration at a time.</li>
+              <li>Provider rate limits pause the global worker.</li>
+              <li>Transient failures use exponential backoff and jitter.</li>
+              <li>Policy/abuse responses open a permanent circuit for manual review.</li>
+              <li>Credentials remain isolated per inbox and are never shown here.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" data-view="jobs" hidden>
+        <div class="panel table-panel">
+          <div class="panel-head"><div><h2>Jobs</h2><p class="muted">Recent mailbox creation batches</p></div><button id="refreshJobs" class="btn ghost small-btn">Refresh</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Created</th><th>Job</th><th>Status</th><th>Progress</th><th>Prefix</th></tr></thead><tbody id="jobsBody"></tbody></table></div>
+          <div id="jobsEmpty" class="empty" hidden>No jobs yet.</div>
+        </div>
+
+        <article id="jobDetailPanel" class="panel job-detail" hidden>
+          <div class="panel-head"><div><h2 id="jobDetailTitle">Job</h2><p id="jobDetailMeta" class="muted"></p></div><div id="jobActions" class="button-row"></div></div>
+          <div class="progress-track large"><div id="jobDetailProgress" class="progress-bar"></div></div>
+          <div id="jobDetailNumbers" class="progress-numbers"></div>
+          <p id="jobDetailError" class="form-error" hidden></p>
+          <div class="table-wrap compact"><table><thead><tr><th>#</th><th>Username</th><th>Status</th><th>Attempts</th><th>Last error</th></tr></thead><tbody id="jobItemsBody"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="view" data-view="mailboxes" hidden>
+        <div class="panel table-panel">
+          <div class="panel-head mailbox-head">
+            <div><h2>Mailboxes</h2><p id="mailboxCountText" class="muted">Stored inboxes</p></div>
+            <div class="button-row"><button id="exportCsv" class="btn ghost small-btn">Export CSV</button><button id="exportJson" class="btn ghost small-btn">Export JSON</button></div>
+          </div>
+          <form id="mailboxSearchForm" class="search-row"><input id="mailboxSearch" type="search" placeholder="Search email or username" autocomplete="off" /><button class="btn ghost small-btn" type="submit">Search</button><button id="clearMailboxSearch" class="btn ghost small-btn" type="button">Clear</button></form>
+          <div class="table-wrap"><table><thead><tr><th>Email</th><th>Status</th><th>Created</th><th>Job</th><th></th></tr></thead><tbody id="mailboxesBody"></tbody></table></div>
+          <div id="mailboxesEmpty" class="empty" hidden>No mailboxes found.</div>
+          <div class="pagination"><button id="mailboxPrev" class="btn ghost small-btn">Previous</button><span id="mailboxPageText" class="muted"></span><button id="mailboxNext" class="btn ghost small-btn">Next</button></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="system" hidden>
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><h2>Circuit breaker</h2><p class="muted">Registration protection state</p></div><button id="resetCircuit" class="btn danger-btn small-btn" hidden>Reset circuit</button></div>
+            <dl id="circuitDetails" class="kv-list"></dl>
+            <p class="muted warning-note">Only reset a permanent circuit after reviewing the provider response. The panel will never reset it automatically.</p>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><h2>Recent audit</h2><p class="muted">Operational events; secrets are redacted before storage.</p></div><button id="refreshAudit" class="btn ghost small-btn">Refresh</button></div>
+            <div id="auditList" class="audit-list"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/app.js" defer></script>
 </body>
 </html>

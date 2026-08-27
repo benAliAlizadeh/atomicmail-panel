@@ -1,144 +1,107 @@
-# AtomicMail Panel — Stage 1 Core (AM-01 → AM-08)
+# AtomicMail Panel — Web Operator Stage (AM-01 → AM-14)
 
-A conservative batch-registration core for Atomic Mail. It uses the official Atomic Mail AgentSkill CLI for registration and PoW rather than reimplementing or bypassing provider controls.
+A conservative Atomic Mail batch-registration panel. Registration stays sequential and delegates provider PoW/registration behavior to the configured Atomic Mail AgentSkill CLI rather than attempting to bypass provider controls.
 
-## What is implemented
+## Included
 
-- SQLite persistence with crash recovery
-- Atomic Mail provider adapter using the official `@atomicmail/agent-skill` CLI
-- one isolated credentials directory per inbox
-- valid 5–21 character random usernames with duplicate prevention
-- persistent batch jobs and items
+- persistent SQLite jobs and restart recovery
+- isolated credential directory per inbox
+- valid random usernames with duplicate prevention
 - strictly sequential worker (`concurrency = 1`)
-- configurable post-success cooldown
-- retry with exponential backoff + jitter for transient failures
-- 429/rate-limit cooldown and global temporary circuit breaker
-- permanent circuit breaker on policy/abuse-protection responses
-- automatic regeneration when a username is unavailable
-- secret redaction in provider errors/audit logs
-- pause / resume / cancel endpoints
-- restart recovery for interrupted items
+- post-success cooldown, retry/backoff+jitter, rate-limit cooldown
+- temporary and permanent circuit breakers
+- automatic username regeneration on conflicts
+- web dashboard and create-batch form
+- live job progress with pause/resume/cancel
+- searchable mailbox list with copy and pagination
+- CSV and JSON export
+- optional admin session authentication
+- HttpOnly/SameSite session cookie, CSRF protection, login attempt throttling
+- restrictive browser security headers/CSP
+- no credential file path, API key or JWT exposure through mailbox APIs
 
-## Provider behavior
+## Run on Windows / PowerShell
 
-Atomic Mail's official documentation says `@atomicmail.ai` registrations use PoW and that separate credential directories should be used for multiple accounts. This project delegates that protocol to their official CLI.
+Requirements: Node.js 22.9+.
 
-Default runtime command:
+```powershell
+npm.cmd start
+```
+
+Open:
+
+```text
+http://127.0.0.1:8787
+```
+
+`npm start` now automatically reads `.env` when it exists.
+
+## Enable admin login
+
+Copy `.env.example` to `.env`, then set a 12+ character password:
+
+```env
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=replace-with-a-long-random-password
+```
+
+Restart the app. The browser will show the login screen.
+
+When the panel remains strictly on `127.0.0.1`, authentication can be left disabled for local-only operation. Before exposing it on a LAN, public interface, tunnel, or reverse proxy, enable `ADMIN_PASSWORD` and put the panel behind HTTPS. Set `ADMIN_COOKIE_SECURE=true` only when the browser actually reaches it over HTTPS.
+
+## Create emails
+
+Use **Create emails** in the web panel, enter a count and optional prefix, then create the batch. The server reserves final usernames and the worker processes them one by one.
+
+A policy/abuse-protection response opens a permanent circuit and pauses the affected job. The panel does not automatically reset a permanent circuit; an operator must review the provider response and explicitly reset it from **System**.
+
+## Exports
+
+The Mailboxes page exports the current search as CSV or JSON. Provider credentials and credential paths are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS` to avoid accidental oversized responses.
+
+## Provider command
+
+Default local command:
 
 ```bash
 npx -y --package=@atomicmail/agent-skill@0.3.26 atomicmail register --username <name>
 ```
 
-The process receives `ATOMIC_MAIL_CREDENTIALS_DIR` pointing to a unique directory for that mailbox.
+Each inbox receives a separate `ATOMIC_MAIL_CREDENTIALS_DIR` under:
 
-For production Docker, the same package is installed globally and the worker calls `atomicmail` directly.
-
-## Run locally
-
-Requirements: Node.js 22+ and network access to Atomic Mail/npm.
-
-```bash
-cp .env.example .env
-set -a; source .env; set +a
-npm start
+```text
+data/credentials/<username>/
 ```
 
-PowerShell:
+Do not delete or overwrite these directories; they contain access credentials for the inboxes.
+
+## API authentication
+
+When `ADMIN_PASSWORD` is enabled, `/api/*` endpoints require the admin session except `/api/auth/status` and `/api/auth/login`. State-changing requests also require the per-session CSRF token used automatically by the web UI.
+
+`GET /health` stays intentionally minimal:
+
+```json
+{"ok":true}
+```
+
+## Tests
 
 ```powershell
-$env:HOST="127.0.0.1"
-$env:PORT="8787"
-npm start
+npm.cmd test
+npm.cmd run check
 ```
 
-You do not need a local package install for this project itself; the default provider command invokes the pinned official AgentSkill through `npx`.
+Tests do not create live Atomic Mail inboxes.
 
-## Run with Docker
+## Docker
 
 ```bash
 docker compose up -d --build
 ```
 
-The compose file binds to `127.0.0.1:8787` intentionally because Stage 1 has no admin authentication yet.
+The default compose mapping remains loopback-only (`127.0.0.1:8787`). For non-loopback deployment, enable admin authentication and HTTPS before changing that binding.
 
-## API
+## Next
 
-Health:
-
-```bash
-curl http://127.0.0.1:8787/health
-```
-
-Create 5 inboxes:
-
-```bash
-curl -X POST http://127.0.0.1:8787/api/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"count":5,"prefix":""}'
-```
-
-Optional prefix:
-
-```json
-{"count": 5, "prefix": "lab"}
-```
-
-List jobs:
-
-```bash
-curl http://127.0.0.1:8787/api/jobs
-```
-
-Job details:
-
-```bash
-curl http://127.0.0.1:8787/api/jobs/JOB_ID
-```
-
-Pause / resume / cancel:
-
-```bash
-curl -X POST http://127.0.0.1:8787/api/jobs/JOB_ID/pause
-curl -X POST http://127.0.0.1:8787/api/jobs/JOB_ID/resume
-curl -X POST http://127.0.0.1:8787/api/jobs/JOB_ID/cancel
-```
-
-Mailboxes:
-
-```bash
-curl http://127.0.0.1:8787/api/mailboxes
-```
-
-Circuit status/reset:
-
-```bash
-curl http://127.0.0.1:8787/api/system/circuit
-curl -X POST http://127.0.0.1:8787/api/system/circuit/reset
-```
-
-Do not reset a permanent circuit until the provider response has been reviewed. It intentionally requires explicit operator action.
-
-## Credentials and secrets
-
-Per-inbox credentials are stored under:
-
-```text
-data/credentials/<username>/credentials.json
-```
-
-The project does **not** copy API keys or JWTs into SQLite. Provider output is redacted before it is written to audit logs.
-
-Back up the `data/` directory securely. Replacing an Atomic Mail credential directory can destroy access to that inbox.
-
-## Tests
-
-```bash
-npm test
-npm run check
-```
-
-Tests use fake providers; they do not create live Atomic Mail inboxes.
-
-## Next stage
-
-AM-09 onward: production web dashboard, create-batch screen, live progress, mailbox management, CSV/JSON export, admin authentication, stronger secret-at-rest controls, and final Docker/live validation.
+AM-15 → AM-18: recovery edge-case hardening, broader regression tests, production/TLS deployment polish, and a small operator-approved live registration validation.

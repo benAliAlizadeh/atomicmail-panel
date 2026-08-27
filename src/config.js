@@ -34,6 +34,10 @@ function jsonArrayEnv(name, fallback) {
 export function loadConfig() {
   const cwd = process.cwd();
   const dataDir = path.resolve(cwd, process.env.DATA_DIR || './data');
+  const adminPassword = process.env.ADMIN_PASSWORD || '';
+  if (adminPassword && adminPassword.length < 12) {
+    throw new Error('ADMIN_PASSWORD must be at least 12 characters when admin authentication is enabled');
+  }
 
   return Object.freeze({
     host: process.env.HOST || '127.0.0.1',
@@ -45,6 +49,7 @@ export function loadConfig() {
     maxBatchSize: intEnv('MAX_BATCH_SIZE', 100, 1, 5000),
     usernameMinLength: intEnv('USERNAME_MIN_LENGTH', 10, 5, 21),
     usernameMaxLength: intEnv('USERNAME_MAX_LENGTH', 14, 5, 21),
+    exportMaxRows: intEnv('EXPORT_MAX_ROWS', 50000, 1, 200000),
 
     workerEnabled: boolEnv('WORKER_ENABLED', true),
     workerPollMs: intEnv('WORKER_POLL_MS', 1000, 250, 60000),
@@ -56,6 +61,13 @@ export function loadConfig() {
     transientCircuitThreshold: intEnv('TRANSIENT_CIRCUIT_THRESHOLD', 5, 1, 100),
     transientCircuitCooldownMs: intEnv('TRANSIENT_CIRCUIT_COOLDOWN_MS', 600000, 1000, 86400000),
     registerTimeoutMs: intEnv('REGISTER_TIMEOUT_MS', 180000, 30000, 1800000),
+
+    adminUsername: process.env.ADMIN_USERNAME || 'admin',
+    adminPassword,
+    adminSessionTtlMs: intEnv('ADMIN_SESSION_TTL_MS', 43200000, 300000, 604800000),
+    adminLoginMaxAttempts: intEnv('ADMIN_LOGIN_MAX_ATTEMPTS', 5, 1, 50),
+    adminLoginWindowMs: intEnv('ADMIN_LOGIN_WINDOW_MS', 900000, 60000, 86400000),
+    adminCookieSecure: boolEnv('ADMIN_COOKIE_SECURE', false),
 
     atomicAuthUrl: process.env.ATOMICMAIL_AUTH_URL || 'https://auth.atomicmail.ai',
     atomicApiUrl: process.env.ATOMICMAIL_API_URL || 'https://api.atomicmail.ai',

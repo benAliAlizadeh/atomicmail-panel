@@ -11,5 +11,8 @@ services:
       POST_SUCCESS_DELAY_MS: 5000
       MAX_RETRIES: 3
       RATE_LIMIT_COOLDOWN_MS: 300000
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-false}
     volumes:
       - ./data:/app/data
