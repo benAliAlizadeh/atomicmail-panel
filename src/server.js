@@ -180,6 +180,15 @@ export function createServer({ store, worker, config }) {
             usernameMinLength: config.usernameMinLength,
             usernameMaxLength: config.usernameMaxLength,
           },
+          registration: {
+            mailboxType: 'agent',
+            domain: 'atomicmail.ai',
+            authentication: 'api-key',
+            passwordSupported: false,
+            recoverySeedSupported: false,
+            registerTimeoutMs: config.registerTimeoutMs,
+            postSuccessDelayMs: config.postSuccessDelayMs,
+          },
         });
       }
 

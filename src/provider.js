@@ -60,7 +60,23 @@ export function resolveProviderInvocation(command, args, {
   return { command, args };
 }
 
-function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 131072 }) {
+function emitProgress(callback, phase, message) {
+  if (typeof callback !== 'function') return;
+  try { callback({ phase, message, at: new Date().toISOString() }); } catch {}
+}
+
+function progressFromOutput(chunk) {
+  const text = redactSecrets(String(chunk || '')).toLowerCase();
+  if (!text) return null;
+  if (/capabilit/.test(text)) return ['capability', 'Capability token created; finalizing inbox access'];
+  if (/session/.test(text)) return ['session', 'Authenticated session established'];
+  if (/scrypt|proof[- ]?of[- ]?work|\bpow\b/.test(text)) return ['proof_of_work', 'Solving Atomic Mail proof-of-work'];
+  if (/challenge/.test(text)) return ['challenge', 'Registration challenge received'];
+  if (/credential|accountid|\binbox\b/.test(text)) return ['finalizing', 'Provider returned inbox details; validating credentials'];
+  return null;
+}
+
+function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 131072, onProgress }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env,
@@ -68,6 +84,14 @@ function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 13107
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+
+    emitProgress(onProgress, 'provider_running', 'Atomic Mail CLI is running; registration and proof-of-work are in progress');
+    let lastPhase = 'provider_running';
+    let lastMessage = 'Atomic Mail CLI is running; registration and proof-of-work are in progress';
+    const heartbeatTimer = setInterval(() => {
+      emitProgress(onProgress, lastPhase, lastMessage);
+    }, 2000);
+    heartbeatTimer.unref?.();
 
     let stdout = '';
     let stderr = '';
@@ -83,6 +107,7 @@ function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 13107
 
     const cleanup = () => {
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      clearInterval(heartbeatTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
     };
 
@@ -100,8 +125,21 @@ function runProcess(command, args, { env, timeoutMs, signal, outputLimit = 13107
 
     const onAbort = () => terminate('abort');
 
-    child.stdout.on('data', (chunk) => { stdout = append(stdout, chunk); });
-    child.stderr.on('data', (chunk) => { stderr = append(stderr, chunk); });
+    const handleProgressOutput = (chunk) => {
+      const detected = progressFromOutput(chunk);
+      if (!detected) return;
+      [lastPhase, lastMessage] = detected;
+      emitProgress(onProgress, lastPhase, lastMessage);
+    };
+
+    child.stdout.on('data', (chunk) => {
+      stdout = append(stdout, chunk);
+      handleProgressOutput(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = append(stderr, chunk);
+      handleProgressOutput(chunk);
+    });
 
     const timer = setTimeout(() => terminate('timeout'), timeoutMs);
     timer.unref?.();
@@ -143,7 +181,8 @@ export class AtomicMailProvider {
     this.activeAbortController?.abort();
   }
 
-  async register(username) {
+  async register(username, { onProgress } = {}) {
+    emitProgress(onProgress, 'preparing', 'Preparing isolated credential directory');
     const credentialsDir = this.credentialsDir(username);
     fs.mkdirSync(credentialsDir, { recursive: true, mode: 0o700 });
 
@@ -158,6 +197,7 @@ export class AtomicMailProvider {
       if (inboxId && expectedLocalPart === username.toLowerCase()) {
         try { fs.chmodSync(credentialsDir, 0o700); } catch {}
         try { fs.chmodSync(existingCredentialsPath, 0o600); } catch {}
+        emitProgress(onProgress, 'recovered', 'Existing provider credentials found; reusing crash-safe registration');
         return { username, email: inboxId, inboxId, credentialsPath: existingCredentialsPath };
       }
       throw new ProviderError('Credential directory already exists but does not match the requested username', {
@@ -187,11 +227,13 @@ export class AtomicMailProvider {
 
     let result;
     try {
+      emitProgress(onProgress, 'launching', 'Starting official Atomic Mail AgentSkill');
       const invocation = resolveProviderInvocation(this.config.atomicCliCommand, args);
       result = await runProcess(invocation.command, invocation.args, {
         env,
         timeoutMs: this.config.registerTimeoutMs,
         signal: controller.signal,
+        onProgress,
       });
     } catch (error) {
       const classified = classifyProviderError(error?.message || String(error));
@@ -221,6 +263,7 @@ export class AtomicMailProvider {
       throw new ProviderError(classified.message, { ...classified, raw: combined });
     }
 
+    emitProgress(onProgress, 'validating', 'Registration returned successfully; validating credential files');
     const credentialsPath = path.join(credentialsDir, 'credentials.json');
     if (!fs.existsSync(credentialsPath)) {
       throw new ProviderError('Atomic Mail CLI exited successfully but credentials.json was not created', {
@@ -237,6 +280,7 @@ export class AtomicMailProvider {
       ? credentials.inboxId
       : `${username}@atomicmail.ai`;
 
+    emitProgress(onProgress, 'finalizing', 'Credentials validated; saving mailbox in the panel');
     return {
       username,
       email: inboxId,

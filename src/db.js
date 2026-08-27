@@ -48,6 +48,11 @@ export class Store {
         next_attempt_at TEXT NOT NULL,
         mailbox_id TEXT,
         last_error TEXT,
+        phase TEXT NOT NULL DEFAULT 'queued',
+        phase_message TEXT,
+        phase_updated_at TEXT,
+        attempt_started_at TEXT,
+        finished_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(job_id, position),
@@ -88,6 +93,19 @@ export class Store {
         created_at TEXT NOT NULL
       );
     `);
+
+    // Additive migration for databases created by earlier panel stages.
+    const jobItemColumns = new Set(this.db.prepare(`PRAGMA table_info(job_items)`).all().map((row) => row.name));
+    const additions = [
+      ['phase', `TEXT NOT NULL DEFAULT 'queued'`],
+      ['phase_message', 'TEXT'],
+      ['phase_updated_at', 'TEXT'],
+      ['attempt_started_at', 'TEXT'],
+      ['finished_at', 'TEXT'],
+    ];
+    for (const [name, definition] of additions) {
+      if (!jobItemColumns.has(name)) this.db.exec(`ALTER TABLE job_items ADD COLUMN ${name} ${definition}`);
+    }
   }
 
   recoverInterruptedWork() {
@@ -99,10 +117,15 @@ export class Store {
     try {
       const cancelled = this.db.prepare(`
         UPDATE job_items
-        SET status='cancelled', updated_at=?
+        SET status='cancelled',
+            phase='cancelled',
+            phase_message='Cancelled after interrupted worker process',
+            phase_updated_at=?,
+            finished_at=?,
+            updated_at=?
         WHERE status='running'
           AND job_id IN (SELECT id FROM jobs WHERE status='cancelled')
-      `).run(now);
+      `).run(now, now, now);
       cancelledItems = Number(cancelled.changes || 0);
 
       const reopened = this.db.prepare(`
@@ -119,9 +142,14 @@ export class Store {
             attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
             next_attempt_at=?,
             last_error=COALESCE(last_error, 'Recovered after interrupted worker process'),
+            phase='queued',
+            phase_message='Recovered after restart; waiting to resume',
+            phase_updated_at=?,
+            attempt_started_at=NULL,
+            finished_at=NULL,
             updated_at=?
         WHERE status='running'
-      `).run(now, now);
+      `).run(now, now, now);
       interruptedItems = Number(recovered.changes || 0);
 
       this.db.prepare(`
@@ -216,10 +244,24 @@ export class Store {
     const job = this.db.prepare('SELECT * FROM jobs WHERE id=?').get(id);
     if (!job) return null;
     const items = this.db.prepare(`
-      SELECT id, position, username, status, attempts, next_attempt_at, mailbox_id, last_error, created_at, updated_at
+      SELECT id, position, username, status, attempts, next_attempt_at, mailbox_id, last_error,
+             phase, phase_message, phase_updated_at, attempt_started_at, finished_at, created_at, updated_at
       FROM job_items WHERE job_id=? ORDER BY position
     `).all(id);
-    return { ...job, items };
+    const timingRow = this.db.prepare(`
+      SELECT COUNT(*) AS sample_count,
+             AVG((julianday(finished_at) - julianday(attempt_started_at)) * 86400.0) AS average_success_seconds
+      FROM job_items
+      WHERE job_id=? AND status='succeeded' AND attempt_started_at IS NOT NULL AND finished_at IS NOT NULL
+    `).get(id);
+    return {
+      ...job,
+      items,
+      timing: {
+        sample_count: Number(timingRow?.sample_count || 0),
+        average_success_seconds: timingRow?.average_success_seconds == null ? null : Number(timingRow.average_success_seconds),
+      },
+    };
   }
 
   listJobs(limit = 50) {
@@ -234,13 +276,14 @@ export class Store {
     const statusRows = this.db.prepare(`SELECT status, COUNT(*) AS count FROM jobs GROUP BY status`).all();
     const jobs = { running: 0, paused: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 };
     for (const row of statusRows) jobs[row.status] = Number(row.count);
-    const activeJob = this.db.prepare(`
-      SELECT id, requested_count, prefix, status, success_count, failed_count, created_at, updated_at, last_error
+    const activeJobRow = this.db.prepare(`
+      SELECT id
       FROM jobs
       WHERE status IN ('running','paused')
       ORDER BY created_at DESC
       LIMIT 1
     `).get() || null;
+    const activeJob = activeJobRow ? this.getJob(activeJobRow.id) : null;
     return { totalMailboxes, createdToday, failedItems, jobs, activeJob };
   }
 
@@ -258,7 +301,11 @@ export class Store {
 
   cancelPendingItems(jobId) {
     const now = nowIso();
-    this.db.prepare(`UPDATE job_items SET status='cancelled', updated_at=? WHERE job_id=? AND status='pending'`).run(now, jobId);
+    this.db.prepare(`
+      UPDATE job_items
+      SET status='cancelled', phase='cancelled', phase_message='Cancelled by operator', phase_updated_at=?, finished_at=?, updated_at=?
+      WHERE job_id=? AND status='pending'
+    `).run(now, now, now, jobId);
   }
 
   nextRunnableItem() {
@@ -276,8 +323,12 @@ export class Store {
   markItemRunning(id) {
     const now = nowIso();
     this.db.prepare(`
-      UPDATE job_items SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status='pending'
-    `).run(now, id);
+      UPDATE job_items
+      SET status='running', attempts=attempts+1,
+          phase='starting', phase_message='Preparing Atomic Mail registration', phase_updated_at=?,
+          attempt_started_at=?, finished_at=NULL, updated_at=?
+      WHERE id=? AND status='pending'
+    `).run(now, now, now, id);
     const item = this.db.prepare('SELECT * FROM job_items WHERE id=?').get(id);
     if (item) {
       this.db.prepare(`UPDATE jobs SET started_at=COALESCE(started_at, ?), updated_at=? WHERE id=?`).run(now, now, item.job_id);
@@ -285,12 +336,27 @@ export class Store {
     return item;
   }
 
+  updateItemProgress(id, phase, message) {
+    const now = nowIso();
+    const safePhase = String(phase || 'working').slice(0, 64);
+    const safeMessage = String(message || 'Registration in progress').slice(0, 500);
+    const result = this.db.prepare(`
+      UPDATE job_items
+      SET phase=?, phase_message=?, phase_updated_at=?, updated_at=?
+      WHERE id=? AND status='running'
+    `).run(safePhase, safeMessage, now, now, id);
+    return result.changes > 0;
+  }
+
   rescheduleItem(id, delayMs, errorMessage) {
     const now = new Date();
     const next = new Date(now.getTime() + delayMs).toISOString();
     this.db.prepare(`
-      UPDATE job_items SET status='pending', next_attempt_at=?, last_error=?, updated_at=? WHERE id=?
-    `).run(next, errorMessage || null, now.toISOString(), id);
+      UPDATE job_items
+      SET status='pending', next_attempt_at=?, last_error=?,
+          phase='waiting_retry', phase_message=?, phase_updated_at=?, attempt_started_at=NULL, finished_at=NULL, updated_at=?
+      WHERE id=?
+    `).run(next, errorMessage || null, errorMessage || 'Waiting before retry', now.toISOString(), now.toISOString(), id);
   }
 
   rescheduleInterruptedItem(id, errorMessage = 'Worker stopped before registration completed') {
@@ -304,17 +370,32 @@ export class Store {
           attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
           next_attempt_at=?,
           last_error=?,
+          phase=CASE
+            WHEN (SELECT status FROM jobs WHERE jobs.id=job_items.job_id)='cancelled' THEN 'cancelled'
+            ELSE 'queued'
+          END,
+          phase_message=?,
+          phase_updated_at=?,
+          attempt_started_at=NULL,
+          finished_at=CASE
+            WHEN (SELECT status FROM jobs WHERE jobs.id=job_items.job_id)='cancelled' THEN ?
+            ELSE NULL
+          END,
           updated_at=?
       WHERE id=? AND status='running'
-    `).run(now, errorMessage, now, id);
+    `).run(now, errorMessage, errorMessage, now, now, now, id);
   }
 
   replaceItemUsername(id, username, delayMs = 1000, errorMessage = null) {
     const now = new Date();
     const next = new Date(now.getTime() + delayMs).toISOString();
     this.db.prepare(`
-      UPDATE job_items SET username=?, status='pending', next_attempt_at=?, last_error=?, updated_at=? WHERE id=?
-    `).run(username, next, errorMessage, now.toISOString(), id);
+      UPDATE job_items
+      SET username=?, status='pending', next_attempt_at=?, last_error=?,
+          phase='queued', phase_message='Username regenerated; waiting to retry', phase_updated_at=?,
+          attempt_started_at=NULL, finished_at=NULL, updated_at=?
+      WHERE id=?
+    `).run(username, next, errorMessage, now.toISOString(), now.toISOString(), id);
   }
 
   markItemFailed(id, errorMessage) {
@@ -323,7 +404,11 @@ export class Store {
     if (!item) return;
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare(`UPDATE job_items SET status='failed', last_error=?, updated_at=? WHERE id=?`).run(errorMessage, now, id);
+      this.db.prepare(`
+        UPDATE job_items
+        SET status='failed', last_error=?, phase='failed', phase_message=?, phase_updated_at=?, finished_at=?, updated_at=?
+        WHERE id=?
+      `).run(errorMessage, errorMessage, now, now, now, id);
       this.db.prepare(`UPDATE jobs SET failed_count=failed_count+1, last_error=?, updated_at=? WHERE id=?`).run(errorMessage, now, item.job_id);
       this.db.exec('COMMIT');
     } catch (error) {
@@ -345,7 +430,12 @@ export class Store {
         INSERT INTO mailboxes(id, username, email, inbox_id, credentials_path, status, created_at, job_id, job_item_id)
         VALUES(?, ?, ?, ?, ?, 'active', ?, ?, ?)
       `).run(mailboxId, mailbox.username, mailbox.email, mailbox.inboxId, mailbox.credentialsPath, now, item.job_id, id);
-      this.db.prepare(`UPDATE job_items SET status='succeeded', mailbox_id=?, last_error=NULL, updated_at=? WHERE id=?`).run(mailboxId, now, id);
+      this.db.prepare(`
+        UPDATE job_items
+        SET status='succeeded', mailbox_id=?, last_error=NULL,
+            phase='completed', phase_message='Mailbox created successfully', phase_updated_at=?, finished_at=?, updated_at=?
+        WHERE id=?
+      `).run(mailboxId, now, now, now, id);
       this.db.prepare(`UPDATE jobs SET success_count=success_count+1, updated_at=? WHERE id=?`).run(now, item.job_id);
       this.db.exec('COMMIT');
     } catch (error) {

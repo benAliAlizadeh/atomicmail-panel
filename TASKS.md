@@ -19,4 +19,5 @@
 | AM-15 | Recovery hardening | ✅ Done — restart reconciliation + controlled-shutdown recovery |
 | AM-16 | Tests | ✅ Done — recovery/provider/auth/API regression coverage |
 | AM-17 | Production Docker | ✅ Done — healthcheck + read-only root + reduced privileges + graceful stop |
-| AM-18 | Live Validation | ⬜ Pending — one operator-approved real inbox registration |
+| AM-18 | Live Validation | ✅ Done — first real @atomicmail.ai inbox created successfully |
+| AM-19 | Live Progress / ETA / Auth Clarity | ✅ Done — phase heartbeat, elapsed time, rolling ETA, API-key account model surfaced |

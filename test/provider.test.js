@@ -122,3 +122,30 @@ test('Windows npx resolution fails clearly before contacting the provider when n
     (error) => error?.kind === 'permanent' && /npx launcher was not found/i.test(error.message),
   );
 });
+
+
+test('provider reports operator-safe progress when reusing crash-safe credentials', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-provider-progress-'));
+  const username = 'progress111';
+  const dir = path.join(root, username);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'credentials.json'), JSON.stringify({
+    inboxId: `${username}@atomicmail.ai`,
+    apiKey: 'am_test_secret',
+  }));
+  const events = [];
+  const provider = new AtomicMailProvider({
+    credentialsRoot: root,
+    atomicAuthUrl: 'https://auth.atomicmail.ai',
+    atomicApiUrl: 'https://api.atomicmail.ai',
+    atomicWatchMode: 'on-demand',
+    atomicCliCommand: 'must-not-run',
+    atomicCliPrefixArgs: [],
+    registerTimeoutMs: 30000,
+  });
+  await provider.register(username, { onProgress: (event) => events.push(event) });
+  assert.equal(events[0].phase, 'preparing');
+  assert.ok(events.some((event) => event.phase === 'recovered'));
+  assert.ok(events.every((event) => !String(event.message).includes('am_test_secret')));
+  fs.rmSync(root, { recursive: true, force: true });
+});

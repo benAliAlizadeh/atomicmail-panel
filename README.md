@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-17)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-19)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -15,7 +15,7 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - controlled shutdown: active provider process is stopped and the item is safely returned to pending
 - job counter/state reconciliation after restart
 - web dashboard and create-batch form
-- live job progress with pause/resume/cancel
+- live job progress with provider phase, heartbeat, elapsed time, rolling ETA, pause/resume/cancel
 - searchable mailbox list with copy and pagination
 - CSV and JSON export
 - optional admin session authentication
@@ -82,7 +82,11 @@ Each inbox receives a separate credential directory under:
 data/credentials/<username>/
 ```
 
-Do not delete or overwrite these directories. `credentials.json` contains access credentials for the inbox.
+Do not delete or overwrite these directories. `credentials.json` contains the API key used to access the inbox; session/capability JWTs are short-lived bearer credentials.
+
+### Important: agent inboxes are not human webmail accounts
+
+This panel uses Atomic Mail's **agent** registration path and creates `@atomicmail.ai` inboxes. That path authenticates with an API key/JWT credential model and does **not** create a human webmail password or a 12-word recovery seed phrase. Password + BIP39 seed phrases belong to Atomic Mail's separate human-facing `@atomicmail.io` account flow. The panel therefore does not ask for a batch password because the agent registration API has no password field to send.
 
 ## Create emails
 
@@ -181,6 +185,6 @@ docker compose ps
 
 The service should report healthy before you use **Create emails**.
 
-## Remaining task
+## Live validation status
 
-**AM-18 — Live Validation:** perform one operator-approved real inbox registration, confirm the credential files are created, confirm the mailbox appears in the panel, then stop. Do not use a large batch as the first live validation.
+AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung.

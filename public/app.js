@@ -8,12 +8,15 @@ const state = {
   dashboard: null,
   currentView: 'dashboard',
   selectedJobId: null,
+  selectedJob: null,
+  activeJob: null,
   mailboxOffset: 0,
   mailboxLimit: 50,
   mailboxSearch: '',
   mailboxTotal: 0,
   pollBusy: false,
   pollTimer: null,
+  clockTimer: null,
   toastTimer: null,
 };
 
@@ -43,6 +46,105 @@ function formatDate(value) {
   if (!value) return '—';
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function formatDuration(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 60) return `${value}s`;
+  const minutes = Math.floor(value / 60);
+  const rest = value % 60;
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return mins ? `${hours}h ${mins}m` : `${hours}h`;
+}
+
+function secondsBetween(start, end = Date.now()) {
+  const startMs = Date.parse(start || '');
+  const endMs = typeof end === 'number' ? end : Date.parse(end || '');
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
+  return Math.max(0, (endMs - startMs) / 1000);
+}
+
+function phaseLabel(phase) {
+  const labels = {
+    queued: 'Queued',
+    starting: 'Preparing',
+    preparing: 'Preparing credentials',
+    launching: 'Starting AgentSkill',
+    provider_running: 'Registering / proof-of-work',
+    challenge: 'Challenge received',
+    proof_of_work: 'Solving proof-of-work',
+    session: 'Creating session',
+    capability: 'Creating capability token',
+    validating: 'Validating credentials',
+    finalizing: 'Finalizing',
+    saving: 'Saving mailbox',
+    recovered: 'Reusing existing credentials',
+    waiting_retry: 'Waiting to retry',
+    completed: 'Completed',
+    failed: 'Failed',
+    cancelled: 'Cancelled',
+  };
+  return labels[phase] || String(phase || 'Working').replaceAll('_', ' ');
+}
+
+function runningItem(job) {
+  return (job?.items || []).find((item) => item.status === 'running') || null;
+}
+
+function activityModel(job) {
+  const item = runningItem(job);
+  if (!item) return null;
+  const elapsed = secondsBetween(item.attempt_started_at) ?? 0;
+  const heartbeatAge = secondsBetween(item.phase_updated_at) ?? 0;
+  const average = Number(job?.timing?.average_success_seconds);
+  const pending = (job?.items || []).filter((candidate) => candidate.status === 'pending').length;
+  const delaySeconds = Number(state.dashboard?.registration?.postSuccessDelayMs || 0) / 1000;
+  const timeoutSeconds = Number(state.dashboard?.registration?.registerTimeoutMs || 0) / 1000;
+  const eta = Number.isFinite(average) && average > 0
+    ? Math.max(0, average - elapsed) + pending * average + pending * delaySeconds
+    : null;
+  return { item, elapsed, heartbeatAge, average, pending, timeoutSeconds, eta };
+}
+
+function renderLiveActivity(target, job) {
+  const box = $(target);
+  if (!box) return;
+  const model = activityModel(job);
+  if (!model) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  const { item, elapsed, heartbeatAge, average, timeoutSeconds, eta } = model;
+  const phase = phaseLabel(item.phase);
+  const message = item.phase_message || 'Atomic Mail registration is still running';
+  const timeoutText = timeoutSeconds > 0 ? ` · timeout guard ${formatDuration(timeoutSeconds)}` : '';
+  const etaText = eta == null
+    ? 'ETA: learning from the first successful mailbox'
+    : `ETA remaining: about ${formatDuration(eta)} · average ${formatDuration(average)}/mailbox`;
+  box.innerHTML = `
+    <span class="activity-dot" aria-hidden="true"></span>
+    <div>
+      <strong>Creating ${escapeHtml(item.position)}/${escapeHtml(job.requested_count)} · ${escapeHtml(item.username)}</strong>
+      <span>${escapeHtml(phase)} — ${escapeHtml(message)}</span>
+      <small>Elapsed ${escapeHtml(formatDuration(elapsed))} · heartbeat ${escapeHtml(formatDuration(heartbeatAge))} ago${escapeHtml(timeoutText)}<br>${escapeHtml(etaText)}</small>
+    </div>`;
+  box.hidden = false;
+}
+
+function updateElapsedCells() {
+  $$('[data-elapsed-start]').forEach((cell) => {
+    const seconds = secondsBetween(cell.dataset.elapsedStart, cell.dataset.elapsedEnd || Date.now());
+    cell.textContent = seconds == null ? '—' : formatDuration(seconds);
+  });
+}
+
+function refreshLiveTimers() {
+  if (state.activeJob) renderLiveActivity('#currentJobActivity', state.activeJob);
+  if (state.selectedJob && state.currentView === 'jobs') renderLiveActivity('#jobLiveStatus', state.selectedJob);
+  updateElapsedCells();
 }
 
 function statusPill(status) {
@@ -206,6 +308,7 @@ function renderDashboard(data) {
   $('#createButton').disabled = Boolean(circuit.open) || !data.workerEnabled;
 
   const job = data.activeJob;
+  state.activeJob = job || null;
   $('#currentJobEmpty').hidden = Boolean(job);
   $('#currentJob').hidden = !job;
   $('#openCurrentJob').hidden = !job;
@@ -214,8 +317,12 @@ function renderDashboard(data) {
     $('#currentJobStatus').outerHTML = statusPill(job.status).replace('<span ', '<span id="currentJobStatus" ');
     const percent = progressOf(job);
     $('#currentJobProgress').style.width = `${percent}%`;
-    $('#currentJobNumbers').textContent = `${job.success_count} successful · ${job.failed_count} failed · ${job.requested_count} requested · ${percent}%`;
+    const counts = itemStatusCounts(job.items);
+    $('#currentJobNumbers').textContent = `${job.success_count} successful · ${job.failed_count} failed · ${counts.pending || 0} pending · ${counts.running || 0} running · ${percent}%`;
     $('#openCurrentJob').dataset.jobId = job.id;
+    renderLiveActivity('#currentJobActivity', job);
+  } else {
+    renderLiveActivity('#currentJobActivity', null);
   }
   refreshNamePreview();
 }
@@ -232,7 +339,7 @@ function renderJobs(jobs) {
       <td>${escapeHtml(formatDate(job.created_at))}</td>
       <td class="mono" title="${escapeHtml(job.id)}">${escapeHtml(shortId(job.id))}</td>
       <td>${statusPill(job.status)}</td>
-      <td>${done}/${escapeHtml(job.requested_count)} (${progressOf(job)}%)</td>
+      <td>${done}/${escapeHtml(job.requested_count)} (${progressOf(job)}%)${job.status === 'running' ? ' · working' : ''}</td>
       <td>${escapeHtml(job.prefix || '—')}</td>
     </tr>`;
   }).join('');
@@ -253,6 +360,7 @@ function itemStatusCounts(items) {
 async function loadJobDetail(id) {
   const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
   state.selectedJobId = job.id;
+  state.selectedJob = job;
   $('#jobDetailPanel').hidden = false;
   $('#jobDetailTitle').textContent = `Job ${shortId(job.id)}`;
   $('#jobDetailMeta').textContent = `Created ${formatDate(job.created_at)} · Prefix ${job.prefix || 'none'} · ${job.requested_count} requested`;
@@ -260,6 +368,7 @@ async function loadJobDetail(id) {
   $('#jobDetailProgress').style.width = `${percent}%`;
   const counts = itemStatusCounts(job.items);
   $('#jobDetailNumbers').textContent = `${job.success_count} successful · ${job.failed_count} failed · ${counts.pending || 0} pending · ${counts.running || 0} running · ${counts.cancelled || 0} cancelled · ${percent}%`;
+  renderLiveActivity('#jobLiveStatus', job);
   $('#jobDetailError').hidden = !job.last_error;
   $('#jobDetailError').textContent = job.last_error || '';
 
@@ -269,13 +378,19 @@ async function loadJobDetail(id) {
   if (['running', 'paused', 'pending'].includes(job.status)) actions.push('<button class="btn danger-btn small-btn" data-job-action="cancel">Cancel</button>');
   $('#jobActions').innerHTML = actions.join('');
 
-  $('#jobItemsBody').innerHTML = (job.items || []).map((item) => `<tr>
-    <td>${escapeHtml(item.position)}</td>
-    <td class="mono">${escapeHtml(item.username)}</td>
-    <td>${statusPill(item.status)}</td>
-    <td>${escapeHtml(item.attempts)}</td>
-    <td class="truncate" title="${escapeHtml(item.last_error || '')}">${escapeHtml(item.last_error || '—')}</td>
-  </tr>`).join('');
+  $('#jobItemsBody').innerHTML = (job.items || []).map((item) => {
+    const start = item.attempt_started_at || '';
+    const end = item.finished_at || '';
+    return `<tr>
+      <td>${escapeHtml(item.position)}</td>
+      <td class="mono">${escapeHtml(item.username)}</td>
+      <td>${statusPill(item.status)}</td>
+      <td><span class="phase-label">${escapeHtml(phaseLabel(item.phase))}</span><small class="phase-message">${escapeHtml(item.phase_message || '')}</small></td>
+      <td class="mono" data-elapsed-start="${escapeHtml(start)}" data-elapsed-end="${escapeHtml(end)}">${start ? escapeHtml(formatDuration(secondsBetween(start, end || Date.now()))) : '—'}</td>
+      <td>${escapeHtml(item.attempts)}</td>
+      <td class="truncate" title="${escapeHtml(item.last_error || '')}">${escapeHtml(item.last_error || '—')}</td>
+    </tr>`;
+  }).join('');
 }
 
 async function runJobAction(action) {
@@ -297,6 +412,7 @@ async function loadMailboxes() {
   $('#mailboxesBody').innerHTML = items.map((item) => `<tr>
     <td class="mono">${escapeHtml(item.email)}</td>
     <td>${statusPill(item.status)}</td>
+    <td><span class="pill">API key</span></td>
     <td>${escapeHtml(formatDate(item.created_at))}</td>
     <td class="mono" title="${escapeHtml(item.job_id || '')}">${escapeHtml(item.job_id ? shortId(item.job_id) : '—')}</td>
     <td><button class="copy-btn" data-copy-email="${escapeHtml(item.email)}">Copy</button></td>
@@ -333,8 +449,8 @@ async function loadSystem() {
 }
 
 function startPolling() {
-  if (state.pollTimer) return;
-  state.pollTimer = setInterval(poll, 3000);
+  if (!state.pollTimer) state.pollTimer = setInterval(poll, 2000);
+  if (!state.clockTimer) state.clockTimer = setInterval(refreshLiveTimers, 1000);
 }
 
 async function poll() {

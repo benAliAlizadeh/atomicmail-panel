@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/db.js';
 import { JobWorker } from '../src/worker.js';
 
@@ -221,6 +222,66 @@ test('controlled shutdown does not resurrect a cancelled in-flight item', async 
   assert.equal(result.status, 'cancelled');
   assert.equal(result.items[0].status, 'cancelled');
 
+  store.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+
+test('job item live phase, heartbeat and timing metadata persist safely', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-progress-'));
+  const store = new Store(path.join(root, 'db.sqlite'));
+  const job = store.createJob({ count: 1, prefix: '', usernames: ['phase11111'] });
+  const running = store.markItemRunning(job.items[0].id);
+  assert.equal(running.phase, 'starting');
+  assert.ok(running.attempt_started_at);
+
+  store.updateItemProgress(running.id, 'proof_of_work', 'Solving Atomic Mail proof-of-work');
+  let current = store.getJob(job.id);
+  assert.equal(current.items[0].phase, 'proof_of_work');
+  assert.match(current.items[0].phase_message, /proof-of-work/i);
+  assert.ok(current.items[0].phase_updated_at);
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  store.markItemSucceeded(running.id, {
+    username: running.username,
+    email: `${running.username}@atomicmail.ai`,
+    inboxId: `${running.username}@atomicmail.ai`,
+    credentialsPath: path.join(root, 'credentials', running.username, 'credentials.json'),
+  });
+  current = store.getJob(job.id);
+  assert.equal(current.items[0].phase, 'completed');
+  assert.ok(current.items[0].finished_at);
+  assert.equal(current.timing.sample_count, 1);
+
+  store.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+
+test('existing pre-progress databases receive additive live-progress columns', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-migrate-'));
+  const dbPath = path.join(root, 'db.sqlite');
+  const oldDb = new DatabaseSync(dbPath);
+  oldDb.exec(`
+    CREATE TABLE jobs (
+      id TEXT PRIMARY KEY, requested_count INTEGER NOT NULL, prefix TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+      success_count INTEGER NOT NULL DEFAULT 0, failed_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, last_error TEXT
+    );
+    CREATE TABLE job_items (
+      id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, position INTEGER NOT NULL,
+      username TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+      mailbox_id TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(job_id, position), UNIQUE(job_id, username)
+    );
+  `);
+  oldDb.close();
+
+  const store = new Store(dbPath);
+  const columns = new Set(store.db.prepare(`PRAGMA table_info(job_items)`).all().map((row) => row.name));
+  for (const name of ['phase', 'phase_message', 'phase_updated_at', 'attempt_started_at', 'finished_at']) {
+    assert.ok(columns.has(name), `missing migrated column ${name}`);
+  }
   store.close();
   fs.rmSync(root, { recursive: true, force: true });
 });

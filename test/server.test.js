@@ -13,6 +13,8 @@ function makeConfig(root, adminPassword = '') {
     usernameMinLength: 10,
     usernameMaxLength: 14,
     exportMaxRows: 1000,
+    registerTimeoutMs: 180000,
+    postSuccessDelayMs: 5000,
     adminUsername: 'admin',
     adminPassword,
     adminSessionTtlMs: 3600000,
@@ -139,5 +141,23 @@ test('health is minimal and browser security headers are present', async () => {
     assert.deepEqual(await response.json(), { ok: true });
     assert.equal(response.headers.get('x-frame-options'), 'DENY');
     assert.match(response.headers.get('content-security-policy') || '', /default-src 'self'/);
+  });
+});
+
+
+test('dashboard describes agent credential model and timing guards', async () => {
+  await withServer('', async ({ base }) => {
+    const response = await fetch(`${base}/api/dashboard`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.registration, {
+      mailboxType: 'agent',
+      domain: 'atomicmail.ai',
+      authentication: 'api-key',
+      passwordSupported: false,
+      recoverySeedSupported: false,
+      registerTimeoutMs: 180000,
+      postSuccessDelayMs: 5000,
+    });
   });
 });

@@ -125,7 +125,12 @@ export class JobWorker {
     }
 
     try {
-      const mailbox = await this.provider.register(item.username);
+      const mailbox = await this.provider.register(item.username, {
+        onProgress: ({ phase, message }) => {
+          this.store.updateItemProgress(item.id, phase, message);
+        },
+      });
+      this.store.updateItemProgress(item.id, 'saving', 'Provider registration complete; saving mailbox record');
       this.store.markItemSucceeded(item.id, mailbox);
       this.store.audit('info', 'mailbox.created', `Created ${mailbox.email}`, item.job_id, item.id);
       this.consecutiveTransientFailures = 0;
