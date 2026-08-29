@@ -7,7 +7,7 @@ import { safeJsonParse } from './utils.js';
 const ENVELOPE_VERSION = 1;
 const KEY_BYTES = 32;
 const USERNAME_RE = /^[a-z0-9]{5,21}$/;
-const PURPOSE_RE = /^cloudflare-(?:job-password|verification-url|browser-state|artifact)$/;
+const PURPOSE_RE = /^cloudflare-(?:job-password|account-password|account-verification-url|verification-url|browser-state|artifact)$/;
 
 function chmodQuiet(target, mode) {
   try { fs.chmodSync(target, mode); } catch {}

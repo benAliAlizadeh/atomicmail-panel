@@ -31,23 +31,28 @@ test('long operations expose accessible progress and preserve compose delivery s
   assert.match(styles, /prefers-reduced-motion/);
 });
 
-test('Cloudflare operator workflow exposes selection, visible-runner and non-blocking action states', () => {
+test('Cloudflare manual assistant exposes simple Focus Mode and keeps runner controls out of the primary UX', () => {
+  const primaryCloudflare = html.slice(html.indexOf('data-view="cloudflare"'), html.indexOf('data-view="cloudflare-legacy"'));
   assert.match(html, /data-view="cloudflare"/);
-  assert.match(html, /id="cloudflareJobModal"[^>]+role="dialog"[^>]+aria-modal="true"/);
+  assert.match(html, /id="manualCloudflareBatchModal"[^>]+role="dialog"[^>]+aria-modal="true"/);
   assert.match(html, /id="createCloudflareSelection"[^>]+disabled/);
-  assert.match(html, /id="cloudflareRunnerStatus"/);
+  assert.match(primaryCloudflare, /id="manualCloudflareFocusPanel"/);
+  assert.match(primaryCloudflare, /Open Cloudflare Signup/);
+  assert.match(primaryCloudflare, /Signup Done/);
+  assert.match(primaryCloudflare, /Check Inbox/);
+  assert.match(primaryCloudflare, /Open Verification Link/);
+  assert.match(primaryCloudflare, /Mark Verified &amp; Next/);
+  assert.doesNotMatch(primaryCloudflare, /Runner|Pairing|Playwright/);
   assert.match(app, /selectedCloudflareMailboxIds: new Set/);
-  assert.match(app, /loadCloudflare\(\{ background = false/);
-  assert.match(app, /beginLatestRequest\('cloudflare'/);
-  assert.match(app, /data-cloudflare-item-focus/);
-  assert.match(app, /data-cloudflare-item-reconcile/);
-  assert.doesNotMatch(app, /data-cloudflare-resend-confirmed/);
-  assert.match(app, /cloudflareTimelineState/);
-  assert.match(app, /data-cloudflare-item-open/);
+  assert.match(app, /loadManualCloudflare\(\{ background = false/);
+  assert.match(app, /beginLatestRequest\('manual-cloudflare'/);
+  assert.match(app, /regenerate-password/);
+  assert.match(app, /signup-done/);
+  assert.match(app, /check-inbox/);
+  assert.match(app, /verification-link/);
+  assert.match(app, /Marking account verified and loading the next account/);
   assert.match(app, /mail_rate_limited/);
-  assert.match(app, /pairCloudflareRunner'\)\.hidden = Boolean\(status\.runner\?\.online\)/);
-  assert.match(app, /Browser Runner disconnected/);
-  assert.match(html, /id="cloudflareTimeline"/);
   assert.match(app, /\/api\/cloudflare\/eligible-mailboxes/);
-  assert.match(styles, /\.pill\.awaiting_submit/);
+  assert.match(styles, /\.cloudflare-focus-panel/);
+  assert.match(styles, /\.pill\.verification_received/);
 });

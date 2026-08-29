@@ -191,6 +191,31 @@ export class Store {
     for (const [name, definition] of cloudflareAdditions) {
       if (!cloudflareItemColumns.has(name)) this.db.exec(`ALTER TABLE cloudflare_job_items ADD COLUMN ${name} ${definition}`);
     }
+
+    // The manual Cloudflare assistant stores one independently encrypted
+    // credential and its durable workflow timestamps on each account. These
+    // columns are intentionally additive so runner-era databases and restored
+    // backups remain readable and can be upgraded in place.
+    const cloudflareAccountColumns = new Set(this.db.prepare(`PRAGMA table_info(cloudflare_accounts)`).all().map((row) => row.name));
+    const cloudflareAccountAdditions = [
+      ['password_ciphertext', 'TEXT'],
+      ['notes', `TEXT NOT NULL DEFAULT ''`],
+      ['signup_done_at', 'TEXT'],
+      ['verification_received_at', 'TEXT'],
+      ['verification_url_ciphertext', 'TEXT'],
+      ['last_inbox_check_at', 'TEXT'],
+      ['failed_at', 'TEXT'],
+      ['password_locked_at', 'TEXT'],
+      ['workflow_mode', `TEXT NOT NULL DEFAULT 'runner_legacy'`],
+    ];
+    for (const [name, definition] of cloudflareAccountAdditions) {
+      if (!cloudflareAccountColumns.has(name)) this.db.exec(`ALTER TABLE cloudflare_accounts ADD COLUMN ${name} ${definition}`);
+    }
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_cloudflare_accounts_manual_status
+      ON cloudflare_accounts(workflow_mode, status, created_at);
+    `);
   }
 
   recoverInterruptedWork() {

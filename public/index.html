@@ -148,6 +148,79 @@
       </section>
 
       <section class="view" data-view="cloudflare" hidden>
+        <div class="stats-grid cloudflare-stats">
+          <article class="stat-card"><span>Accounts</span><strong id="manualCloudflareTotal">—</strong><small>saved Cloudflare logins</small></article>
+          <article class="stat-card"><span>Verified</span><strong id="manualCloudflareVerified">—</strong><small>finished accounts</small></article>
+          <article class="stat-card"><span>In progress</span><strong id="manualCloudflarePending">—</strong><small>resume at any time</small></article>
+          <article class="stat-card"><span>Failed</span><strong id="manualCloudflareFailed">—</strong><small>needs your review</small></article>
+        </div>
+
+        <article id="manualCloudflareFocusPanel" class="panel cloudflare-focus-panel" aria-busy="false">
+          <div class="panel-head">
+            <div><h2>Focus Mode</h2><p class="muted">One account at a time. Your progress is saved automatically.</p></div>
+            <button id="refreshManualCloudflare" class="btn ghost small-btn" type="button">Refresh</button>
+          </div>
+          <div id="manualCloudflareFocusEmpty" class="empty" hidden>No unfinished Cloudflare accounts. Select unused emails from Mailboxes to start a batch.</div>
+          <div id="manualCloudflareFocusCard" class="cloudflare-focus-card" hidden>
+            <div class="focus-topline">
+              <strong id="manualCloudflareFocusCounter">Account — / —</strong>
+              <span id="manualCloudflareFocusStatus" class="pill">Not Started</span>
+            </div>
+            <div class="focus-credential">
+              <span class="focus-label">Email</span>
+              <strong id="manualCloudflareFocusEmail" class="mono"></strong>
+              <button id="copyManualCloudflareEmail" class="btn ghost small-btn" type="button">Copy</button>
+            </div>
+            <div class="focus-credential">
+              <span class="focus-label">Password</span>
+              <strong id="manualCloudflareFocusPassword" class="mono">••••••••••••••••••••</strong>
+              <div class="button-row">
+                <button id="revealManualCloudflarePassword" class="btn ghost small-btn" type="button">Reveal</button>
+                <button id="copyManualCloudflarePassword" class="btn ghost small-btn" type="button">Copy</button>
+                <button id="regenerateManualCloudflarePassword" class="btn ghost small-btn" type="button">Regenerate</button>
+              </div>
+            </div>
+            <p id="manualCloudflarePasswordLocked" class="muted warning-note" hidden>Password is locked because Signup Done was recorded.</p>
+            <div class="focus-primary-actions">
+              <button id="openManualCloudflareSignup" class="btn primary" type="button">Open Cloudflare Signup</button>
+              <button id="markManualCloudflareSignupDone" class="btn ghost" type="button">Signup Done</button>
+            </div>
+            <ol id="manualCloudflareTimeline" class="cloudflare-timeline simple-timeline"></ol>
+            <div id="manualCloudflareFocusMessage" class="banner warning" hidden></div>
+            <div class="focus-workflow-actions">
+              <button id="checkManualCloudflareInbox" class="btn ghost" type="button">Check Inbox</button>
+              <button id="openManualCloudflareVerifyLink" class="btn ghost" type="button">Open Verification Link</button>
+              <button id="copyManualCloudflareVerifyLink" class="btn ghost" type="button">Copy Verification Link</button>
+              <button id="markManualCloudflareVerified" class="btn primary" type="button">Mark Verified &amp; Next</button>
+            </div>
+            <label class="focus-notes">Notes<textarea id="manualCloudflareNotes" rows="3" maxlength="8000" placeholder="Optional notes for this account"></textarea></label>
+            <div class="button-row focus-footer-actions">
+              <button id="saveManualCloudflareNotes" class="btn ghost small-btn" type="button">Save notes</button>
+              <button id="markManualCloudflareFailed" class="btn danger-btn small-btn" type="button">Mark failed</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel table-panel cloudflare-section">
+          <div class="panel-head">
+            <div><h2>Account management</h2><p class="muted">Search, filter, and review saved progress.</p></div>
+            <button id="exportManualCloudflareSensitive" class="btn danger-btn small-btn" type="button">Secure export</button>
+          </div>
+          <form id="manualCloudflareAccountFilters" class="filter-row">
+            <input id="manualCloudflareAccountSearch" type="search" maxlength="100" placeholder="Search email" autocomplete="off" />
+            <select id="manualCloudflareAccountStatus" aria-label="Cloudflare status">
+              <option value="">All statuses</option><option value="not_started">Not Started</option>
+              <option value="signup_done">Signup Done</option><option value="waiting_verification">Waiting Verification</option>
+              <option value="verification_received">Verification Received</option><option value="verified">Verified</option><option value="failed">Failed</option>
+            </select>
+            <button class="btn ghost small-btn" type="submit">Apply</button>
+          </form>
+          <div class="table-wrap"><table><thead><tr><th>Email</th><th>Password</th><th>Status</th><th>Verified at</th><th>Notes</th></tr></thead><tbody id="manualCloudflareAccountsBody"></tbody></table></div>
+          <div id="manualCloudflareAccountsEmpty" class="empty" hidden>No Cloudflare account records match this filter.</div>
+        </article>
+      </section>
+
+      <section class="view" data-view="cloudflare-legacy" hidden>
         <div id="cloudflareCircuitBanner" class="banner danger" hidden></div>
         <div class="stats-grid cloudflare-stats">
           <article class="stat-card"><span>Tracked accounts</span><strong id="cloudflareTotal">—</strong><small>independent Cloudflare logins</small></article>
@@ -296,6 +369,16 @@
       <div id="composeProgress" class="operation-status" role="status" aria-live="polite" hidden><span class="spinner" aria-hidden="true"></span><div><strong id="composeProgressTitle">Sending email</strong><span id="composeProgressDetail">Elapsed 0s</span></div></div>
       <p id="composeError" class="form-error" hidden></p>
       <div class="compose-actions"><button id="cancelCompose" class="btn ghost" type="button">Cancel</button><button id="sendCompose" class="btn primary" type="submit">Send</button></div>
+    </form>
+  </div>
+
+  <div id="manualCloudflareBatchModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="manualCloudflareCreateTitle" hidden>
+    <form id="manualCloudflareBatchForm" class="compose-card" aria-busy="false">
+      <div class="compose-head"><div><h2 id="manualCloudflareCreateTitle">Start manual Cloudflare batch</h2><p id="manualCloudflareSelectionSummary" class="muted"></p></div><button id="closeManualCloudflareBatch" class="icon-btn" type="button" aria-label="Close">×</button></div>
+      <p>Each selected email receives its own random 20-character password. Passwords are encrypted and the first unfinished account opens in Focus Mode.</p>
+      <ul class="plain-list compact-list"><li>Uppercase and lowercase letters</li><li>Numbers and symbols</li><li>No duplicate email records</li></ul>
+      <p id="manualCloudflareCreateError" class="form-error" hidden></p>
+      <div class="compose-actions"><button id="cancelManualCloudflareBatch" class="btn ghost" type="button">Cancel</button><button id="submitManualCloudflareBatch" class="btn primary" type="submit">Create &amp; open Focus Mode</button></div>
     </form>
   </div>
 

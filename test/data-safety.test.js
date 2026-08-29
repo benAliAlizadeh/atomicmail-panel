@@ -6,7 +6,7 @@ import path from 'node:path';
 import { CredentialVault } from '../src/credential-vault.js';
 import { BackupManager } from '../src/backup-manager.js';
 import { Store } from '../src/db.js';
-import { CloudflareStore } from '../src/cloudflare-store.js';
+import { CloudflareManualService } from '../src/cloudflare-manual-service.js';
 
 function makeConfig(root) {
   const dataDir = path.join(root, 'data');
@@ -159,20 +159,15 @@ test('encrypted backup verifies and restores portably onto a different path', as
     sourceVault.initialize();
     const sourceStore = new Store(sourceConfig.dbPath);
     createMailbox(sourceStore, sourceVault, 'portable1111', 'destination-secret-4477');
-    const sourceCloudflare = new CloudflareStore(sourceStore);
-    const cloudflareJobId = 'cfjob_portable1111';
-    const cloudflarePassword = sourceVault.sealCloudflareSecret('Cloudflare!Shared-8811', {
-      purpose: 'cloudflare-job-password', id: cloudflareJobId,
-    });
     const mailboxId = sourceStore.listMailboxes(1)[0].id;
-    const cloudflareJob = sourceCloudflare.createJob({
-      id: cloudflareJobId, mailboxIds: [mailboxId], passwordMode: 'manual', passwordCiphertext: cloudflarePassword,
+    const sourceCloudflare = new CloudflareManualService({
+      store: sourceStore, vault: sourceVault, config: { cloudflareMaxBatchSize: 100, exportMaxRows: 1000 },
     });
-    const browserState = sourceVault.sealCloudflareSecret(JSON.stringify({ cookies: [{ name: 'temporary' }] }), {
-      purpose: 'cloudflare-browser-state', id: cloudflareJob.items[0].id,
-    });
-    sourceStore.db.prepare('UPDATE cloudflare_job_items SET browser_state_ciphertext=? WHERE id=?')
-      .run(browserState, cloudflareJob.items[0].id);
+    sourceCloudflare.createBatch([mailboxId]);
+    const sourceCloudflareAccount = sourceCloudflare.getFocusAccount().account;
+    const sourceCloudflarePassword = sourceCloudflare.revealPassword(sourceCloudflareAccount.id);
+    sourceCloudflare.updateNotes(sourceCloudflareAccount.id, 'Resume this account after portable restore');
+    sourceCloudflare.markSignupDone(sourceCloudflareAccount.id);
     const manager = new BackupManager({ config: sourceConfig, store: sourceStore, vault: sourceVault });
     const backup = await manager.createBackup('test');
     assert.equal(backup.verified, true);
@@ -205,17 +200,15 @@ test('encrypted backup verifies and restores portably onto a different path', as
       'destination-secret-4477',
     );
     assert.equal(targetVault.readCredentials('portable1111').apiKey, 'secret-portable1111');
-    const restoredCloudflare = new CloudflareStore(targetStore);
-    const restoredCloudflareJob = restoredCloudflare.getJob(cloudflareJobId);
-    assert.equal(restoredCloudflareJob.requested_count, 1);
-    const restoredCloudflarePassword = restoredCloudflare.getPasswordRecord(cloudflareJobId);
-    assert.equal(targetVault.openCloudflareSecret(restoredCloudflarePassword.password_ciphertext, {
-      purpose: 'cloudflare-job-password', id: cloudflareJobId,
-    }), 'Cloudflare!Shared-8811');
-    const restoredItem = restoredCloudflare.getItem(restoredCloudflareJob.items[0].id, { includeSecrets: true });
-    assert.deepEqual(JSON.parse(targetVault.openCloudflareSecret(restoredItem.browser_state_ciphertext, {
-      purpose: 'cloudflare-browser-state', id: restoredItem.id,
-    })), { cookies: [{ name: 'temporary' }] });
+    const restoredCloudflare = new CloudflareManualService({
+      store: targetStore, vault: targetVault, config: { cloudflareMaxBatchSize: 100, exportMaxRows: 1000 },
+    });
+    assert.equal(restoredCloudflare.initialize().migrated, 0);
+    const restoredCloudflareAccount = restoredCloudflare.getFocusAccount().account;
+    assert.equal(restoredCloudflareAccount.id, sourceCloudflareAccount.id);
+    assert.equal(restoredCloudflareAccount.status, 'signup_done');
+    assert.equal(restoredCloudflareAccount.notes, 'Resume this account after portable restore');
+    assert.equal(restoredCloudflare.revealPassword(restoredCloudflareAccount.id), sourceCloudflarePassword);
     assert.equal(targetVault.status().plaintextCredentialFiles, 0);
     targetStore.close();
   } finally {

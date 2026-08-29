@@ -6,10 +6,7 @@ import { BackupManager } from './backup-manager.js';
 import { AtomicMailProvider } from './provider.js';
 import { AtomicMailJmapClient } from './jmap-client.js';
 import { JobWorker } from './worker.js';
-import { CloudflareStore } from './cloudflare-store.js';
-import { CloudflareRunnerManager } from './cloudflare-runner-manager.js';
-import { CloudflareArtifactStore } from './cloudflare-artifacts.js';
-import { CloudflareOrchestrator } from './cloudflare-orchestrator.js';
+import { CloudflareManualService } from './cloudflare-manual-service.js';
 import { createServer } from './server.js';
 import { acquirePidLock } from './process-lock.js';
 import { hardenStoragePaths } from './file-security.js';
@@ -39,19 +36,17 @@ const backupManager = new BackupManager({ config, store, vault });
 const provider = new AtomicMailProvider(config, vault);
 const mailClient = new AtomicMailJmapClient(config, vault);
 const worker = new JobWorker({ store, provider, config, backupManager });
-const cloudflareStore = new CloudflareStore(store);
-const runnerManager = new CloudflareRunnerManager({ config, store });
-const cloudflareArtifactStore = new CloudflareArtifactStore({ config, vault });
-const cloudflareOrchestrator = new CloudflareOrchestrator({
-  cloudflareStore,
+const cloudflareManualService = new CloudflareManualService({
   store,
   vault,
   mailClient,
-  runnerManager,
-  artifactStore: cloudflareArtifactStore,
   config,
   backupManager,
 });
+const cloudflareMigration = cloudflareManualService.initialize();
+if (cloudflareMigration.migrated) {
+  console.log(`Cloudflare manual assistant: migrated ${cloudflareMigration.migrated} existing account record(s)`);
+}
 const server = createServer({
   store,
   worker,
@@ -59,21 +54,17 @@ const server = createServer({
   backupManager,
   vault,
   mailClient,
-  cloudflareStore,
-  cloudflareOrchestrator,
-  runnerManager,
-  cloudflareArtifactStore,
+  cloudflareManualService,
 });
 
 worker.start();
-cloudflareOrchestrator.start();
 backupManager.start();
 if (store.hasBackupData()) backupManager.requestBackup('startup-protection');
 
 server.listen(config.port, config.host, () => {
   console.log(`AtomicMail Panel listening on http://${config.host}:${config.port}`);
   console.log(`Worker: ${config.workerEnabled ? 'enabled (concurrency=1)' : 'disabled'}`);
-  console.log(`Cloudflare operator workflow: ${config.cloudflareEnabled ? 'enabled (visible runner, concurrency=1)' : 'disabled'}`);
+  console.log(`Cloudflare manual assistant: ${config.cloudflareEnabled ? 'enabled (no browser runner)' : 'disabled'}`);
   console.log(`Admin auth: ${config.adminPassword ? 'enabled' : 'disabled'}`);
   console.log(`Atomic Mail watch mode: ${config.atomicWatchMode}`);
   console.log(`Credential vault: ${vaultStatus.encryption}; key fingerprint ${vaultStatus.keyFingerprint}`);
@@ -104,12 +95,9 @@ async function shutdown(signal) {
     server.close(() => resolve());
   });
 
-  const [idle, cloudflareIdle] = await Promise.all([
-    worker.stop({ abortActive: true, waitMs: config.shutdownGraceMs }),
-    cloudflareOrchestrator.stop({ waitMs: config.shutdownGraceMs }),
-  ]);
-  if (!idle || !cloudflareIdle) {
-    console.error('One or more workers did not become idle before shutdown deadline.');
+  const idle = await worker.stop({ abortActive: true, waitMs: config.shutdownGraceMs });
+  if (!idle) {
+    console.error('The Atomic Mail worker did not become idle before shutdown deadline.');
     return;
   }
 

@@ -22,6 +22,12 @@ const state = {
   cloudflareStatus: null,
   cloudflareJobPassword: null,
   cloudflarePairingCommand: '',
+  manualCloudflareAccount: null,
+  manualCloudflarePassword: null,
+  manualCloudflareVerificationUrl: null,
+  manualCloudflareSearch: '',
+  manualCloudflareStatus: '',
+  manualCloudflareSignupUrl: 'https://dash.cloudflare.com/sign-up',
   selectedMailbox: null,
   inboxItems: [],
   selectedMessage: null,
@@ -59,7 +65,7 @@ const viewMeta = {
   create: ['Create emails', 'Start a safe sequential batch'],
   jobs: ['Jobs', 'Progress and batch controls'],
   mailboxes: ['Mailboxes', 'Search, copy and export created inboxes'],
-  cloudflare: ['Cloudflare Accounts', 'Operator-assisted signup and verified-email workflow'],
+  cloudflare: ['Cloudflare Accounts', 'Simple manual signup assistant with secure saved progress'],
   webmail: ['Webmail', 'Read and send mail through Atomic Mail JMAP'],
   system: ['System', 'Circuit breaker and operational audit'],
 };
@@ -395,7 +401,10 @@ function switchView(view, { load = true } = {}) {
   if (!viewMeta[view]) return;
   if (state.currentView === 'webmail' && view !== 'webmail') stopWebmailAutoRefresh();
   if (state.currentView === 'jobs' && view !== 'jobs') hideJobPassword();
-  if (state.currentView === 'cloudflare' && view !== 'cloudflare') hideCloudflarePassword();
+  if (state.currentView === 'cloudflare' && view !== 'cloudflare') {
+    hideCloudflarePassword();
+    hideManualCloudflareSecrets();
+  }
   state.currentView = view;
   $$('.view').forEach((item) => { item.hidden = item.dataset.view !== view; });
   const navView = view === 'webmail' ? 'mailboxes' : view;
@@ -404,7 +413,7 @@ function switchView(view, { load = true } = {}) {
   $('#pageSubtitle').textContent = viewMeta[view][1];
   if (load && view === 'jobs') loadJobs().catch(handleError);
   if (load && view === 'mailboxes') loadMailboxes().catch(handleError);
-  if (load && view === 'cloudflare') loadCloudflare().catch(handleError);
+  if (load && view === 'cloudflare') loadManualCloudflare().catch(handleError);
   if (load && view === 'system') loadSystem().catch(handleError);
   if (view === 'webmail') startWebmailAutoRefresh();
 }
@@ -412,6 +421,17 @@ function switchView(view, { load = true } = {}) {
 function handleError(error) {
   if (error?.status === 401) return;
   showToast(error?.message || 'Unexpected error', true);
+}
+
+function handleManualCloudflareError(error) {
+  if (error?.body?.temporary || error?.body?.code === 'mail_rate_limited') {
+    const message = $('#manualCloudflareFocusMessage');
+    message.textContent = 'Atomic Mail is temporarily rate limiting requests. Retrying automatically; please check again shortly.';
+    message.hidden = false;
+    showToast('Atomic Mail is temporarily rate limiting requests');
+    return;
+  }
+  handleError(error);
 }
 
 function normalizePrefix(value) {
@@ -642,7 +662,9 @@ async function loadMailboxes({ background = false } = {}) {
     <td class="mailbox-selection-cell"><input type="checkbox" data-cloudflare-mailbox-id="${escapeHtml(item.id)}" aria-label="Select ${escapeHtml(item.email)} for Cloudflare" ${state.selectedCloudflareMailboxIds.has(item.id) ? 'checked' : ''} ${item.cloudflare_eligible ? '' : 'disabled'} /></td>
     <td class="mono">${escapeHtml(item.email)}</td>
     <td>${statusPill(item.status)}</td>
-    <td>${item.cloudflare_status ? statusPill(item.cloudflare_status) : '<span class="muted">Eligible</span>'}</td>
+    <td>${item.cloudflare_status
+      ? `<strong class="cloudflare-account-note">Already Used</strong>${statusPill(item.cloudflare_status)}${item.cloudflare_verified_at ? `<span class="cloudflare-account-note">Verified on ${escapeHtml(formatDate(item.cloudflare_verified_at))}</span>` : ''}`
+      : '<span class="muted">Eligible</span>'}</td>
     <td><span class="pill">API key</span></td>
     <td>${escapeHtml(formatDate(item.created_at))}</td>
     <td class="mono" title="${escapeHtml(item.job_id || '')}">${escapeHtml(item.job_id ? shortId(item.job_id) : '—')}</td>
@@ -693,6 +715,201 @@ async function selectFirstFilteredMailboxes(button) {
     selectMailboxRows(eligible.slice(0, 100));
     showToast(`Selected ${state.selectedCloudflareMailboxIds.size} eligible mailbox${state.selectedCloudflareMailboxIds.size === 1 ? '' : 'es'}`);
   });
+}
+
+const MANUAL_CLOUDFLARE_STATUS_LABELS = {
+  not_started: 'Not Started',
+  signup_done: 'Signup Done',
+  waiting_verification: 'Waiting Verification',
+  verification_received: 'Verification Received',
+  verified: 'Verified',
+  failed: 'Failed',
+};
+
+function hideManualCloudflareSecrets() {
+  state.manualCloudflarePassword = null;
+  state.manualCloudflareVerificationUrl = null;
+  const password = $('#manualCloudflareFocusPassword');
+  if (password) password.textContent = '••••••••••••••••••••';
+  const reveal = $('#revealManualCloudflarePassword');
+  if (reveal) reveal.textContent = 'Reveal';
+}
+
+function manualCloudflareStatusLabel(status) {
+  return MANUAL_CLOUDFLARE_STATUS_LABELS[status] || String(status || 'Unknown');
+}
+
+function manualCloudflareTimeline(account) {
+  const signupDone = Boolean(account.signup_done_at);
+  const emailReceived = Boolean(account.verification_received_at);
+  const verified = Boolean(account.verified_at || account.status === 'verified');
+  const rows = [
+    ['Account prepared', true, false],
+    ['Signup done', signupDone, account.status === 'not_started'],
+    ['Waiting for verification email', emailReceived, signupDone && !emailReceived],
+    ['Verification email received', emailReceived, false],
+    ['Verified', verified, emailReceived && !verified],
+  ];
+  return rows.map(([label, done, active], index) => `<li class="${done ? 'done' : active ? 'active' : ''}">
+    <span class="timeline-marker">${done ? '✓' : active ? '…' : index + 1}</span><span>${escapeHtml(label)}</span>
+  </li>`).join('');
+}
+
+function renderManualCloudflareStats(stats = {}) {
+  state.manualCloudflareSignupUrl = stats.signupUrl || 'https://dash.cloudflare.com/sign-up';
+  $('#manualCloudflareTotal').textContent = stats.totalAccounts ?? 0;
+  $('#manualCloudflareVerified').textContent = stats.verifiedAccounts ?? 0;
+  $('#manualCloudflarePending').textContent = stats.pendingAccounts ?? 0;
+  $('#manualCloudflareFailed').textContent = stats.failedAccounts ?? 0;
+}
+
+function renderManualCloudflareFocus(account, stats = {}) {
+  const previousId = state.manualCloudflareAccount?.id;
+  if (previousId !== account?.id) hideManualCloudflareSecrets();
+  state.manualCloudflareAccount = account || null;
+  $('#manualCloudflareFocusEmpty').hidden = Boolean(account);
+  $('#manualCloudflareFocusCard').hidden = !account;
+  if (!account) return;
+
+  $('#manualCloudflareFocusCounter').textContent = `Account ${account.position || 1} / ${account.batch_total || stats.totalAccounts || 1}`;
+  $('#manualCloudflareFocusEmail').textContent = account.email;
+  $('#manualCloudflareFocusStatus').textContent = manualCloudflareStatusLabel(account.status);
+  $('#manualCloudflareFocusStatus').className = `pill ${escapeHtml(account.status)}`;
+  $('#manualCloudflareTimeline').innerHTML = manualCloudflareTimeline(account);
+  $('#manualCloudflareNotes').value = account.notes || '';
+
+  const notStarted = account.status === 'not_started';
+  const signupDone = Boolean(account.signup_done_at);
+  const verificationReceived = Boolean(account.has_verification_link && account.verification_received_at);
+  $('#regenerateManualCloudflarePassword').disabled = !notStarted;
+  $('#manualCloudflarePasswordLocked').hidden = notStarted;
+  $('#markManualCloudflareSignupDone').disabled = !notStarted;
+  $('#checkManualCloudflareInbox').disabled = !signupDone;
+  $('#openManualCloudflareVerifyLink').disabled = !verificationReceived;
+  $('#copyManualCloudflareVerifyLink').disabled = !verificationReceived;
+  $('#markManualCloudflareVerified').disabled = !verificationReceived;
+  $('#openManualCloudflareSignup').disabled = !notStarted;
+  $('#markManualCloudflareFailed').disabled = ['verified', 'failed'].includes(account.status);
+
+  const message = $('#manualCloudflareFocusMessage');
+  if (account.status === 'waiting_verification') {
+    message.textContent = `No trusted Cloudflare verification email found yet.${account.last_inbox_check_at ? ` Last checked ${formatDate(account.last_inbox_check_at)}.` : ''}`;
+    message.hidden = false;
+  } else if (account.last_error) {
+    message.textContent = account.last_error;
+    message.hidden = false;
+  } else {
+    message.hidden = true;
+    message.textContent = '';
+  }
+}
+
+function renderManualCloudflareAccounts(accounts) {
+  $('#manualCloudflareAccountsEmpty').hidden = accounts.length > 0;
+  $('#manualCloudflareAccountsBody').innerHTML = accounts.map((account) => `<tr>
+    <td><button class="text-button mono" type="button" data-manual-cloudflare-open="${escapeHtml(account.id)}">${escapeHtml(account.email)}</button></td>
+    <td><span class="mono">••••••••</span> <button class="btn ghost small-btn" type="button" data-manual-cloudflare-copy-password="${escapeHtml(account.id)}">Copy</button></td>
+    <td>${statusPill(account.status)}</td>
+    <td>${escapeHtml(formatDate(account.verified_at))}</td>
+    <td class="truncate" title="${escapeHtml(account.notes || '')}">${escapeHtml(account.notes || '—')}</td>
+  </tr>`).join('');
+}
+
+async function loadManualCloudflare({ background = false } = {}) {
+  const request = beginLatestRequest('manual-cloudflare', { skipIfBusy: background });
+  if (!request) return;
+  const endActivity = background ? () => {} : beginActivity('manual-cloudflare-load', 'Loading saved Cloudflare progress');
+  if (!background) setButtonBusy($('#refreshManualCloudflare'), true, 'Refreshing');
+  $('#manualCloudflareFocusPanel').setAttribute('aria-busy', 'true');
+  try {
+    const params = new URLSearchParams({ limit: '100', offset: '0' });
+    if (state.manualCloudflareSearch) params.set('search', state.manualCloudflareSearch);
+    if (state.manualCloudflareStatus) params.set('status', state.manualCloudflareStatus);
+    const [focus, accounts] = await Promise.all([
+      api('/api/cloudflare/focus', { signal: request.signal }),
+      api(`/api/cloudflare/accounts?${params}`, { signal: request.signal }),
+    ]);
+    if (!request.isCurrent()) return;
+    renderManualCloudflareStats(focus.stats);
+    renderManualCloudflareFocus(focus.account, focus.stats);
+    renderManualCloudflareAccounts(accounts.items || []);
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+  } finally {
+    if (request.isCurrent()) {
+      request.finish();
+      $('#manualCloudflareFocusPanel').setAttribute('aria-busy', 'false');
+      if (!background) setButtonBusy($('#refreshManualCloudflare'), false);
+    }
+    endActivity();
+  }
+}
+
+async function openManualCloudflareAccount(id) {
+  const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(id)}`);
+  const stats = await api('/api/cloudflare/status');
+  renderManualCloudflareStats(stats);
+  renderManualCloudflareFocus(result.account, stats);
+  $('#manualCloudflareFocusPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function revealManualCloudflarePassword() {
+  const account = state.manualCloudflareAccount;
+  if (!account) return '';
+  const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/password`, { method: 'POST', body: '{}' });
+  state.manualCloudflarePassword = result.password;
+  $('#manualCloudflareFocusPassword').textContent = result.password;
+  $('#revealManualCloudflarePassword').textContent = 'Hide';
+  return result.password;
+}
+
+async function manualCloudflareVerificationLink() {
+  const account = state.manualCloudflareAccount;
+  if (!account) return '';
+  if (state.manualCloudflareVerificationUrl) return state.manualCloudflareVerificationUrl;
+  const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/verification-link`, { method: 'POST', body: '{}' });
+  state.manualCloudflareVerificationUrl = result.verificationUrl;
+  return result.verificationUrl;
+}
+
+function openManualCloudflareBatchModal() {
+  const count = state.selectedCloudflareMailboxIds.size;
+  if (!count) return;
+  $('#manualCloudflareSelectionSummary').textContent = `${count} email${count === 1 ? '' : 's'} selected`;
+  $('#manualCloudflareCreateError').hidden = true;
+  $('#manualCloudflareBatchModal').hidden = false;
+  setTimeout(() => $('#submitManualCloudflareBatch').focus(), 0);
+}
+
+function closeManualCloudflareBatchModal() {
+  if ($('#manualCloudflareBatchForm').getAttribute('aria-busy') === 'true') return;
+  $('#manualCloudflareBatchModal').hidden = true;
+}
+
+async function downloadManualCloudflareSensitiveExport() {
+  if (!confirm('This export contains plaintext Cloudflare passwords. Store it securely and delete it when finished. Continue?')) return;
+  const headers = { 'content-type': 'application/json' };
+  if (state.csrf) headers['x-atomicmail-csrf'] = state.csrf;
+  const response = await fetch('/api/cloudflare/accounts/export-sensitive', {
+    method: 'POST', headers, credentials: 'same-origin',
+    body: JSON.stringify({
+      confirm: 'EXPORT CLOUDFLARE',
+      search: state.manualCloudflareSearch,
+      status: state.manualCloudflareStatus,
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `Cloudflare export failed (${response.status})`);
+  }
+  const href = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement('a');
+  anchor.href = href;
+  anchor.download = 'cloudflare-accounts-sensitive.csv';
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(href);
 }
 
 function openCloudflareJobModal() {
@@ -1595,7 +1812,7 @@ async function poll() {
   try {
     await loadDashboard();
     if (state.currentView === 'jobs' && state.activeJob) await loadJobs({ background: true });
-    if (state.currentView === 'cloudflare') await loadCloudflare({ background: true });
+    if (state.currentView === 'cloudflare') await loadManualCloudflare({ background: true });
   } catch (error) {
     if (!isAbortError(error) && error?.status !== 401) console.warn(error);
   } finally {
@@ -1772,7 +1989,170 @@ $('#clearCloudflareSelection').addEventListener('click', () => {
   state.selectedCloudflareMailboxIds.clear();
   selectMailboxRows(state.mailboxItems, false);
 });
-$('#createCloudflareSelection').addEventListener('click', openCloudflareJobModal);
+$('#createCloudflareSelection').addEventListener('click', openManualCloudflareBatchModal);
+$('#closeManualCloudflareBatch').addEventListener('click', closeManualCloudflareBatchModal);
+$('#cancelManualCloudflareBatch').addEventListener('click', closeManualCloudflareBatchModal);
+$('#manualCloudflareBatchModal').addEventListener('click', (event) => {
+  if (event.target === event.currentTarget) closeManualCloudflareBatchModal();
+});
+$('#manualCloudflareBatchForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = $('#submitManualCloudflareBatch');
+  const errorBox = $('#manualCloudflareCreateError');
+  errorBox.hidden = true;
+  form.setAttribute('aria-busy', 'true');
+  setButtonBusy(button, true, 'Creating accounts');
+  const endActivity = beginActivity('manual-cloudflare-create', 'Generating and encrypting unique account passwords', { immediate: true });
+  try {
+    const result = await api('/api/cloudflare/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ mailboxIds: [...state.selectedCloudflareMailboxIds] }),
+    });
+    state.selectedCloudflareMailboxIds.clear();
+    $('#manualCloudflareBatchModal').hidden = true;
+    showToast(`${result.requested_count} Cloudflare account record${result.requested_count === 1 ? '' : 's'} ready`);
+    switchView('cloudflare', { load: false });
+    await Promise.all([loadManualCloudflare(), loadMailboxes({ background: true }), loadDashboard()]);
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+  } finally {
+    form.setAttribute('aria-busy', 'false');
+    setButtonBusy(button, false);
+    endActivity();
+  }
+});
+
+$('#refreshManualCloudflare').addEventListener('click', () => loadManualCloudflare().catch(handleError));
+$('#copyManualCloudflareEmail').addEventListener('click', () => {
+  const email = state.manualCloudflareAccount?.email;
+  if (email) copyText(email, 'Cloudflare email copied').catch(handleError);
+});
+$('#revealManualCloudflarePassword').addEventListener('click', async (event) => {
+  if (state.manualCloudflarePassword) {
+    hideManualCloudflareSecrets();
+    return;
+  }
+  await withBusyButton(event.currentTarget, 'Decrypting', 'Decrypting this account password', revealManualCloudflarePassword).catch(handleError);
+});
+$('#copyManualCloudflarePassword').addEventListener('click', async (event) => {
+  await withBusyButton(event.currentTarget, 'Copying', 'Decrypting this account password', async () => {
+    const password = state.manualCloudflarePassword || await revealManualCloudflarePassword();
+    if (password) await copyText(password, 'Cloudflare password copied');
+  }).catch(handleError);
+});
+$('#regenerateManualCloudflarePassword').addEventListener('click', async (event) => {
+  const account = state.manualCloudflareAccount;
+  if (!account || !confirm('Replace this unused password with a new random password?')) return;
+  await withBusyButton(event.currentTarget, 'Regenerating', 'Encrypting a new account password', async () => {
+    const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/regenerate-password`, { method: 'POST', body: '{}' });
+    state.manualCloudflareAccount = result.account;
+    state.manualCloudflarePassword = result.password;
+    $('#manualCloudflareFocusPassword').textContent = result.password;
+    $('#revealManualCloudflarePassword').textContent = 'Hide';
+    showToast('New unique password generated');
+  }).catch(handleError);
+});
+$('#openManualCloudflareSignup').addEventListener('click', () => {
+  window.open(state.manualCloudflareSignupUrl, '_blank', 'noopener,noreferrer');
+});
+$('#markManualCloudflareSignupDone').addEventListener('click', async (event) => {
+  const account = state.manualCloudflareAccount;
+  if (!account || !confirm('Confirm that Cloudflare accepted the signup for this exact email. The password will be locked.')) return;
+  await withBusyButton(event.currentTarget, 'Saving', 'Locking password and saving Signup Done', async () => {
+    await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/signup-done`, { method: 'POST', body: '{}' });
+    hideManualCloudflareSecrets();
+    await loadManualCloudflare();
+    showToast('Signup Done saved; password is now locked');
+  }).catch(handleError);
+});
+$('#checkManualCloudflareInbox').addEventListener('click', async (event) => {
+  const account = state.manualCloudflareAccount;
+  if (!account) return;
+  await withBusyButton(event.currentTarget, 'Checking inbox', 'Looking for a trusted Cloudflare verification email', async () => {
+    const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/check-inbox`, { method: 'POST', body: '{}' });
+    state.manualCloudflareVerificationUrl = null;
+    await loadManualCloudflare();
+    showToast(result.found ? 'Verification email received' : 'No verification email yet');
+  }).catch(handleManualCloudflareError);
+});
+$('#openManualCloudflareVerifyLink').addEventListener('click', async (event) => {
+  const popup = window.open('about:blank', '_blank');
+  await withBusyButton(event.currentTarget, 'Opening', 'Validating the Cloudflare verification link', async () => {
+    const url = await manualCloudflareVerificationLink();
+    if (popup) {
+      popup.opener = null;
+      popup.location.replace(url);
+    } else {
+      throw new Error('The browser blocked the new tab. Allow popups and try again.');
+    }
+  }).catch((error) => {
+    try { popup?.close(); } catch {}
+    handleError(error);
+  });
+});
+$('#copyManualCloudflareVerifyLink').addEventListener('click', async (event) => {
+  await withBusyButton(event.currentTarget, 'Copying', 'Validating the Cloudflare verification link', async () => {
+    await copyText(await manualCloudflareVerificationLink(), 'Verification link copied');
+  }).catch(handleError);
+});
+$('#markManualCloudflareVerified').addEventListener('click', async (event) => {
+  const account = state.manualCloudflareAccount;
+  if (!account || !confirm('Confirm that Cloudflare shows this email as verified. Continue to the next account?')) return;
+  await withBusyButton(event.currentTarget, 'Saving', 'Marking account verified and loading the next account', async () => {
+    await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/verified`, { method: 'POST', body: '{}' });
+    hideManualCloudflareSecrets();
+    await Promise.all([loadManualCloudflare(), loadDashboard()]);
+    showToast('Account verified. Focus Mode advanced to the next account.');
+  }).catch(handleError);
+});
+$('#saveManualCloudflareNotes').addEventListener('click', async (event) => {
+  const account = state.manualCloudflareAccount;
+  if (!account) return;
+  await withBusyButton(event.currentTarget, 'Saving', 'Saving account notes', async () => {
+    await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/notes`, {
+      method: 'POST', body: JSON.stringify({ notes: $('#manualCloudflareNotes').value }),
+    });
+    await loadManualCloudflare({ background: true });
+    showToast('Notes saved');
+  }).catch(handleError);
+});
+$('#markManualCloudflareFailed').addEventListener('click', async (event) => {
+  const account = state.manualCloudflareAccount;
+  if (!account || !confirm('Mark this account as Failed and move to the next unfinished account?')) return;
+  await withBusyButton(event.currentTarget, 'Saving', 'Marking account failed', async () => {
+    await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/failed`, {
+      method: 'POST', body: JSON.stringify({ reason: $('#manualCloudflareNotes').value || 'Marked failed by operator' }),
+    });
+    hideManualCloudflareSecrets();
+    await loadManualCloudflare();
+  }).catch(handleError);
+});
+$('#manualCloudflareAccountFilters').addEventListener('submit', (event) => {
+  event.preventDefault();
+  state.manualCloudflareSearch = $('#manualCloudflareAccountSearch').value.trim();
+  state.manualCloudflareStatus = $('#manualCloudflareAccountStatus').value;
+  loadManualCloudflare().catch(handleError);
+});
+$('#manualCloudflareAccountsBody').addEventListener('click', async (event) => {
+  const open = event.target.closest('[data-manual-cloudflare-open]');
+  if (open) {
+    await withBusyButton(open, 'Opening', 'Loading saved Cloudflare account', () => openManualCloudflareAccount(open.dataset.manualCloudflareOpen)).catch(handleError);
+    return;
+  }
+  const copy = event.target.closest('[data-manual-cloudflare-copy-password]');
+  if (copy) {
+    await withBusyButton(copy, 'Copying', 'Decrypting this account password', async () => {
+      const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(copy.dataset.manualCloudflareCopyPassword)}/password`, { method: 'POST', body: '{}' });
+      await copyText(result.password, 'Cloudflare password copied');
+    }).catch(handleError);
+  }
+});
+$('#exportManualCloudflareSensitive').addEventListener('click', (event) => {
+  withBusyButton(event.currentTarget, 'Exporting', 'Preparing explicit sensitive export', downloadManualCloudflareSensitiveExport).catch(handleError);
+});
+
 $('#closeCloudflareJobModal').addEventListener('click', closeCloudflareJobModal);
 $('#cancelCloudflareJob').addEventListener('click', closeCloudflareJobModal);
 $('#cloudflareJobModal').addEventListener('click', (event) => {
@@ -2033,12 +2413,13 @@ $('#resetCircuit').addEventListener('click', async (event) => {
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && state.currentView === 'webmail' && state.selectedMailbox) loadInbox({ background: true }).catch(() => {});
-  if (!document.hidden && state.currentView === 'cloudflare') loadCloudflare({ background: true }).catch(() => {});
+  if (!document.hidden && state.currentView === 'cloudflare') loadManualCloudflare({ background: true }).catch(() => {});
 });
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !$('#composeModal').hidden) closeCompose();
   if (event.key === 'Escape' && !$('#cloudflareJobModal').hidden) closeCloudflareJobModal();
+  if (event.key === 'Escape' && !$('#manualCloudflareBatchModal').hidden) closeManualCloudflareBatchModal();
 });
 
 window.addEventListener('beforeunload', (event) => {

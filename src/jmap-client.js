@@ -749,14 +749,14 @@ export class AtomicMailJmapClient {
     return this.listMailbox(username, { ...options, folder: 'inbox' });
   }
 
-  async findCloudflareVerification(username, { recipient, submittedAt, signal = null } = {}) {
+  async findCloudflareVerification(username, { recipient, submittedAt, signal = null, priority = 'background' } = {}) {
     const afterMs = Date.parse(submittedAt || '');
     if (!Number.isFinite(afterMs)) {
       throw new MailClientError('Cloudflare submission timestamp is invalid', { statusCode: 400, code: 'invalid_verification_window' });
     }
     const inboxMailboxId = this.legacyRunner
       ? '$INBOX_MAILBOX_ID'
-      : await this.mailboxIdForRole(username, 'inbox', { signal, priority: 'background' });
+      : await this.mailboxIdForRole(username, 'inbox', { signal, priority });
     const ops = {
       using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
       methodCalls: [
@@ -785,8 +785,8 @@ export class AtomicMailJmapClient {
     const result = await this.request(username, {
       ops,
       signal,
-      priority: 'background',
-      coalesceKey: `cloudflare-verification:${new Date(afterMs).toISOString()}`,
+      priority,
+      coalesceKey: priority === 'background' ? `cloudflare-verification:${new Date(afterMs).toISOString()}` : '',
     });
     const payload = methodResponse(result, 'Email/get', 'cfg0') || {};
     const messages = Array.isArray(payload.list) ? payload.list.map(normalizedMessage) : [];

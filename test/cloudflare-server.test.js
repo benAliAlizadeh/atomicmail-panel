@@ -5,8 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/db.js';
 import { CredentialVault } from '../src/credential-vault.js';
-import { CloudflareStore } from '../src/cloudflare-store.js';
-import { CloudflareRunnerManager } from '../src/cloudflare-runner-manager.js';
+import { CloudflareManualService } from '../src/cloudflare-manual-service.js';
 import { createServer } from '../src/server.js';
 
 function config(root) {
@@ -21,64 +20,94 @@ function config(root) {
     mailMaxTotalAttachmentBytes: 10485760, destinationPasswordMaxBytes: 1024,
     credentialsRoot: path.join(root, 'credentials'), runtimeCredentialsRoot: path.join(root, 'runtime'),
     secretsDir: path.join(root, 'secrets'), encryptionKeyPath: path.join(root, 'secrets', 'data.key'),
-    cloudflareEnabled: true, cloudflareMaxBatchSize: 100, cloudflarePairingTtlMs: 600000,
-    cloudflareRunnerOfflineMs: 45000, cloudflareTrustProxy: false,
+    cloudflareEnabled: true, cloudflareMaxBatchSize: 100,
   };
 }
 
-test('Cloudflare admin API keeps secrets out of normal responses and explicitly protects export/reveal', async () => {
+test('manual Cloudflare API protects secrets, transitions safely, exports explicitly, and retires runner endpoints', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-cloudflare-server-'));
   const cfg = config(root);
   const store = new Store(path.join(root, 'panel.sqlite'));
   const vault = new CredentialVault(cfg);
   vault.initialize();
-  const cloudflareStore = new CloudflareStore(store);
-  const runnerManager = new CloudflareRunnerManager({ config: cfg, store });
-  const orchestrator = {
-    circuitState: () => ({ open: false, until: null, reason: null }),
-    status: () => ({ enabled: true, runner: runnerManager.status(), circuit: { open: false }, limits: { maxBatchSize: 100 } }),
-    resetCircuit() {},
-    claimTask: () => null,
-    heartbeat: (session, body) => runnerManager.heartbeat(session, body),
-    handleRunnerEvent() { throw new Error('No task'); },
-  };
-  const worker = { circuitState: () => ({ open: false }), resetCircuit() {} };
   const now = new Date().toISOString();
-  store.db.prepare(`
-    INSERT INTO mailboxes(id, username, email, inbox_id, credentials_path, status, created_at)
-    VALUES('mbx_api', 'mailboxapi1', 'mailboxapi1@atomicmail.ai', 'mailboxapi1', 'safe.enc', 'active', ?)
-  `).run(now);
-  const server = createServer({
-    store, worker, config: cfg, vault, cloudflareStore, cloudflareOrchestrator: orchestrator, runnerManager,
-  });
+  for (let index = 1; index <= 2; index += 1) {
+    const username = `mailboxapi${index}`;
+    store.db.prepare(`
+      INSERT INTO mailboxes(id, username, email, inbox_id, credentials_path, status, created_at)
+      VALUES(?, ?, ?, ?, 'safe.enc', 'active', ?)
+    `).run(`mbx_api_${index}`, username, `${username}@atomicmail.ai`, username, now);
+  }
+  const mailClient = {
+    async findCloudflareVerification(username, options) {
+      assert.equal(username, 'mailboxapi1');
+      assert.equal(options.recipient, 'mailboxapi1@atomicmail.ai');
+      return {
+        messageId: 'trusted-message', receivedAt: new Date().toISOString(),
+        url: 'https://dash.cloudflare.com/verify-email?token=api-secret-link',
+      };
+    },
+  };
+  const cloudflareManualService = new CloudflareManualService({ store, vault, mailClient, config: cfg });
+  const worker = { circuitState: () => ({ open: false }), resetCircuit() {} };
+  const server = createServer({ store, worker, config: cfg, vault, mailClient, cloudflareManualService });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
-    const eligibleBefore = await (await fetch(`${base}/api/cloudflare/eligible-mailboxes?limit=100&search=mailboxapi1`)).json();
-    assert.deepEqual(eligibleBefore.items.map((item) => item.id), ['mbx_api']);
+    const eligibleBefore = await (await fetch(`${base}/api/cloudflare/eligible-mailboxes?limit=100`)).json();
+    assert.deepEqual(eligibleBefore.items.map((item) => item.id), ['mbx_api_1', 'mbx_api_2']);
+
     const createdResponse = await fetch(`${base}/api/cloudflare/jobs`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ mailboxIds: ['mbx_api'], passwordMode: 'generated' }),
+      body: JSON.stringify({ mailboxIds: ['mbx_api_1', 'mbx_api_2'] }),
     });
     assert.equal(createdResponse.status, 201);
-    const job = await createdResponse.json();
-    const normalJson = JSON.stringify(job);
-    assert.doesNotMatch(normalJson, /password_ciphertext|browser_state_ciphertext|verification_url_ciphertext/);
-    assert.equal(Object.hasOwn(cloudflareStore.getItem(job.items[0].id), 'password_ciphertext'), false);
-    assert.equal(Object.hasOwn(cloudflareStore.getItem(job.items[0].id, { includeSecrets: true }), 'password_ciphertext'), true);
+    const created = await createdResponse.json();
+    assert.equal(created.requested_count, 2);
+    assert.doesNotMatch(JSON.stringify(created), /password_ciphertext|verification_url_ciphertext|api-secret-link/);
 
-    const revealed = await fetch(`${base}/api/cloudflare/jobs/${job.id}/password`, { method: 'POST', body: '{}' });
+    const focus = await (await fetch(`${base}/api/cloudflare/focus`)).json();
+    assert.equal(focus.account.email, 'mailboxapi1@atomicmail.ai');
+    assert.equal(focus.account.status, 'not_started');
+    assert.equal(focus.account.position, 1);
+    assert.equal(focus.account.batch_total, 2);
+    assert.doesNotMatch(JSON.stringify(focus), /password_ciphertext|verification_url_ciphertext/);
+
+    const accountId = focus.account.id;
+    const revealed = await fetch(`${base}/api/cloudflare/accounts/${accountId}/password`, { method: 'POST', body: '{}' });
     assert.equal(revealed.status, 200);
     const password = (await revealed.json()).password;
-    assert.equal(password.length, 24);
-    assert.match(password, /[A-Z]/);
-    assert.match(password, /[a-z]/);
-    assert.match(password, /[0-9]/);
-    assert.match(password, /[!@#$%^&*()_+\-=]/);
+    assert.equal(password.length, 20);
 
-    const accounts = await (await fetch(`${base}/api/cloudflare/accounts`)).json();
-    assert.equal(accounts.items[0].email, 'mailboxapi1@atomicmail.ai');
-    assert.doesNotMatch(JSON.stringify(accounts), new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    const regenerated = await fetch(`${base}/api/cloudflare/accounts/${accountId}/regenerate-password`, { method: 'POST', body: '{}' });
+    assert.equal(regenerated.status, 200);
+    const regeneratedPassword = (await regenerated.json()).password;
+    assert.notEqual(regeneratedPassword, password);
+
+    const signup = await fetch(`${base}/api/cloudflare/accounts/${accountId}/signup-done`, { method: 'POST', body: '{}' });
+    assert.equal(signup.status, 200);
+    const locked = await fetch(`${base}/api/cloudflare/accounts/${accountId}/regenerate-password`, { method: 'POST', body: '{}' });
+    assert.equal(locked.status, 409);
+
+    const inbox = await fetch(`${base}/api/cloudflare/accounts/${accountId}/check-inbox`, { method: 'POST', body: '{}' });
+    assert.equal(inbox.status, 200);
+    assert.equal((await inbox.json()).found, true);
+    const normalAccounts = await (await fetch(`${base}/api/cloudflare/accounts`)).json();
+    assert.doesNotMatch(JSON.stringify(normalAccounts), /api-secret-link|password_ciphertext|verification_url_ciphertext/);
+    const link = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verification-link`, { method: 'POST', body: '{}' });
+    assert.equal(link.status, 200);
+    assert.equal((await link.json()).verificationUrl, 'https://dash.cloudflare.com/verify-email?token=api-secret-link');
+
+    const verified = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verified`, { method: 'POST', body: '{}' });
+    assert.equal(verified.status, 200);
+    assert.equal((await verified.json()).next.account.email, 'mailboxapi2@atomicmail.ai');
+
+    const duplicate = await fetch(`${base}/api/cloudflare/jobs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mailboxIds: ['mbx_api_1'] }),
+    });
+    assert.equal(duplicate.status, 409);
+    assert.match((await duplicate.json()).error, /already used/i);
 
     const deniedExport = await fetch(`${base}/api/cloudflare/accounts/export-sensitive`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
@@ -89,26 +118,16 @@ test('Cloudflare admin API keeps secrets out of normal responses and explicitly 
       body: JSON.stringify({ confirm: 'EXPORT CLOUDFLARE' }),
     });
     assert.equal(exportResponse.status, 200);
-    assert.match(await exportResponse.text(), new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(exportResponse.headers.get('cache-control') || '', /no-store/);
+    const csv = await exportResponse.text();
+    assert.match(csv, /^"Email","Password","Status"/);
+    assert.ok(csv.includes(regeneratedPassword));
 
-    const mailbox = await (await fetch(`${base}/api/mailboxes?limit=10&offset=0`)).json();
-    assert.equal(mailbox.items[0].cloudflare_eligible, 0);
-    assert.equal(mailbox.items[0].cloudflare_status, 'queued');
-    const eligibleAfter = await (await fetch(`${base}/api/cloudflare/eligible-mailboxes?limit=100&search=mailboxapi1`)).json();
-    assert.deepEqual(eligibleAfter.items, []);
-
-    const pairing = await (await fetch(`${base}/api/cloudflare/runners/pairing`, { method: 'POST', body: '{}' })).json();
-    const pairedResponse = await fetch(`${base}/api/cloudflare/runner/pair`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code: pairing.code, protocolVersion: pairing.protocolVersion, name: 'API runner' }),
-    });
-    assert.equal(pairedResponse.status, 201);
-    const paired = await pairedResponse.json();
-    const taskResponse = await fetch(`${base}/api/cloudflare/runner/tasks/next?wait=0`, {
-      headers: { authorization: `Bearer ${paired.token}` },
-    });
-    assert.equal(taskResponse.status, 200);
-    assert.deepEqual(await taskResponse.json(), { task: null });
+    const auditJson = JSON.stringify(store.recentAudit(100));
+    assert.equal(auditJson.includes(regeneratedPassword), false);
+    assert.doesNotMatch(auditJson, /api-secret-link/);
+    const runner = await fetch(`${base}/api/cloudflare/runner/tasks/next?wait=0`);
+    assert.equal(runner.status, 410);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     store.close();
