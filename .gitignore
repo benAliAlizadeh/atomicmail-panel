@@ -1,5 +1,6 @@
 .env
 data/
+data-before-*/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
@@ -9,5 +10,9 @@ runner/node_modules/
 .DS_Store
 secrets/
 backups/
-
 *.patch
+
+# Never commit plaintext Atomic Mail credentials/JWTs from copied state.
+**/credentials/*/credentials.json
+**/credentials/*/session.jwt
+**/credentials/*/capability.jwt

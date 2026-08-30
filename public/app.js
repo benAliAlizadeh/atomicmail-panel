@@ -374,6 +374,9 @@ async function downloadExport(format) {
 
 function showLogin() {
   stopWebmailAutoRefresh();
+  hideJobPassword();
+  hideCloudflarePassword();
+  hideManualCloudflareSecrets();
   clearInterval(state.clockTimer);
   state.clockTimer = null;
   $('#appShell').hidden = true;

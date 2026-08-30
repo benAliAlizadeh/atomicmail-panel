@@ -3,6 +3,7 @@
 .env
 .env.*
 data/
+data-before-*/
 secrets/
 backups/
 node_modules/
@@ -14,3 +15,8 @@ coverage/
 *.zip
 npm-debug.log*
 .DS_Store
+
+# Defense in depth for accidentally copied plaintext credential state.
+**/credentials/*/credentials.json
+**/credentials/*/session.jwt
+**/credentials/*/capability.jwt

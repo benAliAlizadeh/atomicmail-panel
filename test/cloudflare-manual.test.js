@@ -19,6 +19,7 @@ function fixture({ mailClient = null } = {}) {
     secretsDir: path.join(root, 'secrets'),
     encryptionKeyPath: path.join(root, 'secrets', 'data.key'),
     cloudflareMaxBatchSize: 100,
+    cloudflareVerificationLookbackMs: 600000,
     exportMaxRows: 1000,
   };
   const store = new Store(path.join(root, 'panel.sqlite'));
@@ -141,6 +142,7 @@ test('Inbox check uses the saved signup window and stores only a safe encrypted 
     assert.equal(call.username, 'manualuser1');
     assert.equal(call.recipient, 'manualuser1@atomicmail.ai');
     assert.equal(call.submittedAt, checked.account.signup_done_at);
+    assert.equal(call.lookbackMs, 600000);
     assert.equal(call.priority, 'interactive');
     assert.equal(current.service.revealVerificationLink(account.id), 'https://dash.cloudflare.com/verify-email?token=trusted-secret');
     const raw = current.store.db.prepare(`
@@ -148,6 +150,14 @@ test('Inbox check uses the saved signup window and stores only a safe encrypted 
     `).get(account.id);
     assert.ok(raw.verification_url_ciphertext);
     assert.doesNotMatch(raw.verification_url_ciphertext, /trusted-secret/);
+    assert.throws(
+      () => current.service.markVerified(account.id),
+      (error) => error.statusCode === 409 && error.code === 'cloudflare_access_secrets_incomplete',
+    );
+    current.service.saveAccessSecrets(account.id, {
+      globalApiKey: 'cfk_LINK_TEST_abcdefghijklmnopqrstuvwxyz0123456789',
+      apiToken: 'cfat_LINK_TEST_abcdefghijklmnopqrstuvwxyz0123456789',
+    });
     const verified = current.service.markVerified(account.id);
     assert.equal(verified.account.status, 'verified');
     assert.ok(verified.account.verified_at);
@@ -211,7 +221,46 @@ test('Inbox check accepts a trusted Cloudflare login code without requiring a ve
     `).get(account.id);
     assert.ok(raw.verification_code_ciphertext);
     assert.doesNotMatch(raw.verification_code_ciphertext, /7286934/);
+    current.service.saveAccessSecrets(account.id, {
+      globalApiKey: 'cfk_CODE_TEST_abcdefghijklmnopqrstuvwxyz0123456789',
+      apiToken: 'cfut_CODE_TEST_abcdefghijklmnopqrstuvwxyz0123456789',
+    });
     assert.equal(current.service.markVerified(account.id).account.status, 'verified');
+  } finally {
+    current.close();
+  }
+});
+
+test('rechecking Inbox preserves previously stored verification link and code evidence', async () => {
+  let attempt = 0;
+  const current = fixture({
+    mailClient: {
+      async findCloudflareVerification() {
+        attempt += 1;
+        if (attempt === 1) {
+          return {
+            messageId: 'message-link', subject: 'Verify your email', receivedAt: new Date().toISOString(),
+            url: 'https://dash.cloudflare.com/verify-email?token=preserve-link', code: null,
+          };
+        }
+        return {
+          messageId: 'message-code', subject: 'Your login verification code', receivedAt: new Date().toISOString(),
+          url: null, code: '7654321',
+        };
+      },
+    },
+  });
+  try {
+    current.service.createBatch(['mbx_1']);
+    const account = current.service.getFocusAccount().account;
+    current.service.markSignupDone(account.id);
+    await current.service.checkInbox(account.id);
+    await current.service.checkInbox(account.id);
+    const updated = current.service.getAccount(account.id);
+    assert.equal(updated.has_verification_link, 1);
+    assert.equal(updated.has_verification_code, 1);
+    assert.equal(current.service.revealVerificationLink(account.id), 'https://dash.cloudflare.com/verify-email?token=preserve-link');
+    assert.equal(current.service.revealVerificationCode(account.id), '7654321');
   } finally {
     current.close();
   }
@@ -245,6 +294,14 @@ test('Cloudflare API key and API token are encrypted per account and included on
     assert.equal(exported[0].apiToken, apiToken);
     assert.throws(
       () => current.service.saveAccessSecrets(account.id, { globalApiKey: apiToken }),
+      (error) => error.code === 'cloudflare_secret_type_mismatch',
+    );
+    assert.throws(
+      () => current.service.saveAccessSecrets(account.id, { globalApiKey: 'cfut_WRONG_FIELD_abcdefghijklmnopqrstuvwxyz0123456789' }),
+      (error) => error.code === 'cloudflare_secret_type_mismatch',
+    );
+    assert.throws(
+      () => current.service.saveAccessSecrets(account.id, { apiToken: globalApiKey }),
       (error) => error.code === 'cloudflare_secret_type_mismatch',
     );
   } finally {

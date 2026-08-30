@@ -20,7 +20,7 @@ function config(root) {
     mailMaxTotalAttachmentBytes: 10485760, destinationPasswordMaxBytes: 1024,
     credentialsRoot: path.join(root, 'credentials'), runtimeCredentialsRoot: path.join(root, 'runtime'),
     secretsDir: path.join(root, 'secrets'), encryptionKeyPath: path.join(root, 'secrets', 'data.key'),
-    cloudflareEnabled: true, cloudflareMaxBatchSize: 100,
+    cloudflareEnabled: true, cloudflareMaxBatchSize: 100, cloudflareVerificationLookbackMs: 600000,
   };
 }
 
@@ -42,6 +42,7 @@ test('manual Cloudflare API protects secrets, transitions safely, exports explic
     async findCloudflareVerification(username, options) {
       assert.equal(username, 'mailboxapi1');
       assert.equal(options.recipient, 'mailboxapi1@atomicmail.ai');
+      assert.equal(options.lookbackMs, 600000);
       return {
         messageId: 'trusted-message', subject: 'Your login verification code', receivedAt: new Date().toISOString(),
         url: 'https://dash.cloudflare.com/verify-email?token=api-secret-link', code: '7286934',
@@ -91,18 +92,15 @@ test('manual Cloudflare API protects secrets, transitions safely, exports explic
 
     const globalApiKey = 'cfk_SERVER_TEST_abcdefghijklmnopqrstuvwxyz012345';
     const apiToken = 'cfat_SERVER_TEST_abcdefghijklmnopqrstuvwxyz0123456789';
-    const saveSecrets = await fetch(`${base}/api/cloudflare/accounts/${accountId}/access-secrets`, {
+    const saveGlobalKey = await fetch(`${base}/api/cloudflare/accounts/${accountId}/access-secrets`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ globalApiKey, apiToken }),
+      body: JSON.stringify({ globalApiKey }),
     });
-    assert.equal(saveSecrets.status, 200);
-    const savedAccount = (await saveSecrets.json()).account;
-    assert.equal(savedAccount.has_global_api_key, 1);
-    assert.equal(savedAccount.has_api_token, 1);
-    assert.doesNotMatch(JSON.stringify(savedAccount), /SERVER_TEST|ciphertext/);
-    const revealSecrets = await fetch(`${base}/api/cloudflare/accounts/${accountId}/access-secrets/reveal`, { method: 'POST', body: '{}' });
-    assert.equal(revealSecrets.status, 200);
-    assert.deepEqual(await revealSecrets.json(), { globalApiKey, apiToken });
+    assert.equal(saveGlobalKey.status, 200);
+    const partiallySavedAccount = (await saveGlobalKey.json()).account;
+    assert.equal(partiallySavedAccount.has_global_api_key, 1);
+    assert.equal(partiallySavedAccount.has_api_token, 0);
+    assert.doesNotMatch(JSON.stringify(partiallySavedAccount), /SERVER_TEST|ciphertext/);
 
     const inbox = await fetch(`${base}/api/cloudflare/accounts/${accountId}/check-inbox`, { method: 'POST', body: '{}' });
     assert.equal(inbox.status, 200);
@@ -116,6 +114,22 @@ test('manual Cloudflare API protects secrets, transitions safely, exports explic
     const code = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verification-code`, { method: 'POST', body: '{}' });
     assert.equal(code.status, 200);
     assert.equal((await code.json()).verificationCode, '7286934');
+
+    const incomplete = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verified`, { method: 'POST', body: '{}' });
+    assert.equal(incomplete.status, 409);
+    assert.equal((await incomplete.json()).code, 'cloudflare_access_secrets_incomplete');
+
+    const saveApiToken = await fetch(`${base}/api/cloudflare/accounts/${accountId}/access-secrets`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ apiToken }),
+    });
+    assert.equal(saveApiToken.status, 200);
+    const savedAccount = (await saveApiToken.json()).account;
+    assert.equal(savedAccount.has_global_api_key, 1);
+    assert.equal(savedAccount.has_api_token, 1);
+    const revealSecrets = await fetch(`${base}/api/cloudflare/accounts/${accountId}/access-secrets/reveal`, { method: 'POST', body: '{}' });
+    assert.equal(revealSecrets.status, 200);
+    assert.deepEqual(await revealSecrets.json(), { globalApiKey, apiToken });
 
     const verified = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verified`, { method: 'POST', body: '{}' });
     assert.equal(verified.status, 200);

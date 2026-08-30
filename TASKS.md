@@ -40,3 +40,4 @@
 | AM-36 | Manual Cloudflare Focus Assistant | ✅ Done — per-account encrypted random password, duplicate protection, durable resume, trusted Inbox verification, secure link/reveal/export, backup coverage |
 
 | AM-37 | Cloudflare Focus Assistant v2 | ✅ Done — direct code/link Inbox evidence, per-account encrypted Global API Key + API Token vault, secure export and 100-account Focus workflow |
+| AM-38 | Review hardening / completion integrity / source safety | ✅ Done — backend requires verification + both API credentials, bounded Inbox lookback and evidence preservation, live JMAP retry timers, cfut_ redaction, logout secret clearing, and plaintext source snapshots are blocked/purgeable |

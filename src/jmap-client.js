@@ -749,11 +749,16 @@ export class AtomicMailJmapClient {
     return this.listMailbox(username, { ...options, folder: 'inbox' });
   }
 
-  async findCloudflareVerification(username, { recipient, submittedAt, signal = null, priority = 'background' } = {}) {
-    const afterMs = Date.parse(submittedAt || '');
-    if (!Number.isFinite(afterMs)) {
+  async findCloudflareVerification(username, {
+    recipient, submittedAt, lookbackMs = 0, signal = null, priority = 'background',
+  } = {}) {
+    const submittedMs = Date.parse(submittedAt || '');
+    if (!Number.isFinite(submittedMs)) {
       throw new MailClientError('Cloudflare submission timestamp is invalid', { statusCode: 400, code: 'invalid_verification_window' });
     }
+    const safeLookbackMs = Math.min(3600000, Math.max(0, Number(lookbackMs) || 0));
+    const windowStartMs = submittedMs - safeLookbackMs;
+    const windowStart = new Date(windowStartMs).toISOString();
     const inboxMailboxId = this.legacyRunner
       ? '$INBOX_MAILBOX_ID'
       : await this.mailboxIdForRole(username, 'inbox', { signal, priority });
@@ -764,7 +769,7 @@ export class AtomicMailJmapClient {
           accountId: '$ACCOUNT_ID',
           filter: {
             inMailbox: inboxMailboxId,
-            after: new Date(afterMs).toISOString(),
+            after: windowStart,
           },
           sort: [{ property: 'receivedAt', isAscending: false }],
           limit: 20,
@@ -786,11 +791,11 @@ export class AtomicMailJmapClient {
       ops,
       signal,
       priority,
-      coalesceKey: priority === 'background' ? `cloudflare-verification:${new Date(afterMs).toISOString()}` : '',
+      coalesceKey: priority === 'background' ? `cloudflare-verification:${windowStart}` : '',
     });
     const payload = methodResponse(result, 'Email/get', 'cfg0') || {};
     const messages = Array.isArray(payload.list) ? payload.list.map(normalizedMessage) : [];
-    return selectCloudflareVerification(messages, { recipient, submittedAt });
+    return selectCloudflareVerification(messages, { recipient, submittedAt: windowStart });
   }
 
   async getMessage(username, messageId, { signal = null } = {}) {

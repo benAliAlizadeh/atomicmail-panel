@@ -33,10 +33,10 @@ function normalizeAccessSecret(value, kind) {
   if (text.length < 20 || text.length > 512 || /\s/.test(text)) {
     throw exposedError(`${kind} must be a single non-whitespace value between 20 and 512 characters`, 400, 'invalid_cloudflare_secret');
   }
-  if (kind === 'Global API Key' && text.startsWith('cfat_')) {
-    throw exposedError('The API Token was pasted into the Global API Key field', 400, 'cloudflare_secret_type_mismatch');
+  if (kind === 'Global API Key' && /^(?:cfat|cfut)_/i.test(text)) {
+    throw exposedError('An API Token was pasted into the Global API Key field', 400, 'cloudflare_secret_type_mismatch');
   }
-  if (kind === 'API Token' && text.startsWith('cfk_')) {
+  if (kind === 'API Token' && /^cfk_/i.test(text)) {
     throw exposedError('The Global API Key was pasted into the API Token field', 400, 'cloudflare_secret_type_mismatch');
   }
   return text;
@@ -497,6 +497,7 @@ export class CloudflareManualService {
     const found = await this.mailClient.findCloudflareVerification(account.username, {
       recipient: account.email,
       submittedAt: account.signup_done_at,
+      lookbackMs: Number(this.config.cloudflareVerificationLookbackMs || 0),
       signal,
       priority: 'interactive',
     });
@@ -538,8 +539,8 @@ export class CloudflareManualService {
     const receivedAt = found.receivedAt || now;
     this.db.prepare(`
       UPDATE cloudflare_accounts SET status='verification_received', verification_received_at=?,
-        verification_url_ciphertext=?,
-        verification_code_ciphertext=?,
+        verification_url_ciphertext=COALESCE(?, verification_url_ciphertext),
+        verification_code_ciphertext=COALESCE(?, verification_code_ciphertext),
         verification_message_id=?, verification_subject=?, last_inbox_check_at=?,
         last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=?
     `).run(
@@ -638,6 +639,13 @@ export class CloudflareManualService {
     const account = this.requireAccount(id);
     if (account.status !== 'verification_received' || (!account.has_verification_link && !account.has_verification_code)) {
       throw exposedError('A trusted Cloudflare verification code or link is required before Mark Verified', 409, 'cloudflare_verification_not_received');
+    }
+    if (!account.has_global_api_key || !account.has_api_token) {
+      throw exposedError(
+        'Save both the Cloudflare Global API Key and API Token before finishing this account',
+        409,
+        'cloudflare_access_secrets_incomplete',
+      );
     }
     const now = nowIso();
     this.db.prepare(`

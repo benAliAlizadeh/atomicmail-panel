@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-37)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-38)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -43,6 +43,8 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - on-demand trusted Cloudflare verification-email detection that returns either a login/security code or a strict Cloudflare HTTPS verification link directly in Focus Mode
 - per-account encrypted Cloudflare Global API Key + API Token vault with reveal/copy and explicit secure export
 - explicit password/code/link/key reveal and sensitive export; normal APIs, logs, audit, and ordinary exports stay secret-free
+- backend-enforced Cloudflare completion integrity: verification evidence plus both API credentials are required before an account can be finished
+- source-safety preflight that blocks legacy plaintext credential snapshots from verify/ZIP/commit workflows
 
 ## Local run on Windows / PowerShell
 
@@ -57,6 +59,13 @@ $env:Path = "C:\Program Files\nodejs;$env:Path"
 ```powershell
 npm.cmd run verify
 npm.cmd start
+```
+
+If this PowerShell session still cannot resolve `npm.cmd`, refresh PATH for that terminal or invoke the installed command directly:
+
+```powershell
+$env:Path = "C:\Program Files\nodejs;$env:Path"
+& "C:\Program Files\nodejs\npm.cmd" run verify
 ```
 
 Open:
@@ -130,7 +139,7 @@ The current Cloudflare workflow is intentionally simple and does not use Playwri
 2. The panel generates a different 20-character password for every email and encrypts it at rest.
 3. In **Cloudflare Accounts → Focus Mode**, copy the current email and password, then choose **Open Cloudflare Signup**.
 4. Complete signup yourself in the official Cloudflare page and return to choose **Signup Done**. This locks the password.
-5. Choose **Check Inbox & Get Code/Link**. The panel checks only that Atomic Mail inbox and only messages received after Signup Done.
+5. Choose **Check Inbox & Get Code/Link**. The panel checks only that Atomic Mail inbox and trusted Cloudflare messages addressed to that exact recipient. A bounded 10-minute lookback covers codes/links delivered just before you returned and clicked Signup Done; configure it with `CLOUDFLARE_VERIFICATION_LOOKBACK_SECONDS`.
 6. A trusted Cloudflare login/security code is shown directly with **Copy code**. If Cloudflare sent a verification link instead, **Open Verification Link** / **Copy Verification Link** appear.
 7. After Cloudflare shows the account as verified, paste its **Global API Key** and **API Token** into the Focus Mode vault and save them. Either field can be added/replaced later.
 8. Choose **Mark Verified & Next**. Focus Mode advances to the next unfinished account in the batch.
@@ -138,6 +147,8 @@ The current Cloudflare workflow is intentionally simple and does not use Playwri
 Focus Mode resumes from the first unfinished record after a restart. An email already present in `cloudflare_accounts` can never be selected again; the Mailboxes page shows its saved status and verification date. Password regeneration is allowed only before Signup Done. For batches up to 100 accounts, the current account remains the only operational focus and the next item is selected automatically after Verified/Failed.
 
 Normal account/list APIs never return passwords, verification codes/URLs, Global API Keys, or API Tokens. Reveal/copy and the separate `Email,Password,GlobalApiKey,ApiToken,Status` CSV use authenticated POST actions with `Cache-Control: no-store`; audit records contain the action but never the secret. The SQLite columns holding these values contain only account-bound AES-256-GCM ciphertext, so the existing encrypted backup/restore pipeline includes them automatically.
+
+The server—not only the browser button—refuses **Mark Verified & Next** until trusted verification evidence and both Cloudflare API credentials are present. Prefixed `cfk_` keys are rejected from the token field, and `cfat_` / `cfut_` tokens are rejected from the Global API Key field; legacy unprefixed credentials remain accepted for compatibility.
 
 ## Retired browser-runner workflow (historical reference)
 
@@ -178,6 +189,27 @@ Cloudflare browser cookies are encrypted only while an item is recoverable and a
 The panel supports queues of up to 100, but live rollout should begin with 1, then 3, then 5 accounts. A provider challenge or rate limit stops the workflow for review; the software cannot promise that Cloudflare will accept any particular volume.
 
 </details>
+
+
+## Source safety before ZIP / commit / Docker build
+
+Do not keep old plaintext migration snapshots inside the source tree. In particular, delete folders such as `data-before-am20/`; they can contain a real Atomic Mail API key and JWTs even though the current runtime vault is encrypted.
+
+PowerShell:
+
+```powershell
+& "C:\Program Files\nodejs\npm.cmd" run security:purge-legacy -- --confirm="DELETE LEGACY PLAINTEXT"
+& "C:\Program Files\nodejs\npm.cmd" run source:safety
+```
+
+Linux:
+
+```bash
+npm run security:purge-legacy -- --confirm="DELETE LEGACY PLAINTEXT"
+npm run source:safety
+```
+
+`npm run verify` now runs the normal preflight first; it permits the ignored local `.env` needed for development. **Before creating a source ZIP**, run `npm run source:safety:strict` (or the full-path `npm.cmd` equivalent on Windows) so a local `.env` is rejected too. The purge command only targets the fixed `data-before-am20/` directory and requires an exact confirmation phrase. `.gitignore` and `.dockerignore` also block legacy snapshots and plaintext `credentials.json` / JWT files as defense in depth. Runtime state remains under ignored `data/`, `secrets/`, and `backups/` paths. Any credential that was ever copied into a plaintext snapshot or shared ZIP must be treated as exposed and rotated/replaced.
 
 ## Restart and shutdown safety
 
@@ -316,7 +348,7 @@ AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox 
 
 The AM-33 production check also completed a read-only live JMAP smoke for both Inbox and Sent against a temporary copy of the existing vault. No message was sent, modified or deleted, and the source data directory was not migrated or rewritten by the smoke.
 
-AM-36 retires the live Browser Runner from runtime and the primary UI. Cloudflare work is now a durable manual assistant with one independently encrypted random password per account, Focus Mode resume, strict duplicate protection, on-demand trusted Inbox verification, and explicit secret reveal/export actions. AM-37 makes that assistant operationally useful: Check Inbox returns Cloudflare verification codes or safe links directly in Focus Mode, and each account gains an encrypted Global API Key + API Token vault that is included only in the explicit sensitive export.
+AM-36 retires the live Browser Runner from runtime and the primary UI. Cloudflare work is now a durable manual assistant with one independently encrypted random password per account, Focus Mode resume, strict duplicate protection, on-demand trusted Inbox verification, and explicit secret reveal/export actions. AM-37 makes that assistant operationally useful: Check Inbox returns Cloudflare verification codes or safe links directly in Focus Mode, and each account gains an encrypted Global API Key + API Token vault that is included only in the explicit sensitive export. AM-38 hardens completion integrity, adds a bounded pre-click verification lookback, preserves previously discovered code/link evidence across rechecks, keeps shared JMAP retry timers alive, clears browser secrets on logout, redacts Cloudflare user tokens, and blocks plaintext source snapshots.
 
 ## AM-20 — encrypted credential vault, backup and portability
 

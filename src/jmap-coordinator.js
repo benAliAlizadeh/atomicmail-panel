@@ -40,8 +40,10 @@ function isTransient(error) {
 function sleep(ms, signal) {
   if (signal?.aborted) return Promise.reject(abortError());
   return new Promise((resolve, reject) => {
+    // Keep retry/backoff timers referenced while a scheduled request is awaiting
+    // them. Unref'ing this timer lets short-lived callers (including tests and
+    // maintenance scripts) exit with an unresolved mail operation.
     const timer = setTimeout(done, Math.max(0, ms));
-    timer.unref?.();
     function done() {
       signal?.removeEventListener('abort', aborted);
       resolve();

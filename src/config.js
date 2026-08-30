@@ -112,6 +112,11 @@ export function loadConfig() {
     cloudflareWorkerPollMs: intEnv('CLOUDFLARE_WORKER_POLL_MS', 1000, 250, 60000),
     cloudflareEmailPollMs: intEnv('CLOUDFLARE_EMAIL_POLL_MS', 15000, 5000, 300000),
     cloudflareVerificationTimeoutMs: intEnv('CLOUDFLARE_VERIFICATION_TIMEOUT_MS', 300000, 60000, 86400000),
+    // In a manual flow the provider may deliver the code a few seconds before
+    // the operator returns and clicks "Signup Done". Search a bounded window
+    // before that click so valid evidence is not missed forever.
+    cloudflareVerificationLookbackMs:
+      intEnv('CLOUDFLARE_VERIFICATION_LOOKBACK_SECONDS', 600, 0, 3600) * 1000,
     cloudflareRunnerLeaseMs: intEnv('CLOUDFLARE_RUNNER_LEASE_MS', 60000, 15000, 300000),
     cloudflareRunnerOfflineMs: intEnv('CLOUDFLARE_RUNNER_OFFLINE_MS', 45000, 10000, 300000),
     cloudflarePairingTtlMs: intEnv('CLOUDFLARE_PAIRING_TTL_MS', 600000, 60000, 3600000),
