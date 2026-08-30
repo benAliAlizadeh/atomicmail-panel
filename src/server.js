@@ -223,7 +223,7 @@ function exportFilename(extension) {
 
 function serveStatic(res, filename, type) {
   const file = path.join(publicDir, filename);
-  return text(res, 200, fs.readFileSync(file), type, { 'cache-control': 'no-cache' });
+  return text(res, 200, fs.readFileSync(file), type, { 'cache-control': 'no-store' });
 }
 
 export function createServer({

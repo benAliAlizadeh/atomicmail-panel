@@ -7,6 +7,8 @@ import { Store } from '../src/db.js';
 import { createServer } from '../src/server.js';
 import { CredentialVault } from '../src/credential-vault.js';
 
+const packageVersion = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+
 function makeConfig(root, adminPassword = '') {
   return {
     workerEnabled: false,
@@ -142,6 +144,16 @@ test('health is minimal and browser security headers are present', async () => {
     assert.deepEqual(await response.json(), { ok: true });
     assert.equal(response.headers.get('x-frame-options'), 'DENY');
     assert.match(response.headers.get('content-security-policy') || '', /default-src 'self'/);
+  });
+});
+
+test('operator UI assets are never served from a stale cache', async () => {
+  await withServer('', async ({ base }) => {
+    for (const pathname of ['/', `/styles.css?v=${packageVersion}`, `/app.js?v=${packageVersion}`]) {
+      const response = await fetch(`${base}${pathname}`);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+    }
   });
 });
 

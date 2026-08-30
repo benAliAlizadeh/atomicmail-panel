@@ -44,6 +44,8 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - per-account encrypted Cloudflare Global API Key + API Token vault with reveal/copy and explicit secure export
 - explicit password/code/link/key reveal and sensitive export; normal APIs, logs, audit, and ordinary exports stay secret-free
 - backend-enforced Cloudflare completion integrity: verification evidence plus both API credentials are required before an account can be finished
+- operator-guided Cloudflare steps: the primary action points to the next missing requirement, credentials remain visible immediately after save for the current session, and saved values can be shown/copied explicitly after refresh
+- cache-busted, `no-store` operator assets so a deployment cannot leave the browser on an older Focus Mode UI
 - source-safety preflight that blocks legacy plaintext credential snapshots from verify/ZIP/commit workflows
 
 ## Local run on Windows / PowerShell
@@ -350,7 +352,9 @@ The AM-33 production check also completed a read-only live JMAP smoke for both I
 
 AM-36 retires the live Browser Runner from runtime and the primary UI. Cloudflare work is now a durable manual assistant with one independently encrypted random password per account, Focus Mode resume, strict duplicate protection, on-demand trusted Inbox verification, and explicit secret reveal/export actions. AM-37 makes that assistant operationally useful: Check Inbox returns Cloudflare verification codes or safe links directly in Focus Mode, and each account gains an encrypted Global API Key + API Token vault that is included only in the explicit sensitive export. AM-38 hardens completion integrity, adds a bounded pre-click verification lookback, preserves previously discovered code/link evidence across rechecks, keeps shared JMAP retry timers alive, clears browser secrets on logout, redacts Cloudflare user tokens, and blocks plaintext source snapshots.
 
-Version 0.11.1 starts Phase B live-validation hardening. An empty Inbox recheck after trusted evidence has already been stored now preserves both the encrypted evidence and the `verification_received` workflow state. Startup repairs any AM-38 records already left in the inconsistent waiting state, and the backend completion guard validates durable evidence rather than depending on that transient status alone. The next rollout step is one real Cloudflare account end-to-end before any scale increase.
+Version 0.11.1 starts Phase B live-validation hardening. An empty Inbox recheck after trusted evidence has already been stored now preserves both the encrypted evidence and the `verification_received` workflow state. Startup repairs any AM-38 records already left in the inconsistent waiting state, and the backend completion guard validates durable evidence rather than depending on that transient status alone.
+
+Version 0.11.2 applies the first real-use UX findings without changing the database or secret model. Focus Mode now always states the next required action, **Continue setup** scrolls to and focuses the missing step, saved credential values remain visible immediately after a successful save in the current browser session, and refresh/account-change/logout hides them again until an explicit reveal. Copy actions no longer reveal values on screen as a side effect. Versioned asset URLs plus `Cache-Control: no-store` prevent stale pre-deploy UI from hiding newly added controls.
 
 ## AM-20 — encrypted credential vault, backup and portability
 

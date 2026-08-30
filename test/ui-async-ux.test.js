@@ -41,7 +41,8 @@ test('Cloudflare manual assistant exposes simple Focus Mode and keeps runner con
   assert.match(primaryCloudflare, /Signup Done/);
   assert.match(primaryCloudflare, /Check Inbox/);
   assert.match(primaryCloudflare, /Open Verification Link/);
-  assert.match(primaryCloudflare, /Mark Verified &amp; Next/);
+  assert.match(primaryCloudflare, /Continue setup/);
+  assert.match(app, /Mark Verified & Next/);
   assert.doesNotMatch(primaryCloudflare, /Runner|Pairing|Playwright/);
   assert.match(app, /selectedCloudflareMailboxIds: new Set/);
   assert.match(app, /loadManualCloudflare\(\{ background = false/);
@@ -57,4 +58,23 @@ test('Cloudflare manual assistant exposes simple Focus Mode and keeps runner con
   assert.match(app, /\/api\/cloudflare\/eligible-mailboxes/);
   assert.match(styles, /\.cloudflare-focus-panel/);
   assert.match(styles, /\.pill\.verification_received/);
+});
+
+test('Cloudflare credential UX keeps the operator oriented without weakening secret boundaries', () => {
+  const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.match(html, new RegExp(`/styles\\.css\\?v=${pkg.version.replaceAll('.', '\\.')}`));
+  assert.match(html, new RegExp(`/app\\.js\\?v=${pkg.version.replaceAll('.', '\\.')}`));
+  assert.match(html, /id="manualCloudflareNextAction"[^>]+role="status"[^>]+aria-live="polite"/);
+  assert.match(html, /id="manualCloudflareCredentialStep"[^>]+tabindex="-1"/);
+  assert.match(html, /Save \/ update credentials/);
+  assert.match(html, /Show saved values/);
+  assert.match(html, /id="manualCloudflareFinishStep"[^>]+tabindex="-1"/);
+  assert.match(app, /function setManualCloudflareAccessSecretsVisible/);
+  assert.match(app, /function guideManualCloudflareStep/);
+  assert.match(app, /Saved: cfk_••••••••••••/);
+  assert.match(app, /finishButton\.textContent = verified \? 'Verified'.*workflowReady \? 'Mark Verified & Next' : 'Continue setup'/);
+  assert.match(app, /Credentials saved\. Next: Mark Verified & Next\./);
+  assert.match(app, /fetchManualCloudflareAccessSecrets\(\)\)\.globalApiKey/);
+  assert.match(styles, /\.focus-next-action/);
+  assert.match(styles, /\.focus-attention/);
 });

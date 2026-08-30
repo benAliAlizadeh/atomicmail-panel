@@ -46,6 +46,6 @@
 
 | Phase | Status | Scope |
 |---|---|---|
-| Phase A — Production / Current Version | ✅ Complete | 0.11.0 production baseline; 0.11.1 is the Phase B hardening candidate |
-| Phase B — End-to-End Live Validation | 🟡 In progress | Recheck now preserves durable verification state, startup repairs affected AM-38 records, and backend completion accepts preserved trusted evidence; real 1-account Cloudflare E2E is next |
-| Phase C — Scale & UX Polish | ⏳ Pending | 3-account → 5-account → larger-batch validation, then polish only issues observed in real use |
+| Phase A — Production / Current Version | ✅ Complete | 0.11.1 is deployed and healthy in production |
+| Phase B — End-to-End Live Validation | 🟡 In progress | The first real account exposed credential-step confusion; 0.11.2 adds clear next-step guidance, visible-after-save values for the current session, safe reveal/copy, guided completion, and stale-UI prevention |
+| Phase C — Scale & UX Polish | ⏳ Pending | Continue the real 1-account flow, then 3-account → 5-account → larger-batch validation |

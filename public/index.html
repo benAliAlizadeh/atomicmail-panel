@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="color-scheme" content="light" />
   <title>AtomicMail Panel</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=0.11.2" />
 </head>
 <body>
   <div id="authGate" class="auth-gate" hidden>
@@ -181,11 +181,12 @@
               </div>
             </div>
             <p id="manualCloudflarePasswordLocked" class="muted warning-note" hidden>Password is locked because Signup Done was recorded.</p>
-            <div class="focus-primary-actions">
+            <div id="manualCloudflareSignupStep" class="focus-primary-actions" tabindex="-1">
               <button id="openManualCloudflareSignup" class="btn primary" type="button">Open Cloudflare Signup</button>
               <button id="markManualCloudflareSignupDone" class="btn ghost" type="button">Signup Done</button>
             </div>
             <ol id="manualCloudflareTimeline" class="cloudflare-timeline simple-timeline"></ol>
+            <div id="manualCloudflareNextAction" class="focus-next-action" role="status" aria-live="polite"></div>
             <div id="manualCloudflareFocusMessage" class="banner warning" role="status" aria-live="polite" hidden></div>
             <div id="manualCloudflareVerificationEvidence" class="focus-evidence" hidden>
               <div class="focus-evidence-head"><div><strong>Cloudflare verification found</strong><small id="manualCloudflareVerificationSubject" class="muted"></small></div><span id="manualCloudflareVerificationReceivedAt" class="muted"></span></div>
@@ -199,27 +200,36 @@
                 <button id="copyManualCloudflareVerifyLink" class="btn ghost" type="button">Copy Verification Link</button>
               </div>
             </div>
-            <div class="focus-workflow-actions">
+            <div id="manualCloudflareInboxStep" class="focus-workflow-actions" tabindex="-1">
               <button id="checkManualCloudflareInbox" class="btn ghost" type="button">Check Inbox &amp; Get Code/Link</button>
             </div>
-            <div class="focus-secret-vault">
-              <div class="focus-secret-vault-head"><div><h3>Cloudflare API credentials</h3><p class="muted">Paste the two credentials after you create them. They are encrypted per account and included only in the explicit secure export.</p></div><div id="manualCloudflareApiSecretBadges" class="chips"></div></div>
-              <label>Global API Key
-                <input id="manualCloudflareGlobalApiKey" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="cfk_..." />
+            <div id="manualCloudflareCredentialStep" class="focus-secret-vault" tabindex="-1">
+              <div class="focus-secret-vault-head">
+                <div><span class="focus-step-kicker">Step 4 of 5</span><h3>Save Cloudflare API credentials</h3><p class="muted">Paste the Global API Key and API Token created in Cloudflare. They stay encrypted and can be shown or copied when needed.</p></div>
+                <div id="manualCloudflareApiSecretBadges" class="chips"></div>
+              </div>
+              <div id="manualCloudflareCredentialGuide" class="focus-secret-guide" role="status" aria-live="polite"></div>
+              <label class="focus-secret-field">
+                <span class="focus-secret-label">Global API Key <span id="manualCloudflareGlobalApiKeyStatus" class="mini-status">Required</span></span>
+                <input id="manualCloudflareGlobalApiKey" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste Global API Key (cfk_...)" aria-describedby="manualCloudflareGlobalApiKeyHint" />
+                <small id="manualCloudflareGlobalApiKeyHint" class="muted">Required before this account can be completed.</small>
               </label>
-              <label>API Token
-                <input id="manualCloudflareApiToken" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="cfat_... or cfut_..." />
+              <label class="focus-secret-field">
+                <span class="focus-secret-label">API Token <span id="manualCloudflareApiTokenStatus" class="mini-status">Required</span></span>
+                <input id="manualCloudflareApiToken" type="password" maxlength="512" autocomplete="new-password" autocapitalize="none" spellcheck="false" placeholder="Paste API Token (cfat_... or cfut_...)" aria-describedby="manualCloudflareApiTokenHint" />
+                <small id="manualCloudflareApiTokenHint" class="muted">Required before this account can be completed.</small>
               </label>
               <div class="button-row">
-                <button id="saveManualCloudflareAccessSecrets" class="btn primary small-btn" type="button">Save API credentials</button>
-                <button id="revealManualCloudflareAccessSecrets" class="btn ghost small-btn" type="button">Reveal saved keys</button>
-                <button id="copyManualCloudflareGlobalApiKey" class="btn ghost small-btn" type="button">Copy API Key</button>
+                <button id="saveManualCloudflareAccessSecrets" class="btn primary small-btn" type="button">Save / update credentials</button>
+                <button id="revealManualCloudflareAccessSecrets" class="btn ghost small-btn" type="button" aria-pressed="false">Show saved values</button>
+                <button id="copyManualCloudflareGlobalApiKey" class="btn ghost small-btn" type="button">Copy Global API Key</button>
                 <button id="copyManualCloudflareApiToken" class="btn ghost small-btn" type="button">Copy API Token</button>
               </div>
+              <p id="manualCloudflareSecretVisibilityHint" class="muted focus-secret-visibility">Saved values are hidden after refresh, account change, or logout. Use Show saved values when needed.</p>
             </div>
-            <div class="focus-finish-action">
-              <button id="markManualCloudflareVerified" class="btn primary" type="button">Mark Verified &amp; Next</button>
-              <span id="manualCloudflareFinishHint" class="muted"></span>
+            <div id="manualCloudflareFinishStep" class="focus-finish-action" tabindex="-1">
+              <div><strong>Step 5 of 5 — Finish this account</strong><span id="manualCloudflareFinishHint" class="muted"></span></div>
+              <button id="markManualCloudflareVerified" class="btn primary" type="button">Continue setup</button>
             </div>
             <label class="focus-notes">Notes<textarea id="manualCloudflareNotes" rows="3" maxlength="8000" placeholder="Optional notes for this account"></textarea></label>
             <div class="button-row focus-footer-actions">
@@ -424,6 +434,6 @@
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=0.11.2" defer></script>
 </body>
 </html>
