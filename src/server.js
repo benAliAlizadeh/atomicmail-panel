@@ -117,9 +117,9 @@ function sensitiveMailboxesCsv(items) {
 }
 
 function cloudflareAccountsCsv(items) {
-  const rows = [['Email', 'Password', 'Status'].map(csvCell).join(',')];
+  const rows = [['Email', 'Password', 'GlobalApiKey', 'ApiToken', 'Status'].map(csvCell).join(',')];
   for (const item of items) {
-    rows.push([item.email, item.password, item.status].map(csvCell).join(','));
+    rows.push([item.email, item.password, item.globalApiKey, item.apiToken, item.status].map(csvCell).join(','));
   }
   return `${rows.join('\r\n')}\r\n`;
 }
@@ -433,6 +433,37 @@ export function createServer({
         const verificationUrl = cloudflareManualService.revealVerificationLink(account.id);
         store.audit('warn', 'cloudflare.verification_link_revealed', 'Cloudflare verification link revealed by operator', account.job_id);
         return json(res, 200, { verificationUrl });
+      }
+
+      const cloudflareVerificationCode = routeMatch(pathname, '/api/cloudflare/accounts/:id/verification-code');
+      if (req.method === 'POST' && cloudflareVerificationCode) {
+        if (!cloudflareManualService) return json(res, 503, { error: 'Cloudflare manual assistant is unavailable' });
+        const account = cloudflareManualService.getAccount(cloudflareVerificationCode.id);
+        if (!account) return json(res, 404, { error: 'Cloudflare account record was not found' });
+        const verificationCode = cloudflareManualService.revealVerificationCode(account.id);
+        store.audit('warn', 'cloudflare.verification_code_revealed', 'Cloudflare verification code revealed by operator', account.job_id);
+        return json(res, 200, { verificationCode });
+      }
+
+      const cloudflareAccessSecrets = routeMatch(pathname, '/api/cloudflare/accounts/:id/access-secrets');
+      if (req.method === 'POST' && cloudflareAccessSecrets) {
+        if (!cloudflareManualService) return json(res, 503, { error: 'Cloudflare manual assistant is unavailable' });
+        const body = await readJson(req, 4096);
+        const account = cloudflareManualService.saveAccessSecrets(cloudflareAccessSecrets.id, {
+          globalApiKey: Object.hasOwn(body, 'globalApiKey') ? body.globalApiKey : undefined,
+          apiToken: Object.hasOwn(body, 'apiToken') ? body.apiToken : undefined,
+        });
+        return json(res, 200, { account });
+      }
+
+      const cloudflareRevealAccessSecrets = routeMatch(pathname, '/api/cloudflare/accounts/:id/access-secrets/reveal');
+      if (req.method === 'POST' && cloudflareRevealAccessSecrets) {
+        if (!cloudflareManualService) return json(res, 503, { error: 'Cloudflare manual assistant is unavailable' });
+        const account = cloudflareManualService.getAccount(cloudflareRevealAccessSecrets.id);
+        if (!account) return json(res, 404, { error: 'Cloudflare account record was not found' });
+        const secrets = cloudflareManualService.revealAccessSecrets(account.id);
+        store.audit('warn', 'cloudflare.access_secrets_revealed', 'Cloudflare access secrets revealed by operator', account.job_id);
+        return json(res, 200, secrets);
       }
 
       const verifiedCloudflareAccount = routeMatch(pathname, '/api/cloudflare/accounts/:id/verified');

@@ -29,8 +29,10 @@ export function redactSecrets(input) {
     .replace(/Authorization\s*:\s*Bearer\s+[^\s"']+/gi, 'Authorization: Bearer [REDACTED]')
     .replace(/\beyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g, '[JWT_REDACTED]')
     .replace(/\bam_[a-zA-Z0-9_-]{8,}\b/g, '[API_KEY_REDACTED]')
+    .replace(/\bcfk_[a-zA-Z0-9_-]{8,}\b/g, '[CLOUDFLARE_API_KEY_REDACTED]')
+    .replace(/\bcfat_[a-zA-Z0-9_-]{8,}\b/g, '[CLOUDFLARE_API_TOKEN_REDACTED]')
     .replace(/("apiKey"\s*:\s*")[^"]+("\s*)/gi, '$1[REDACTED]$2')
-    .replace(/("(?:destinationPassword|destination_password|destination_password_ciphertext|password)"\s*:\s*")[^"]*("\s*)/gi, '$1[REDACTED]$2')
+    .replace(/("(?:globalApiKey|apiToken|destinationPassword|destination_password|destination_password_ciphertext|password)"\s*:\s*")[^"]*("\s*)/gi, '$1[REDACTED]$2')
     .replace(/(?:[a-z]:)?[^\s"']*[\\/]credentials[\\/][^\s"']+/gi, '[CREDENTIAL_PATH_REDACTED]')
     .replace(/(?:[a-z]:)?[^\s"']*[\\/]secrets[\\/]data\.key/gi, '[DATA_KEY_PATH_REDACTED]');
 }

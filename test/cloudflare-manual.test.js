@@ -179,6 +179,79 @@ test('unsafe verification links are rejected and never persisted', async () => {
   }
 });
 
+test('Inbox check accepts a trusted Cloudflare login code without requiring a verification link', async () => {
+  const current = fixture({
+    mailClient: {
+      async findCloudflareVerification() {
+        return {
+          messageId: 'message-code',
+          subject: 'Your login verification code',
+          receivedAt: new Date().toISOString(),
+          code: '7286934',
+          url: null,
+        };
+      },
+    },
+  });
+  try {
+    current.service.createBatch(['mbx_1']);
+    const account = current.service.getFocusAccount().account;
+    current.service.markSignupDone(account.id);
+    const checked = await current.service.checkInbox(account.id);
+    assert.equal(checked.found, true);
+    assert.equal(checked.evidence.verificationCode, '7286934');
+    assert.equal(checked.evidence.verificationUrl, null);
+    assert.equal(checked.account.status, 'verification_received');
+    assert.equal(checked.account.has_verification_code, 1);
+    assert.equal(checked.account.has_verification_link, 0);
+    assert.equal(checked.account.verification_subject, 'Your login verification code');
+    assert.equal(current.service.revealVerificationCode(account.id), '7286934');
+    const raw = current.store.db.prepare(`
+      SELECT verification_code_ciphertext FROM cloudflare_accounts WHERE id=?
+    `).get(account.id);
+    assert.ok(raw.verification_code_ciphertext);
+    assert.doesNotMatch(raw.verification_code_ciphertext, /7286934/);
+    assert.equal(current.service.markVerified(account.id).account.status, 'verified');
+  } finally {
+    current.close();
+  }
+});
+
+test('Cloudflare API key and API token are encrypted per account and included only in explicit secret output', () => {
+  const current = fixture();
+  try {
+    current.service.createBatch(['mbx_1']);
+    const account = current.service.getFocusAccount().account;
+    const globalApiKey = 'cfk_TESTGlobalApiKey_abcdefghijklmnopqrstuvwxyz012345';
+    const apiToken = 'cfat_TESTApiToken_abcdefghijklmnopqrstuvwxyz0123456789';
+    const saved = current.service.saveAccessSecrets(account.id, { globalApiKey, apiToken });
+    assert.equal(saved.has_global_api_key, 1);
+    assert.equal(saved.has_api_token, 1);
+    assert.doesNotMatch(JSON.stringify(saved), /TESTGlobalApiKey|TESTApiToken|global_api_key_ciphertext|api_token_ciphertext/);
+    assert.deepEqual(current.service.revealAccessSecrets(account.id), { globalApiKey, apiToken });
+
+    const raw = current.store.db.prepare(`
+      SELECT global_api_key_ciphertext, api_token_ciphertext FROM cloudflare_accounts WHERE id=?
+    `).get(account.id);
+    assert.ok(raw.global_api_key_ciphertext);
+    assert.ok(raw.api_token_ciphertext);
+    assert.doesNotMatch(raw.global_api_key_ciphertext, /TESTGlobalApiKey/);
+    assert.doesNotMatch(raw.api_token_ciphertext, /TESTApiToken/);
+
+    const publicRows = current.service.listAccounts({ limit: 10 });
+    assert.doesNotMatch(JSON.stringify(publicRows), /TESTGlobalApiKey|TESTApiToken|ciphertext/);
+    const exported = current.service.exportSensitive();
+    assert.equal(exported[0].globalApiKey, globalApiKey);
+    assert.equal(exported[0].apiToken, apiToken);
+    assert.throws(
+      () => current.service.saveAccessSecrets(account.id, { globalApiKey: apiToken }),
+      (error) => error.code === 'cloudflare_secret_type_mismatch',
+    );
+  } finally {
+    current.close();
+  }
+});
+
 test('legacy runner records migrate additively without changing a used external password', () => {
   const current = fixture();
   try {
@@ -245,8 +318,9 @@ test('pre-assistant databases receive additive account columns without deleting 
     const columns = new Set(migrated.db.prepare('PRAGMA table_info(cloudflare_accounts)').all().map((row) => row.name));
     for (const column of [
       'password_ciphertext', 'notes', 'signup_done_at', 'verification_received_at',
-      'verification_url_ciphertext', 'last_inbox_check_at', 'failed_at',
-      'password_locked_at', 'workflow_mode',
+      'verification_url_ciphertext', 'verification_code_ciphertext', 'verification_message_id',
+      'verification_subject', 'global_api_key_ciphertext', 'api_token_ciphertext', 'secrets_updated_at',
+      'last_inbox_check_at', 'failed_at', 'password_locked_at', 'workflow_mode',
     ]) assert.equal(columns.has(column), true, `missing additive column ${column}`);
     const row = migrated.db.prepare('SELECT id, email, status, notes, workflow_mode FROM cloudflare_accounts').get();
     assert.deepEqual({ ...row }, {

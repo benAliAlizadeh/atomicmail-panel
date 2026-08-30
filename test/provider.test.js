@@ -35,9 +35,11 @@ test('classifies policy/abuse protection', () => {
 });
 
 test('redacts API keys and JWTs', () => {
-  const raw = 'apiKey am_abcdefghijklmnop token eyJabc.def.ghi Authorization: Bearer abc123';
+  const raw = 'apiKey am_abcdefghijklmnop cfk_TEST_secret_abcdefghijklmnop cfat_TEST_token_abcdefghijklmnop token eyJabc.def.ghi Authorization: Bearer abc123';
   const safe = redactSecrets(raw);
   assert.ok(!safe.includes('am_abcdefghijklmnop'));
+  assert.ok(!safe.includes('cfk_TEST_secret_abcdefghijklmnop'));
+  assert.ok(!safe.includes('cfat_TEST_token_abcdefghijklmnop'));
   assert.ok(!safe.includes('eyJabc.def.ghi'));
   assert.ok(!safe.includes('abc123'));
 });

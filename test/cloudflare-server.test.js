@@ -43,8 +43,8 @@ test('manual Cloudflare API protects secrets, transitions safely, exports explic
       assert.equal(username, 'mailboxapi1');
       assert.equal(options.recipient, 'mailboxapi1@atomicmail.ai');
       return {
-        messageId: 'trusted-message', receivedAt: new Date().toISOString(),
-        url: 'https://dash.cloudflare.com/verify-email?token=api-secret-link',
+        messageId: 'trusted-message', subject: 'Your login verification code', receivedAt: new Date().toISOString(),
+        url: 'https://dash.cloudflare.com/verify-email?token=api-secret-link', code: '7286934',
       };
     },
   };
@@ -89,14 +89,33 @@ test('manual Cloudflare API protects secrets, transitions safely, exports explic
     const locked = await fetch(`${base}/api/cloudflare/accounts/${accountId}/regenerate-password`, { method: 'POST', body: '{}' });
     assert.equal(locked.status, 409);
 
+    const globalApiKey = 'cfk_SERVER_TEST_abcdefghijklmnopqrstuvwxyz012345';
+    const apiToken = 'cfat_SERVER_TEST_abcdefghijklmnopqrstuvwxyz0123456789';
+    const saveSecrets = await fetch(`${base}/api/cloudflare/accounts/${accountId}/access-secrets`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ globalApiKey, apiToken }),
+    });
+    assert.equal(saveSecrets.status, 200);
+    const savedAccount = (await saveSecrets.json()).account;
+    assert.equal(savedAccount.has_global_api_key, 1);
+    assert.equal(savedAccount.has_api_token, 1);
+    assert.doesNotMatch(JSON.stringify(savedAccount), /SERVER_TEST|ciphertext/);
+    const revealSecrets = await fetch(`${base}/api/cloudflare/accounts/${accountId}/access-secrets/reveal`, { method: 'POST', body: '{}' });
+    assert.equal(revealSecrets.status, 200);
+    assert.deepEqual(await revealSecrets.json(), { globalApiKey, apiToken });
+
     const inbox = await fetch(`${base}/api/cloudflare/accounts/${accountId}/check-inbox`, { method: 'POST', body: '{}' });
     assert.equal(inbox.status, 200);
     assert.equal((await inbox.json()).found, true);
     const normalAccounts = await (await fetch(`${base}/api/cloudflare/accounts`)).json();
-    assert.doesNotMatch(JSON.stringify(normalAccounts), /api-secret-link|password_ciphertext|verification_url_ciphertext/);
+    assert.doesNotMatch(JSON.stringify(normalAccounts), /api-secret-link|SERVER_TEST|password_ciphertext|verification_url_ciphertext|verification_code_ciphertext|global_api_key_ciphertext|api_token_ciphertext/);
     const link = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verification-link`, { method: 'POST', body: '{}' });
     assert.equal(link.status, 200);
     assert.equal((await link.json()).verificationUrl, 'https://dash.cloudflare.com/verify-email?token=api-secret-link');
+
+    const code = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verification-code`, { method: 'POST', body: '{}' });
+    assert.equal(code.status, 200);
+    assert.equal((await code.json()).verificationCode, '7286934');
 
     const verified = await fetch(`${base}/api/cloudflare/accounts/${accountId}/verified`, { method: 'POST', body: '{}' });
     assert.equal(verified.status, 200);
@@ -120,12 +139,14 @@ test('manual Cloudflare API protects secrets, transitions safely, exports explic
     assert.equal(exportResponse.status, 200);
     assert.match(exportResponse.headers.get('cache-control') || '', /no-store/);
     const csv = await exportResponse.text();
-    assert.match(csv, /^"Email","Password","Status"/);
+    assert.match(csv, /^"Email","Password","GlobalApiKey","ApiToken","Status"/);
     assert.ok(csv.includes(regeneratedPassword));
+    assert.ok(csv.includes(globalApiKey));
+    assert.ok(csv.includes(apiToken));
 
     const auditJson = JSON.stringify(store.recentAudit(100));
     assert.equal(auditJson.includes(regeneratedPassword), false);
-    assert.doesNotMatch(auditJson, /api-secret-link/);
+    assert.doesNotMatch(auditJson, /api-secret-link|SERVER_TEST/);
     const runner = await fetch(`${base}/api/cloudflare/runner/tasks/next?wait=0`);
     assert.equal(runner.status, 410);
   } finally {

@@ -38,3 +38,5 @@
 | AM-34 | Responsive Operator UX | ✅ Done — end-to-end stale read cancellation, adaptive polling, progress/elapsed states, guarded Compose delivery and accessible async feedback |
 | AM-35 | Cloudflare Browser Runner (legacy) | ⚠️ Retired — retained only for additive migration compatibility; not started or exposed in the main UX |
 | AM-36 | Manual Cloudflare Focus Assistant | ✅ Done — per-account encrypted random password, duplicate protection, durable resume, trusted Inbox verification, secure link/reveal/export, backup coverage |
+
+| AM-37 | Cloudflare Focus Assistant v2 | ✅ Done — direct code/link Inbox evidence, per-account encrypted Global API Key + API Token vault, secure export and 100-account Focus workflow |

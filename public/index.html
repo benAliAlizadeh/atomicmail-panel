@@ -187,11 +187,39 @@
             </div>
             <ol id="manualCloudflareTimeline" class="cloudflare-timeline simple-timeline"></ol>
             <div id="manualCloudflareFocusMessage" class="banner warning" hidden></div>
+            <div id="manualCloudflareVerificationEvidence" class="focus-evidence" hidden>
+              <div class="focus-evidence-head"><div><strong>Cloudflare verification found</strong><small id="manualCloudflareVerificationSubject" class="muted"></small></div><span id="manualCloudflareVerificationReceivedAt" class="muted"></span></div>
+              <div id="manualCloudflareVerificationCodeRow" class="focus-credential compact" hidden>
+                <span class="focus-label">Verification code</span>
+                <strong id="manualCloudflareVerificationCode" class="mono verification-code">••••••</strong>
+                <button id="copyManualCloudflareVerificationCode" class="btn ghost small-btn" type="button">Copy code</button>
+              </div>
+              <div id="manualCloudflareVerificationLinkRow" class="focus-evidence-actions" hidden>
+                <button id="openManualCloudflareVerifyLink" class="btn ghost" type="button">Open Verification Link</button>
+                <button id="copyManualCloudflareVerifyLink" class="btn ghost" type="button">Copy Verification Link</button>
+              </div>
+            </div>
             <div class="focus-workflow-actions">
-              <button id="checkManualCloudflareInbox" class="btn ghost" type="button">Check Inbox</button>
-              <button id="openManualCloudflareVerifyLink" class="btn ghost" type="button">Open Verification Link</button>
-              <button id="copyManualCloudflareVerifyLink" class="btn ghost" type="button">Copy Verification Link</button>
+              <button id="checkManualCloudflareInbox" class="btn ghost" type="button">Check Inbox &amp; Get Code/Link</button>
+            </div>
+            <div class="focus-secret-vault">
+              <div class="focus-secret-vault-head"><div><h3>Cloudflare API credentials</h3><p class="muted">Paste the two credentials after you create them. They are encrypted per account and included only in the explicit secure export.</p></div><div id="manualCloudflareApiSecretBadges" class="chips"></div></div>
+              <label>Global API Key
+                <input id="manualCloudflareGlobalApiKey" type="password" maxlength="512" autocomplete="off" placeholder="cfk_..." />
+              </label>
+              <label>API Token
+                <input id="manualCloudflareApiToken" type="password" maxlength="512" autocomplete="off" placeholder="cfat_..." />
+              </label>
+              <div class="button-row">
+                <button id="saveManualCloudflareAccessSecrets" class="btn primary small-btn" type="button">Save API credentials</button>
+                <button id="revealManualCloudflareAccessSecrets" class="btn ghost small-btn" type="button">Reveal saved keys</button>
+                <button id="copyManualCloudflareGlobalApiKey" class="btn ghost small-btn" type="button">Copy API Key</button>
+                <button id="copyManualCloudflareApiToken" class="btn ghost small-btn" type="button">Copy API Token</button>
+              </div>
+            </div>
+            <div class="focus-finish-action">
               <button id="markManualCloudflareVerified" class="btn primary" type="button">Mark Verified &amp; Next</button>
+              <span id="manualCloudflareFinishHint" class="muted"></span>
             </div>
             <label class="focus-notes">Notes<textarea id="manualCloudflareNotes" rows="3" maxlength="8000" placeholder="Optional notes for this account"></textarea></label>
             <div class="button-row focus-footer-actions">
@@ -215,7 +243,7 @@
             </select>
             <button class="btn ghost small-btn" type="submit">Apply</button>
           </form>
-          <div class="table-wrap"><table><thead><tr><th>Email</th><th>Password</th><th>Status</th><th>Verified at</th><th>Notes</th></tr></thead><tbody id="manualCloudflareAccountsBody"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Email</th><th>Password</th><th>API credentials</th><th>Status</th><th>Verified at</th><th>Notes</th></tr></thead><tbody id="manualCloudflareAccountsBody"></tbody></table></div>
           <div id="manualCloudflareAccountsEmpty" class="empty" hidden>No Cloudflare account records match this filter.</div>
         </article>
       </section>

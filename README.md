@@ -1,4 +1,4 @@
-# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-36)
+# AtomicMail Panel — Production-Ready Web Operator (AM-01 → AM-37)
 
 A conservative Atomic Mail batch-registration panel. Registration remains strictly sequential and delegates Proof-of-Work and account registration to the official Atomic Mail AgentSkill CLI. The panel does not attempt to bypass provider controls.
 
@@ -40,8 +40,9 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - manual Cloudflare Focus Mode for selected AtomicMail inboxes
 - unique random 20-character password per Cloudflare account, encrypted with account-bound AES-256-GCM
 - durable Signup Done / Verification Received / Verified progress with duplicate prevention and restart resume
-- on-demand trusted Cloudflare verification-email detection with strict HTTPS/hostname validation
-- explicit password/link reveal and sensitive export; normal APIs, logs, audit, and ordinary exports stay secret-free
+- on-demand trusted Cloudflare verification-email detection that returns either a login/security code or a strict Cloudflare HTTPS verification link directly in Focus Mode
+- per-account encrypted Cloudflare Global API Key + API Token vault with reveal/copy and explicit secure export
+- explicit password/code/link/key reveal and sensitive export; normal APIs, logs, audit, and ordinary exports stay secret-free
 
 ## Local run on Windows / PowerShell
 
@@ -129,13 +130,14 @@ The current Cloudflare workflow is intentionally simple and does not use Playwri
 2. The panel generates a different 20-character password for every email and encrypts it at rest.
 3. In **Cloudflare Accounts → Focus Mode**, copy the current email and password, then choose **Open Cloudflare Signup**.
 4. Complete signup yourself in the official Cloudflare page and return to choose **Signup Done**. This locks the password.
-5. Choose **Check Inbox**. The panel checks only that Atomic Mail inbox and only messages received after Signup Done.
-6. When a trusted Cloudflare message is found, use **Open Verification Link** or **Copy Verification Link**.
-7. After Cloudflare shows the address as verified, choose **Mark Verified & Next**.
+5. Choose **Check Inbox & Get Code/Link**. The panel checks only that Atomic Mail inbox and only messages received after Signup Done.
+6. A trusted Cloudflare login/security code is shown directly with **Copy code**. If Cloudflare sent a verification link instead, **Open Verification Link** / **Copy Verification Link** appear.
+7. After Cloudflare shows the account as verified, paste its **Global API Key** and **API Token** into the Focus Mode vault and save them. Either field can be added/replaced later.
+8. Choose **Mark Verified & Next**. Focus Mode advances to the next unfinished account in the batch.
 
-Focus Mode resumes from the first unfinished record after a restart. An email already present in `cloudflare_accounts` can never be selected again; the Mailboxes page shows its saved status and verification date. Password regeneration is allowed only before Signup Done.
+Focus Mode resumes from the first unfinished record after a restart. An email already present in `cloudflare_accounts` can never be selected again; the Mailboxes page shows its saved status and verification date. Password regeneration is allowed only before Signup Done. For batches up to 100 accounts, the current account remains the only operational focus and the next item is selected automatically after Verified/Failed.
 
-Normal account/list APIs never return passwords or verification URLs. Reveal, copy, and the separate `Email,Password,Status` CSV use authenticated POST actions with `Cache-Control: no-store`; audit records contain the action but not the secret. The SQLite columns holding account passwords and verification URLs contain only account-bound AES-256-GCM ciphertext, so the existing encrypted backup/restore pipeline includes them automatically.
+Normal account/list APIs never return passwords, verification codes/URLs, Global API Keys, or API Tokens. Reveal/copy and the separate `Email,Password,GlobalApiKey,ApiToken,Status` CSV use authenticated POST actions with `Cache-Control: no-store`; audit records contain the action but never the secret. The SQLite columns holding these values contain only account-bound AES-256-GCM ciphertext, so the existing encrypted backup/restore pipeline includes them automatically.
 
 ## Retired browser-runner workflow (historical reference)
 
@@ -314,7 +316,7 @@ AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox 
 
 The AM-33 production check also completed a read-only live JMAP smoke for both Inbox and Sent against a temporary copy of the existing vault. No message was sent, modified or deleted, and the source data directory was not migrated or rewritten by the smoke.
 
-AM-36 retires the live Browser Runner from runtime and the primary UI. Cloudflare work is now a durable manual assistant with one independently encrypted random password per account, Focus Mode resume, strict duplicate protection, on-demand trusted Inbox verification, and explicit secret reveal/export actions.
+AM-36 retires the live Browser Runner from runtime and the primary UI. Cloudflare work is now a durable manual assistant with one independently encrypted random password per account, Focus Mode resume, strict duplicate protection, on-demand trusted Inbox verification, and explicit secret reveal/export actions. AM-37 makes that assistant operationally useful: Check Inbox returns Cloudflare verification codes or safe links directly in Focus Mode, and each account gains an encrypted Global API Key + API Token vault that is included only in the explicit sensitive export.
 
 ## AM-20 — encrypted credential vault, backup and portability
 

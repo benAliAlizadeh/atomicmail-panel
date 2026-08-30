@@ -27,6 +27,21 @@ function placeholders(count) {
   return Array.from({ length: count }, () => '?').join(',');
 }
 
+function normalizeAccessSecret(value, kind) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  if (text.length < 20 || text.length > 512 || /\s/.test(text)) {
+    throw exposedError(`${kind} must be a single non-whitespace value between 20 and 512 characters`, 400, 'invalid_cloudflare_secret');
+  }
+  if (kind === 'Global API Key' && text.startsWith('cfat_')) {
+    throw exposedError('The API Token was pasted into the Global API Key field', 400, 'cloudflare_secret_type_mismatch');
+  }
+  if (kind === 'API Token' && text.startsWith('cfk_')) {
+    throw exposedError('The Global API Key was pasted into the API Token field', 400, 'cloudflare_secret_type_mismatch');
+  }
+  return text;
+}
+
 function safeSignupUrl(value) {
   try {
     const parsed = new URL(String(value || 'https://dash.cloudflare.com/sign-up'));
@@ -76,8 +91,12 @@ function publicAccountColumns(alias = 'a') {
           ${alias}.signup_done_at, ${alias}.verification_received_at, ${alias}.verified_at,
           ${alias}.last_inbox_check_at, ${alias}.failed_at, ${alias}.password_locked_at,
           ${alias}.last_error_code, ${alias}.last_error,
+          ${alias}.verification_message_id, ${alias}.verification_subject, ${alias}.secrets_updated_at,
           ${alias}.password_ciphertext IS NOT NULL AS has_password,
-          ${alias}.verification_url_ciphertext IS NOT NULL AS has_verification_link`;
+          ${alias}.verification_url_ciphertext IS NOT NULL AS has_verification_link,
+          ${alias}.verification_code_ciphertext IS NOT NULL AS has_verification_code,
+          ${alias}.global_api_key_ciphertext IS NOT NULL AS has_global_api_key,
+          ${alias}.api_token_ciphertext IS NOT NULL AS has_api_token`;
 }
 
 export class CloudflareManualService {
@@ -488,27 +507,67 @@ export class CloudflareManualService {
           last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=?
       `).run(now, now, account.id);
       this.syncItem(account.id, 'waiting_verification', now, { message: 'No trusted Cloudflare verification email found yet' });
-      return { found: false, account: this.getAccount(account.id) };
+      return { found: false, account: this.getAccount(account.id), evidence: null };
     }
-    if (!isCloudflareVerificationUrl(found.url)) {
-      throw exposedError('The verification email did not contain a safe Cloudflare HTTPS link', 422, 'unsafe_cloudflare_verification_url');
+
+    let verificationUrlCiphertext = null;
+    if (found.url) {
+      if (!isCloudflareVerificationUrl(found.url)) {
+        throw exposedError('The verification email contained an unsafe Cloudflare link', 422, 'unsafe_cloudflare_verification_url');
+      }
+      verificationUrlCiphertext = this.vault.sealCloudflareSecret(found.url, {
+        purpose: 'cloudflare-account-verification-url', id: account.id,
+      });
     }
-    const ciphertext = this.vault.sealCloudflareSecret(found.url, {
-      purpose: 'cloudflare-account-verification-url', id: account.id,
-    });
+
+    let verificationCodeCiphertext = null;
+    const verificationCode = String(found.code || '').trim();
+    if (verificationCode) {
+      if (!/^[A-Z0-9]{4,10}$/i.test(verificationCode)) {
+        throw exposedError('The verification email contained an invalid verification code', 422, 'invalid_cloudflare_verification_code');
+      }
+      verificationCodeCiphertext = this.vault.sealCloudflareSecret(verificationCode, {
+        purpose: 'cloudflare-account-verification-code', id: account.id,
+      });
+    }
+
+    if (!verificationUrlCiphertext && !verificationCodeCiphertext) {
+      throw exposedError('The Cloudflare message did not contain a usable verification code or link', 422, 'cloudflare_verification_evidence_missing');
+    }
+
     const receivedAt = found.receivedAt || now;
     this.db.prepare(`
       UPDATE cloudflare_accounts SET status='verification_received', verification_received_at=?,
-        verification_url_ciphertext=?, last_inbox_check_at=?, last_error_code=NULL,
-        last_error=NULL, updated_at=? WHERE id=?
-    `).run(receivedAt, ciphertext, now, now, account.id);
+        verification_url_ciphertext=?,
+        verification_code_ciphertext=?,
+        verification_message_id=?, verification_subject=?, last_inbox_check_at=?,
+        last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=?
+    `).run(
+      receivedAt, verificationUrlCiphertext, verificationCodeCiphertext,
+      String(found.messageId || '').slice(0, 1024) || null,
+      String(found.subject || '').slice(0, 500) || null,
+      now, now, account.id,
+    );
     this.syncItem(account.id, 'verification_received', now, {
       verificationReceivedAt: receivedAt,
-      message: 'Trusted Cloudflare verification email received',
+      message: verificationCodeCiphertext && verificationUrlCiphertext
+        ? 'Trusted Cloudflare verification code and link received'
+        : verificationCodeCiphertext
+          ? 'Trusted Cloudflare verification code received'
+          : 'Trusted Cloudflare verification link received',
     });
     this.store.audit('info', 'cloudflare.verification_email_found', 'Trusted Cloudflare verification email found', account.job_id);
     this.backupManager?.requestBackup?.('cloudflare-verification-received');
-    return { found: true, account: this.getAccount(account.id) };
+    return {
+      found: true,
+      account: this.getAccount(account.id),
+      evidence: {
+        subject: String(found.subject || ''),
+        receivedAt,
+        verificationCode: verificationCode || null,
+        verificationUrl: found.url || null,
+      },
+    };
   }
 
   revealVerificationLink(id) {
@@ -522,10 +581,63 @@ export class CloudflareManualService {
     return url;
   }
 
+  revealVerificationCode(id) {
+    const account = this.requireAccount(id);
+    const row = this.db.prepare('SELECT verification_code_ciphertext FROM cloudflare_accounts WHERE id=?').get(account.id);
+    if (!row?.verification_code_ciphertext) throw exposedError('Verification code has not been received', 404, 'cloudflare_verification_code_missing');
+    const code = this.vault.openCloudflareSecret(row.verification_code_ciphertext, {
+      purpose: 'cloudflare-account-verification-code', id: account.id,
+    });
+    if (!/^[A-Z0-9]{4,10}$/i.test(code)) throw exposedError('Stored verification code failed validation', 409, 'invalid_cloudflare_verification_code');
+    return code;
+  }
+
+  saveAccessSecrets(id, { globalApiKey = undefined, apiToken = undefined } = {}) {
+    const account = this.requireAccount(id);
+    if (globalApiKey === undefined && apiToken === undefined) {
+      throw exposedError('Provide a Global API Key and/or API Token', 400, 'cloudflare_secrets_missing');
+    }
+    const globalKey = globalApiKey === undefined ? undefined : normalizeAccessSecret(globalApiKey, 'Global API Key');
+    const token = apiToken === undefined ? undefined : normalizeAccessSecret(apiToken, 'API Token');
+    if (globalKey === '' && token === '') {
+      throw exposedError('At least one Cloudflare secret must be non-empty', 400, 'cloudflare_secrets_missing');
+    }
+    const current = this.db.prepare(`
+      SELECT global_api_key_ciphertext, api_token_ciphertext FROM cloudflare_accounts WHERE id=?
+    `).get(account.id);
+    const globalCiphertext = globalKey === undefined || globalKey === ''
+      ? current.global_api_key_ciphertext
+      : this.vault.sealCloudflareSecret(globalKey, { purpose: 'cloudflare-account-global-api-key', id: account.id });
+    const tokenCiphertext = token === undefined || token === ''
+      ? current.api_token_ciphertext
+      : this.vault.sealCloudflareSecret(token, { purpose: 'cloudflare-account-api-token', id: account.id });
+    const now = nowIso();
+    this.db.prepare(`
+      UPDATE cloudflare_accounts SET global_api_key_ciphertext=?, api_token_ciphertext=?, secrets_updated_at=?, updated_at=? WHERE id=?
+    `).run(globalCiphertext, tokenCiphertext, now, now, account.id);
+    this.store.audit('warn', 'cloudflare.access_secrets_saved', 'Cloudflare access secrets saved or replaced by operator', account.job_id);
+    this.backupManager?.requestBackup?.('cloudflare-access-secrets-saved');
+    return this.getAccount(account.id);
+  }
+
+  revealAccessSecrets(id) {
+    const account = this.requireAccount(id);
+    const row = this.db.prepare(`
+      SELECT global_api_key_ciphertext, api_token_ciphertext FROM cloudflare_accounts WHERE id=?
+    `).get(account.id);
+    const open = (ciphertext, purpose) => ciphertext
+      ? this.vault.openCloudflareSecret(ciphertext, { purpose, id: account.id })
+      : null;
+    return {
+      globalApiKey: open(row?.global_api_key_ciphertext, 'cloudflare-account-global-api-key'),
+      apiToken: open(row?.api_token_ciphertext, 'cloudflare-account-api-token'),
+    };
+  }
+
   markVerified(id) {
     const account = this.requireAccount(id);
-    if (account.status !== 'verification_received' || !account.has_verification_link) {
-      throw exposedError('A trusted verification email is required before Mark Verified', 409, 'cloudflare_verification_not_received');
+    if (account.status !== 'verification_received' || (!account.has_verification_link && !account.has_verification_code)) {
+      throw exposedError('A trusted Cloudflare verification code or link is required before Mark Verified', 409, 'cloudflare_verification_not_received');
     }
     const now = nowIso();
     this.db.prepare(`
@@ -567,10 +679,15 @@ export class CloudflareManualService {
 
   exportSensitive({ status = '', search = '' } = {}) {
     const accounts = this.listAccounts({ status, search, limit: Number(this.config.exportMaxRows || 50000), offset: 0 });
-    return accounts.map((account) => ({
-      email: account.email,
-      password: this.revealPassword(account.id),
-      status: account.status,
-    }));
+    return accounts.map((account) => {
+      const secrets = this.revealAccessSecrets(account.id);
+      return {
+        email: account.email,
+        password: this.revealPassword(account.id),
+        globalApiKey: secrets.globalApiKey || '',
+        apiToken: secrets.apiToken || '',
+        status: account.status,
+      };
+    });
   }
 }

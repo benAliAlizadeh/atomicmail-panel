@@ -25,6 +25,9 @@ const state = {
   manualCloudflareAccount: null,
   manualCloudflarePassword: null,
   manualCloudflareVerificationUrl: null,
+  manualCloudflareVerificationCode: null,
+  manualCloudflareGlobalApiKey: null,
+  manualCloudflareApiToken: null,
   manualCloudflareSearch: '',
   manualCloudflareStatus: '',
   manualCloudflareSignupUrl: 'https://dash.cloudflare.com/sign-up',
@@ -729,10 +732,19 @@ const MANUAL_CLOUDFLARE_STATUS_LABELS = {
 function hideManualCloudflareSecrets() {
   state.manualCloudflarePassword = null;
   state.manualCloudflareVerificationUrl = null;
+  state.manualCloudflareVerificationCode = null;
+  state.manualCloudflareGlobalApiKey = null;
+  state.manualCloudflareApiToken = null;
   const password = $('#manualCloudflareFocusPassword');
   if (password) password.textContent = '••••••••••••••••••••';
   const reveal = $('#revealManualCloudflarePassword');
   if (reveal) reveal.textContent = 'Reveal';
+  for (const id of ['manualCloudflareGlobalApiKey', 'manualCloudflareApiToken']) {
+    const input = $(`#${id}`);
+    if (input) { input.value = ''; input.type = 'password'; }
+  }
+  const revealAccess = $('#revealManualCloudflareAccessSecrets');
+  if (revealAccess) revealAccess.textContent = 'Reveal saved keys';
 }
 
 function manualCloudflareStatusLabel(status) {
@@ -742,13 +754,14 @@ function manualCloudflareStatusLabel(status) {
 function manualCloudflareTimeline(account) {
   const signupDone = Boolean(account.signup_done_at);
   const emailReceived = Boolean(account.verification_received_at);
+  const apiSecretsSaved = Boolean(account.has_global_api_key && account.has_api_token);
   const verified = Boolean(account.verified_at || account.status === 'verified');
   const rows = [
     ['Account prepared', true, false],
     ['Signup done', signupDone, account.status === 'not_started'],
-    ['Waiting for verification email', emailReceived, signupDone && !emailReceived],
-    ['Verification email received', emailReceived, false],
-    ['Verified', verified, emailReceived && !verified],
+    ['Verification received', emailReceived, signupDone && !emailReceived],
+    ['API credentials saved', apiSecretsSaved, emailReceived && !apiSecretsSaved],
+    ['Completed', verified, apiSecretsSaved && !verified],
   ];
   return rows.map(([label, done, active], index) => `<li class="${done ? 'done' : active ? 'active' : ''}">
     <span class="timeline-marker">${done ? '✓' : active ? '…' : index + 1}</span><span>${escapeHtml(label)}</span>
@@ -780,16 +793,38 @@ function renderManualCloudflareFocus(account, stats = {}) {
 
   const notStarted = account.status === 'not_started';
   const signupDone = Boolean(account.signup_done_at);
-  const verificationReceived = Boolean(account.has_verification_link && account.verification_received_at);
+  const hasVerificationCode = Boolean(account.has_verification_code && account.verification_received_at);
+  const hasVerificationLink = Boolean(account.has_verification_link && account.verification_received_at);
+  const verificationReceived = hasVerificationCode || hasVerificationLink;
   $('#regenerateManualCloudflarePassword').disabled = !notStarted;
   $('#manualCloudflarePasswordLocked').hidden = notStarted;
   $('#markManualCloudflareSignupDone').disabled = !notStarted;
   $('#checkManualCloudflareInbox').disabled = !signupDone;
-  $('#openManualCloudflareVerifyLink').disabled = !verificationReceived;
-  $('#copyManualCloudflareVerifyLink').disabled = !verificationReceived;
-  $('#markManualCloudflareVerified').disabled = !verificationReceived;
+  const apiSecretsReady = Boolean(account.has_global_api_key && account.has_api_token);
+  $('#markManualCloudflareVerified').disabled = !verificationReceived || !apiSecretsReady;
+  $('#manualCloudflareFinishHint').textContent = !verificationReceived
+    ? 'Get the Cloudflare verification code/link first.'
+    : !apiSecretsReady
+      ? 'Save both Cloudflare API credentials so this account cannot be finished with missing secrets.'
+      : 'Everything required is saved. Finish and move to the next account.';
   $('#openManualCloudflareSignup').disabled = !notStarted;
   $('#markManualCloudflareFailed').disabled = ['verified', 'failed'].includes(account.status);
+
+  const evidence = $('#manualCloudflareVerificationEvidence');
+  evidence.hidden = !verificationReceived;
+  $('#manualCloudflareVerificationSubject').textContent = account.verification_subject || 'Trusted Cloudflare message';
+  $('#manualCloudflareVerificationReceivedAt').textContent = account.verification_received_at ? formatDate(account.verification_received_at) : '';
+  $('#manualCloudflareVerificationCodeRow').hidden = !hasVerificationCode;
+  $('#manualCloudflareVerificationLinkRow').hidden = !hasVerificationLink;
+  $('#manualCloudflareVerificationCode').textContent = hasVerificationCode
+    ? (state.manualCloudflareVerificationCode || '••••••') : '';
+  $('#manualCloudflareApiSecretBadges').innerHTML = [
+    `<span class="chip ${account.has_global_api_key ? 'success' : ''}">API Key ${account.has_global_api_key ? 'saved' : 'missing'}</span>`,
+    `<span class="chip ${account.has_api_token ? 'success' : ''}">API Token ${account.has_api_token ? 'saved' : 'missing'}</span>`,
+  ].join('');
+  $('#copyManualCloudflareGlobalApiKey').disabled = !account.has_global_api_key;
+  $('#copyManualCloudflareApiToken').disabled = !account.has_api_token;
+  $('#revealManualCloudflareAccessSecrets').disabled = !account.has_global_api_key && !account.has_api_token;
 
   const message = $('#manualCloudflareFocusMessage');
   if (account.status === 'waiting_verification') {
@@ -809,6 +844,7 @@ function renderManualCloudflareAccounts(accounts) {
   $('#manualCloudflareAccountsBody').innerHTML = accounts.map((account) => `<tr>
     <td><button class="text-button mono" type="button" data-manual-cloudflare-open="${escapeHtml(account.id)}">${escapeHtml(account.email)}</button></td>
     <td><span class="mono">••••••••</span> <button class="btn ghost small-btn" type="button" data-manual-cloudflare-copy-password="${escapeHtml(account.id)}">Copy</button></td>
+    <td><span class="mini-status ${account.has_global_api_key ? 'ok' : ''}">Key ${account.has_global_api_key ? '✓' : '—'}</span> <span class="mini-status ${account.has_api_token ? 'ok' : ''}">Token ${account.has_api_token ? '✓' : '—'}</span></td>
     <td>${statusPill(account.status)}</td>
     <td>${escapeHtml(formatDate(account.verified_at))}</td>
     <td class="truncate" title="${escapeHtml(account.notes || '')}">${escapeHtml(account.notes || '—')}</td>
@@ -872,6 +908,41 @@ async function manualCloudflareVerificationLink() {
   return result.verificationUrl;
 }
 
+async function manualCloudflareVerificationCode() {
+  const account = state.manualCloudflareAccount;
+  if (!account) return '';
+  if (state.manualCloudflareVerificationCode) return state.manualCloudflareVerificationCode;
+  const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/verification-code`, { method: 'POST', body: '{}' });
+  state.manualCloudflareVerificationCode = result.verificationCode;
+  $('#manualCloudflareVerificationCode').textContent = result.verificationCode;
+  return result.verificationCode;
+}
+
+async function revealManualCloudflareAccessSecrets() {
+  const account = state.manualCloudflareAccount;
+  if (!account) return { globalApiKey: '', apiToken: '' };
+  const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/access-secrets/reveal`, { method: 'POST', body: '{}' });
+  state.manualCloudflareGlobalApiKey = result.globalApiKey || null;
+  state.manualCloudflareApiToken = result.apiToken || null;
+  $('#manualCloudflareGlobalApiKey').value = result.globalApiKey || '';
+  $('#manualCloudflareApiToken').value = result.apiToken || '';
+  $('#manualCloudflareGlobalApiKey').type = 'text';
+  $('#manualCloudflareApiToken').type = 'text';
+  $('#revealManualCloudflareAccessSecrets').textContent = 'Hide saved keys';
+  return result;
+}
+
+function hideManualCloudflareAccessSecretsOnly() {
+  state.manualCloudflareGlobalApiKey = null;
+  state.manualCloudflareApiToken = null;
+  for (const id of ['manualCloudflareGlobalApiKey', 'manualCloudflareApiToken']) {
+    const input = $(`#${id}`);
+    input.value = '';
+    input.type = 'password';
+  }
+  $('#revealManualCloudflareAccessSecrets').textContent = 'Reveal saved keys';
+}
+
 function openManualCloudflareBatchModal() {
   const count = state.selectedCloudflareMailboxIds.size;
   if (!count) return;
@@ -887,7 +958,7 @@ function closeManualCloudflareBatchModal() {
 }
 
 async function downloadManualCloudflareSensitiveExport() {
-  if (!confirm('This export contains plaintext Cloudflare passwords. Store it securely and delete it when finished. Continue?')) return;
+  if (!confirm('This export contains plaintext Cloudflare passwords, Global API Keys and API Tokens. Store it securely and delete it when finished. Continue?')) return;
   const headers = { 'content-type': 'application/json' };
   if (state.csrf) headers['x-atomicmail-csrf'] = state.csrf;
   const response = await fetch('/api/cloudflare/accounts/export-sensitive', {
@@ -1153,7 +1224,7 @@ async function revealCloudflarePassword(button) {
 }
 
 async function downloadCloudflareSensitiveExport() {
-  if (!confirm('This export contains plaintext Cloudflare passwords. Store it securely and delete it when finished. Continue?')) return;
+  if (!confirm('This export contains plaintext Cloudflare passwords, Global API Keys and API Tokens. Store it securely and delete it when finished. Continue?')) return;
   const headers = { 'content-type': 'application/json' };
   if (state.csrf) headers['x-atomicmail-csrf'] = state.csrf;
   const response = await fetch('/api/cloudflare/accounts/export-sensitive', {
@@ -2070,11 +2141,19 @@ $('#markManualCloudflareSignupDone').addEventListener('click', async (event) => 
 $('#checkManualCloudflareInbox').addEventListener('click', async (event) => {
   const account = state.manualCloudflareAccount;
   if (!account) return;
-  await withBusyButton(event.currentTarget, 'Checking inbox', 'Looking for a trusted Cloudflare verification email', async () => {
+  await withBusyButton(event.currentTarget, 'Checking inbox', 'Looking for a Cloudflare code or verification link', async () => {
     const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/check-inbox`, { method: 'POST', body: '{}' });
-    state.manualCloudflareVerificationUrl = null;
+    state.manualCloudflareVerificationUrl = result.evidence?.verificationUrl || null;
+    state.manualCloudflareVerificationCode = result.evidence?.verificationCode || null;
     await loadManualCloudflare();
-    showToast(result.found ? 'Verification email received' : 'No verification email yet');
+    if (result.found) {
+      if (state.manualCloudflareVerificationCode) $('#manualCloudflareVerificationCode').textContent = state.manualCloudflareVerificationCode;
+      showToast(state.manualCloudflareVerificationCode
+        ? `Cloudflare code found: ${state.manualCloudflareVerificationCode}`
+        : 'Cloudflare verification link found');
+    } else {
+      showToast('No Cloudflare verification email yet');
+    }
   }).catch(handleManualCloudflareError);
 });
 $('#openManualCloudflareVerifyLink').addEventListener('click', async (event) => {
@@ -2095,6 +2174,59 @@ $('#openManualCloudflareVerifyLink').addEventListener('click', async (event) => 
 $('#copyManualCloudflareVerifyLink').addEventListener('click', async (event) => {
   await withBusyButton(event.currentTarget, 'Copying', 'Validating the Cloudflare verification link', async () => {
     await copyText(await manualCloudflareVerificationLink(), 'Verification link copied');
+  }).catch(handleError);
+});
+$('#copyManualCloudflareVerificationCode').addEventListener('click', async (event) => {
+  await withBusyButton(event.currentTarget, 'Copying', 'Decrypting the saved Cloudflare verification code', async () => {
+    await copyText(await manualCloudflareVerificationCode(), 'Cloudflare verification code copied');
+  }).catch(handleError);
+});
+$('#saveManualCloudflareAccessSecrets').addEventListener('click', async (event) => {
+  const account = state.manualCloudflareAccount;
+  if (!account) return;
+  const globalApiKey = $('#manualCloudflareGlobalApiKey').value.trim();
+  const apiToken = $('#manualCloudflareApiToken').value.trim();
+  if (!globalApiKey && !apiToken) {
+    showToast('Paste an API Key and/or API Token first');
+    return;
+  }
+  await withBusyButton(event.currentTarget, 'Saving', 'Encrypting Cloudflare API credentials for this account', async () => {
+    const body = {};
+    if (globalApiKey) body.globalApiKey = globalApiKey;
+    if (apiToken) body.apiToken = apiToken;
+    const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/access-secrets`, {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    state.manualCloudflareAccount = result.account;
+    hideManualCloudflareAccessSecretsOnly();
+    renderManualCloudflareFocus(result.account, { totalAccounts: result.account.batch_total || 1 });
+    await loadManualCloudflare({ background: true });
+    showToast('Cloudflare API credentials encrypted and saved');
+  }).catch(handleError);
+});
+$('#revealManualCloudflareAccessSecrets').addEventListener('click', async (event) => {
+  if (state.manualCloudflareGlobalApiKey || state.manualCloudflareApiToken) {
+    hideManualCloudflareAccessSecretsOnly();
+    return;
+  }
+  await withBusyButton(event.currentTarget, 'Decrypting', 'Decrypting saved Cloudflare API credentials', revealManualCloudflareAccessSecrets).catch(handleError);
+});
+$('#copyManualCloudflareGlobalApiKey').addEventListener('click', async (event) => {
+  await withBusyButton(event.currentTarget, 'Copying', 'Decrypting saved Global API Key', async () => {
+    const secrets = (state.manualCloudflareGlobalApiKey || state.manualCloudflareApiToken)
+      ? { globalApiKey: state.manualCloudflareGlobalApiKey, apiToken: state.manualCloudflareApiToken }
+      : await revealManualCloudflareAccessSecrets();
+    if (!secrets.globalApiKey) throw new Error('No Global API Key is saved for this account');
+    await copyText(secrets.globalApiKey, 'Cloudflare Global API Key copied');
+  }).catch(handleError);
+});
+$('#copyManualCloudflareApiToken').addEventListener('click', async (event) => {
+  await withBusyButton(event.currentTarget, 'Copying', 'Decrypting saved API Token', async () => {
+    const secrets = (state.manualCloudflareGlobalApiKey || state.manualCloudflareApiToken)
+      ? { globalApiKey: state.manualCloudflareGlobalApiKey, apiToken: state.manualCloudflareApiToken }
+      : await revealManualCloudflareAccessSecrets();
+    if (!secrets.apiToken) throw new Error('No API Token is saved for this account');
+    await copyText(secrets.apiToken, 'Cloudflare API Token copied');
   }).catch(handleError);
 });
 $('#markManualCloudflareVerified').addEventListener('click', async (event) => {

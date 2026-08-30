@@ -285,7 +285,22 @@ test('Cloudflare verification selector rejects lookalike domains and mismatched 
   ], { recipient: 'box@atomicmail.ai', submittedAt });
   assert.deepEqual(selected, {
     messageId: 'real', receivedAt: '2026-08-27T10:03:00.000Z',
-    url: 'https://dash.cloudflare.com/verify-email?token=private',
+    subject: 'Verify your email address',
+    url: 'https://dash.cloudflare.com/verify-email?token=private', code: null,
+  });
+
+  const codeOnly = selectCloudflareVerification([
+    {
+      id: 'login-code', receivedAt: '2026-08-27T10:04:00.000Z',
+      from: [{ email: 'noreply@notify.cloudflare.com' }],
+      to: [{ email: 'box@atomicmail.ai' }], subject: 'Your login verification code',
+      body: 'A login attempt requires verification. Enter this code on the challenge page to continue: 7286934',
+      verificationCodes: [], links: ['https://dash.cloudflare.com/?to=/profile/authentication'],
+    },
+  ], { recipient: 'box@atomicmail.ai', submittedAt });
+  assert.deepEqual(codeOnly, {
+    messageId: 'login-code', receivedAt: '2026-08-27T10:04:00.000Z',
+    subject: 'Your login verification code', url: null, code: '7286934',
   });
 });
 

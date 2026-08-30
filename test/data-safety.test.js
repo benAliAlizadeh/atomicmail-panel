@@ -167,6 +167,12 @@ test('encrypted backup verifies and restores portably onto a different path', as
     const sourceCloudflareAccount = sourceCloudflare.getFocusAccount().account;
     const sourceCloudflarePassword = sourceCloudflare.revealPassword(sourceCloudflareAccount.id);
     sourceCloudflare.updateNotes(sourceCloudflareAccount.id, 'Resume this account after portable restore');
+    const sourceGlobalApiKey = 'cfk_BACKUP_TEST_abcdefghijklmnopqrstuvwxyz012345';
+    const sourceApiToken = 'cfat_BACKUP_TEST_abcdefghijklmnopqrstuvwxyz0123456789';
+    sourceCloudflare.saveAccessSecrets(sourceCloudflareAccount.id, {
+      globalApiKey: sourceGlobalApiKey,
+      apiToken: sourceApiToken,
+    });
     sourceCloudflare.markSignupDone(sourceCloudflareAccount.id);
     const manager = new BackupManager({ config: sourceConfig, store: sourceStore, vault: sourceVault });
     const backup = await manager.createBackup('test');
@@ -209,6 +215,10 @@ test('encrypted backup verifies and restores portably onto a different path', as
     assert.equal(restoredCloudflareAccount.status, 'signup_done');
     assert.equal(restoredCloudflareAccount.notes, 'Resume this account after portable restore');
     assert.equal(restoredCloudflare.revealPassword(restoredCloudflareAccount.id), sourceCloudflarePassword);
+    assert.deepEqual(restoredCloudflare.revealAccessSecrets(restoredCloudflareAccount.id), {
+      globalApiKey: sourceGlobalApiKey,
+      apiToken: sourceApiToken,
+    });
     assert.equal(targetVault.status().plaintextCredentialFiles, 0);
     targetStore.close();
   } finally {
