@@ -2146,14 +2146,20 @@ $('#checkManualCloudflareInbox').addEventListener('click', async (event) => {
   if (!account) return;
   await withBusyButton(event.currentTarget, 'Checking inbox', 'Looking for a Cloudflare code or verification link', async () => {
     const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/check-inbox`, { method: 'POST', body: '{}' });
-    state.manualCloudflareVerificationUrl = result.evidence?.verificationUrl || null;
-    state.manualCloudflareVerificationCode = result.evidence?.verificationCode || null;
+    if (result.evidence?.verificationUrl) state.manualCloudflareVerificationUrl = result.evidence.verificationUrl;
+    if (result.evidence?.verificationCode) state.manualCloudflareVerificationCode = result.evidence.verificationCode;
     await loadManualCloudflare();
     if (result.found) {
       if (state.manualCloudflareVerificationCode) $('#manualCloudflareVerificationCode').textContent = state.manualCloudflareVerificationCode;
-      showToast(state.manualCloudflareVerificationCode
-        ? `Cloudflare code found: ${state.manualCloudflareVerificationCode}`
-        : 'Cloudflare verification link found');
+      const foundCode = Boolean(result.evidence?.verificationCode);
+      const foundLink = Boolean(result.evidence?.verificationUrl);
+      showToast(foundCode && foundLink
+        ? 'Cloudflare verification code and link found'
+        : foundCode
+          ? 'Cloudflare verification code found'
+          : 'Cloudflare verification link found');
+    } else if (result.retainedEvidence) {
+      showToast('No newer Cloudflare email found; saved verification evidence is still available');
     } else {
       showToast('No Cloudflare verification email yet');
     }

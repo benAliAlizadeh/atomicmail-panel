@@ -139,7 +139,7 @@ The current Cloudflare workflow is intentionally simple and does not use Playwri
 2. The panel generates a different 20-character password for every email and encrypts it at rest.
 3. In **Cloudflare Accounts → Focus Mode**, copy the current email and password, then choose **Open Cloudflare Signup**.
 4. Complete signup yourself in the official Cloudflare page and return to choose **Signup Done**. This locks the password.
-5. Choose **Check Inbox & Get Code/Link**. The panel checks only that Atomic Mail inbox and trusted Cloudflare messages addressed to that exact recipient. A bounded 10-minute lookback covers codes/links delivered just before you returned and clicked Signup Done; configure it with `CLOUDFLARE_VERIFICATION_LOOKBACK_SECONDS`.
+5. Choose **Check Inbox & Get Code/Link**. The panel checks only that Atomic Mail inbox and trusted Cloudflare messages addressed to that exact recipient. A bounded 10-minute lookback covers codes/links delivered just before you returned and clicked Signup Done; configure it with `CLOUDFLARE_VERIFICATION_LOOKBACK_SECONDS`. Rechecking never downgrades or removes previously saved trusted evidence when no newer message is found.
 6. A trusted Cloudflare login/security code is shown directly with **Copy code**. If Cloudflare sent a verification link instead, **Open Verification Link** / **Copy Verification Link** appear.
 7. After Cloudflare shows the account as verified, paste its **Global API Key** and **API Token** into the Focus Mode vault and save them. Either field can be added/replaced later.
 8. Choose **Mark Verified & Next**. Focus Mode advances to the next unfinished account in the batch.
@@ -148,7 +148,7 @@ Focus Mode resumes from the first unfinished record after a restart. An email al
 
 Normal account/list APIs never return passwords, verification codes/URLs, Global API Keys, or API Tokens. Reveal/copy and the separate `Email,Password,GlobalApiKey,ApiToken,Status` CSV use authenticated POST actions with `Cache-Control: no-store`; audit records contain the action but never the secret. The SQLite columns holding these values contain only account-bound AES-256-GCM ciphertext, so the existing encrypted backup/restore pipeline includes them automatically.
 
-The server—not only the browser button—refuses **Mark Verified & Next** until trusted verification evidence and both Cloudflare API credentials are present. Prefixed `cfk_` keys are rejected from the token field, and `cfat_` / `cfut_` tokens are rejected from the Global API Key field; legacy unprefixed credentials remain accepted for compatibility.
+The server—not only the browser button—refuses **Mark Verified & Next** until Signup Done, trusted verification evidence, and both Cloudflare API credentials are present. On startup, 0.11.1 also repairs the AM-38 edge case where encrypted evidence existed but a later empty Inbox recheck had left the workflow status at `waiting_verification`; no schema migration or secret re-encryption is required. Prefixed `cfk_` keys are rejected from the token field, and `cfat_` / `cfut_` tokens are rejected from the Global API Key field; legacy unprefixed credentials remain accepted for compatibility.
 
 ## Retired browser-runner workflow (historical reference)
 
@@ -349,6 +349,8 @@ AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox 
 The AM-33 production check also completed a read-only live JMAP smoke for both Inbox and Sent against a temporary copy of the existing vault. No message was sent, modified or deleted, and the source data directory was not migrated or rewritten by the smoke.
 
 AM-36 retires the live Browser Runner from runtime and the primary UI. Cloudflare work is now a durable manual assistant with one independently encrypted random password per account, Focus Mode resume, strict duplicate protection, on-demand trusted Inbox verification, and explicit secret reveal/export actions. AM-37 makes that assistant operationally useful: Check Inbox returns Cloudflare verification codes or safe links directly in Focus Mode, and each account gains an encrypted Global API Key + API Token vault that is included only in the explicit sensitive export. AM-38 hardens completion integrity, adds a bounded pre-click verification lookback, preserves previously discovered code/link evidence across rechecks, keeps shared JMAP retry timers alive, clears browser secrets on logout, redacts Cloudflare user tokens, and blocks plaintext source snapshots.
+
+Version 0.11.1 starts Phase B live-validation hardening. An empty Inbox recheck after trusted evidence has already been stored now preserves both the encrypted evidence and the `verification_received` workflow state. Startup repairs any AM-38 records already left in the inconsistent waiting state, and the backend completion guard validates durable evidence rather than depending on that transient status alone. The next rollout step is one real Cloudflare account end-to-end before any scale increase.
 
 ## AM-20 — encrypted credential vault, backup and portability
 

@@ -231,7 +231,7 @@ test('Inbox check accepts a trusted Cloudflare login code without requiring a ve
   }
 });
 
-test('rechecking Inbox preserves previously stored verification link and code evidence', async () => {
+test('rechecking Inbox preserves stored evidence even when no newer Cloudflare email is found', async () => {
   let attempt = 0;
   const current = fixture({
     mailClient: {
@@ -243,10 +243,13 @@ test('rechecking Inbox preserves previously stored verification link and code ev
             url: 'https://dash.cloudflare.com/verify-email?token=preserve-link', code: null,
           };
         }
-        return {
-          messageId: 'message-code', subject: 'Your login verification code', receivedAt: new Date().toISOString(),
-          url: null, code: '7654321',
-        };
+        if (attempt === 2) {
+          return {
+            messageId: 'message-code', subject: 'Your login verification code', receivedAt: new Date().toISOString(),
+            url: null, code: '7654321',
+          };
+        }
+        return null;
       },
     },
   });
@@ -256,11 +259,59 @@ test('rechecking Inbox preserves previously stored verification link and code ev
     current.service.markSignupDone(account.id);
     await current.service.checkInbox(account.id);
     await current.service.checkInbox(account.id);
+    const noNewMessage = await current.service.checkInbox(account.id);
     const updated = current.service.getAccount(account.id);
+    assert.equal(noNewMessage.found, false);
+    assert.equal(noNewMessage.retainedEvidence, true);
+    assert.equal(noNewMessage.account.status, 'verification_received');
+    assert.equal(updated.status, 'verification_received');
     assert.equal(updated.has_verification_link, 1);
     assert.equal(updated.has_verification_code, 1);
     assert.equal(current.service.revealVerificationLink(account.id), 'https://dash.cloudflare.com/verify-email?token=preserve-link');
     assert.equal(current.service.revealVerificationCode(account.id), '7654321');
+  } finally {
+    current.close();
+  }
+});
+
+test('startup repairs AM-38 waiting state when encrypted verification evidence already exists', async () => {
+  const current = fixture({
+    mailClient: {
+      async findCloudflareVerification() {
+        return {
+          messageId: 'message-repair', subject: 'Your login verification code', receivedAt: new Date().toISOString(),
+          url: null, code: '824611',
+        };
+      },
+    },
+  });
+  try {
+    current.service.createBatch(['mbx_1']);
+    const account = current.service.getFocusAccount().account;
+    current.service.markSignupDone(account.id);
+    await current.service.checkInbox(account.id);
+    current.store.db.prepare(`UPDATE cloudflare_accounts SET status='waiting_verification' WHERE id=?`).run(account.id);
+    current.store.db.prepare(`UPDATE cloudflare_job_items SET status='waiting_verification', phase='waiting_verification' WHERE account_id=?`).run(account.id);
+
+    const restarted = new CloudflareManualService({
+      store: current.store,
+      vault: current.vault,
+      mailClient: current.service.mailClient,
+      config: current.config,
+    });
+    assert.deepEqual(restarted.initialize(), { migrated: 0, legacyCredentialsPreserved: 0, failures: 0 });
+    const repaired = restarted.getAccount(account.id);
+    const repairedItem = current.store.db.prepare(`SELECT status, phase FROM cloudflare_job_items WHERE account_id=?`).get(account.id);
+    assert.equal(repaired.status, 'verification_received');
+    assert.equal(repairedItem.status, 'verification_received');
+    assert.equal(repairedItem.phase, 'verification_received');
+    assert.equal(restarted.revealVerificationCode(account.id), '824611');
+
+    restarted.saveAccessSecrets(account.id, {
+      globalApiKey: 'cfk_REPAIR_TEST_abcdefghijklmnopqrstuvwxyz0123456789',
+      apiToken: 'cfat_REPAIR_TEST_abcdefghijklmnopqrstuvwxyz0123456789',
+    });
+    assert.equal(restarted.markVerified(account.id).account.status, 'verified');
   } finally {
     current.close();
   }

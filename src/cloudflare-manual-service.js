@@ -125,14 +125,13 @@ export class CloudflareManualService {
       WHERE a.workflow_mode<>'manual' OR a.password_ciphertext IS NULL
       ORDER BY a.created_at, i.position
     `).all();
-    if (!rows.length) return { migrated: 0, legacyCredentialsPreserved: 0, failures: 0 };
 
     let migrated = 0;
     let legacyCredentialsPreserved = 0;
     let failures = 0;
     const now = nowIso();
     const seenPasswords = new Set();
-    this.db.exec('BEGIN IMMEDIATE');
+    if (rows.length) this.db.exec('BEGIN IMMEDIATE');
     try {
       for (const row of rows) {
         const item = {
@@ -210,14 +209,64 @@ export class CloudflareManualService {
         }
         migrated += 1;
       }
+      if (rows.length) this.db.exec('COMMIT');
+    } catch (error) {
+      if (rows.length) this.db.exec('ROLLBACK');
+      throw error;
+    }
+    if (migrated) {
+      this.store.audit('info', 'cloudflare.manual_migration', `Migrated ${migrated} Cloudflare account record(s) to the manual assistant`);
+      this.backupManager?.requestBackup?.('cloudflare-manual-migration');
+    }
+    this.repairStoredVerificationState();
+    return { migrated, legacyCredentialsPreserved, failures };
+  }
+
+  repairStoredVerificationState() {
+    const rows = this.db.prepare(`
+      SELECT id, credential_job_id AS job_id, verification_received_at
+      FROM cloudflare_accounts
+      WHERE workflow_mode='manual'
+        AND status IN ('signup_done','waiting_verification')
+        AND verification_received_at IS NOT NULL
+        AND (verification_url_ciphertext IS NOT NULL OR verification_code_ciphertext IS NOT NULL)
+    `).all();
+    if (!rows.length) return 0;
+
+    const now = nowIso();
+    const updateAccount = this.db.prepare(`
+      UPDATE cloudflare_accounts
+      SET status='verification_received', last_error_code=NULL, last_error=NULL, updated_at=?
+      WHERE id=? AND status IN ('signup_done','waiting_verification')
+    `);
+    const updateItem = this.db.prepare(`
+      UPDATE cloudflare_job_items
+      SET status='verification_received', phase='verification_received',
+          phase_message='Recovered saved Cloudflare verification evidence',
+          verification_received_at=COALESCE(verification_received_at, ?), updated_at=?
+      WHERE account_id=?
+    `);
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) {
+        updateAccount.run(now, row.id);
+        updateItem.run(row.verification_received_at, now, row.id);
+      }
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
-    this.store.audit('info', 'cloudflare.manual_migration', `Migrated ${migrated} Cloudflare account record(s) to the manual assistant`);
-    this.backupManager?.requestBackup?.('cloudflare-manual-migration');
-    return { migrated, legacyCredentialsPreserved, failures };
+
+    for (const jobId of new Set(rows.map((row) => row.job_id))) this.syncJob(jobId, now);
+    this.store.audit(
+      'warn',
+      'cloudflare.verification_state_repaired',
+      `Recovered saved verification evidence for ${rows.length} Cloudflare account record(s)`,
+    );
+    this.backupManager?.requestBackup?.('cloudflare-verification-state-repaired');
+    return rows.length;
   }
 
   createBatch(mailboxIds) {
@@ -503,12 +552,25 @@ export class CloudflareManualService {
     });
     const now = nowIso();
     if (!found) {
+      const retainedEvidence = Boolean(
+        account.verification_received_at && (account.has_verification_link || account.has_verification_code),
+      );
+      const nextStatus = retainedEvidence ? 'verification_received' : 'waiting_verification';
       this.db.prepare(`
-        UPDATE cloudflare_accounts SET status='waiting_verification', last_inbox_check_at=?,
+        UPDATE cloudflare_accounts SET status=?, last_inbox_check_at=?,
           last_error_code=NULL, last_error=NULL, updated_at=? WHERE id=?
-      `).run(now, now, account.id);
-      this.syncItem(account.id, 'waiting_verification', now, { message: 'No trusted Cloudflare verification email found yet' });
-      return { found: false, account: this.getAccount(account.id), evidence: null };
+      `).run(nextStatus, now, now, account.id);
+      this.syncItem(account.id, nextStatus, now, {
+        message: retainedEvidence
+          ? 'No newer trusted Cloudflare email found; saved verification evidence was preserved'
+          : 'No trusted Cloudflare verification email found yet',
+      });
+      return {
+        found: false,
+        retainedEvidence,
+        account: this.getAccount(account.id),
+        evidence: null,
+      };
     }
 
     let verificationUrlCiphertext = null;
@@ -637,7 +699,10 @@ export class CloudflareManualService {
 
   markVerified(id) {
     const account = this.requireAccount(id);
-    if (account.status !== 'verification_received' || (!account.has_verification_link && !account.has_verification_code)) {
+    if (!['signup_done', 'waiting_verification', 'verification_received'].includes(account.status)) {
+      throw exposedError('This Cloudflare account is not in a finishable workflow state', 409, 'invalid_cloudflare_transition');
+    }
+    if (!account.signup_done_at || (!account.has_verification_link && !account.has_verification_code)) {
       throw exposedError('A trusted Cloudflare verification code or link is required before Mark Verified', 409, 'cloudflare_verification_not_received');
     }
     if (!account.has_global_api_key || !account.has_api_token) {

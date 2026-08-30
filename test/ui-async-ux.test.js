@@ -49,6 +49,8 @@ test('Cloudflare manual assistant exposes simple Focus Mode and keeps runner con
   assert.match(app, /regenerate-password/);
   assert.match(app, /signup-done/);
   assert.match(app, /check-inbox/);
+  assert.match(app, /saved verification evidence is still available/);
+  assert.match(html, /id="manualCloudflareFocusMessage"[^>]+role="status"[^>]+aria-live="polite"/);
   assert.match(app, /verification-link/);
   assert.match(app, /Marking account verified and loading the next account/);
   assert.match(app, /mail_rate_limited/);

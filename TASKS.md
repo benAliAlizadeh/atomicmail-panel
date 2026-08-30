@@ -41,3 +41,11 @@
 
 | AM-37 | Cloudflare Focus Assistant v2 | ✅ Done — direct code/link Inbox evidence, per-account encrypted Global API Key + API Token vault, secure export and 100-account Focus workflow |
 | AM-38 | Review hardening / completion integrity / source safety | ✅ Done — backend requires verification + both API credentials, bounded Inbox lookback and evidence preservation, live JMAP retry timers, cfut_ redaction, logout secret clearing, and plaintext source snapshots are blocked/purgeable |
+
+## Current rollout phases
+
+| Phase | Status | Scope |
+|---|---|---|
+| Phase A — Production / Current Version | ✅ Complete | 0.11.0 production baseline; 0.11.1 is the Phase B hardening candidate |
+| Phase B — End-to-End Live Validation | 🟡 In progress | Recheck now preserves durable verification state, startup repairs affected AM-38 records, and backend completion accepts preserved trusted evidence; real 1-account Cloudflare E2E is next |
+| Phase C — Scale & UX Polish | ⏳ Pending | 3-account → 5-account → larger-batch validation, then polish only issues observed in real use |
