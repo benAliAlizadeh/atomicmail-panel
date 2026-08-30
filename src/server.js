@@ -111,7 +111,7 @@ function mailboxesCsv(items) {
 }
 
 function sensitiveMailboxesCsv(items) {
-  const rows = [['Email', 'DestinationPassword'].map(csvCell).join(',')];
+  const rows = [['Email', 'AccountPassword'].map(csvCell).join(',')];
   for (const item of items) rows.push([item.email, item.destinationPassword].map(csvCell).join(','));
   return `${rows.join('\r\n')}\r\n`;
 }
@@ -134,14 +134,14 @@ function contentDispositionFilename(filename) {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(clean)}`;
 }
 
-function assertDestinationPassword(value, config) {
-  const password = String(value ?? '');
-  if (!password) return '';
-  const maximum = Number(config.destinationPasswordMaxBytes || 1024);
-  if (Buffer.byteLength(password, 'utf8') > maximum) {
-    throw Object.assign(new Error('Destination password is too large'), { statusCode: 413, expose: true });
+function openSavedMailboxPassword(vault, record) {
+  if (record?.account_password_ciphertext) {
+    return vault.openMailboxPassword(record.account_password_ciphertext, record.mailbox_id);
   }
-  return password;
+  if (record?.legacy_job_password_ciphertext) {
+    return vault.openJobPassword(record.legacy_job_password_ciphertext, record.job_id);
+  }
+  return '';
 }
 
 function decodeBase64(value) {
@@ -534,9 +534,10 @@ export function createServer({
           return json(res, 400, { error: `count must be an integer between 1 and ${config.maxBatchSize}` });
         }
         const prefix = normalizePrefix(body.prefix || '');
-        const destinationPassword = assertDestinationPassword(body.destinationPassword, config);
-        if (destinationPassword && !vault?.sealJobPassword) {
-          return json(res, 503, { error: 'Encrypted destination-password vault is unavailable' });
+        if (String(body.destinationPassword ?? '')) {
+          return json(res, 409, {
+            error: 'Shared batch passwords are retired. Refresh the page; each new email now receives its own generated password.',
+          });
         }
         const usernames = generateUniqueUsernames(
           count,
@@ -544,11 +545,7 @@ export function createServer({
           { prefix, minLength: config.usernameMinLength, maxLength: config.usernameMaxLength },
         );
         const id = newId('job');
-        const destinationPasswordCiphertext = destinationPassword
-          ? vault.sealJobPassword(destinationPassword, id)
-          : null;
-        const job = store.createJob({ id, count, prefix, usernames, destinationPasswordCiphertext });
-        if (destinationPasswordCiphertext) backupManager?.requestBackup?.('job-password-created');
+        const job = store.createJob({ id, count, prefix, usernames });
         return json(res, 201, job);
       }
 
@@ -606,7 +603,9 @@ export function createServer({
       }
 
       if (req.method === 'POST' && pathname === '/api/mailboxes/export-sensitive') {
-        if (!vault?.openJobPassword) return json(res, 503, { error: 'Encrypted destination-password vault is unavailable' });
+        if (!vault?.openMailboxPassword || !vault?.openJobPassword) {
+          return json(res, 503, { error: 'Encrypted mailbox-password vault is unavailable' });
+        }
         const body = await readJson(req, 8192);
         if (body.confirm !== 'EXPORT') return json(res, 400, { error: 'Sensitive export requires confirm="EXPORT"' });
         const search = String(body.search || '').slice(0, 100);
@@ -618,15 +617,13 @@ export function createServer({
           const record = store.getMailboxPasswordCiphertext(mailbox.id);
           return {
             email: mailbox.email,
-            destinationPassword: record?.destination_password_ciphertext
-              ? vault.openJobPassword(record.destination_password_ciphertext, record.job_id)
-              : '',
+            destinationPassword: openSavedMailboxPassword(vault, record),
           };
         });
         store.audit('warn', 'mailboxes.sensitive_export', `Explicit destination-password export created for ${items.length} mailbox(es)`);
         return text(res, 200, sensitiveMailboxesCsv(items), 'text/csv; charset=utf-8', {
           'cache-control': 'no-store',
-          'content-disposition': `attachment; filename="${exportFilename('csv').replace('.csv', '-destination-passwords.csv')}"`,
+          'content-disposition': `attachment; filename="${exportFilename('csv').replace('.csv', '-account-passwords.csv')}"`,
         });
       }
 
@@ -649,12 +646,14 @@ export function createServer({
 
       const revealMailboxPassword = routeMatch(pathname, '/api/mailboxes/:id/destination-password');
       if (req.method === 'POST' && revealMailboxPassword) {
-        if (!vault?.openJobPassword) return json(res, 503, { error: 'Encrypted destination-password vault is unavailable' });
+        if (!vault?.openMailboxPassword || !vault?.openJobPassword) {
+          return json(res, 503, { error: 'Encrypted mailbox-password vault is unavailable' });
+        }
         const record = store.getMailboxPasswordCiphertext(revealMailboxPassword.id);
         if (!record) return json(res, 404, { error: 'Mailbox not found' });
-        if (!record.destination_password_ciphertext) return json(res, 404, { error: 'Destination password is not configured for this mailbox' });
-        const password = vault.openJobPassword(record.destination_password_ciphertext, record.job_id);
-        store.audit('info', 'mailbox.destination_password_revealed', `Destination password revealed for ${record.email}`, record.job_id);
+        const password = openSavedMailboxPassword(vault, record);
+        if (!password) return json(res, 404, { error: 'Saved account password is not configured for this mailbox' });
+        store.audit('info', 'mailbox.destination_password_revealed', `Saved account password revealed for ${record.email}`, record.job_id);
         return json(res, 200, { password });
       }
 

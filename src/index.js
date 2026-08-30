@@ -35,7 +35,7 @@ if (legacyMigration.migratedMailboxes || runtimeRecovery.recovered || rebasedCre
 const backupManager = new BackupManager({ config, store, vault });
 const provider = new AtomicMailProvider(config, vault);
 const mailClient = new AtomicMailJmapClient(config, vault);
-const worker = new JobWorker({ store, provider, config, backupManager });
+const worker = new JobWorker({ store, provider, config, backupManager, vault });
 const cloudflareManualService = new CloudflareManualService({
   store,
   vault,

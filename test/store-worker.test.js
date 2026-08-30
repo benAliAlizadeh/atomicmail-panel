@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/db.js';
+import { CredentialVault } from '../src/credential-vault.js';
 import { JobWorker } from '../src/worker.js';
 
 function config(root) {
@@ -21,7 +22,16 @@ function config(root) {
     usernameMinLength: 10,
     usernameMaxLength: 14,
     credentialsRoot: path.join(root, 'credentials'),
+    runtimeCredentialsRoot: path.join(root, 'runtime'),
+    secretsDir: path.join(root, 'secrets'),
+    encryptionKeyPath: path.join(root, 'secrets', 'data.key'),
   };
+}
+
+function createVault(root) {
+  const vault = new CredentialVault(config(root));
+  vault.initialize();
+  return vault;
 }
 
 test('worker creates sequential mailboxes and completes a job', async () => {
@@ -45,7 +55,8 @@ test('worker creates sequential mailboxes and completes a job', async () => {
   };
 
   const job = store.createJob({ count: 3, prefix: '', usernames: ['alpha11111', 'bravo22222', 'charlie3333'] });
-  const worker = new JobWorker({ store, provider, config: config(root) });
+  const vault = createVault(root);
+  const worker = new JobWorker({ store, provider, config: config(root), vault });
 
   for (let i = 0; i < 10; i += 1) await worker.tick();
 
@@ -54,6 +65,18 @@ test('worker creates sequential mailboxes and completes a job', async () => {
   assert.equal(result.success_count, 3);
   assert.equal(store.countMailboxes(), 3);
   assert.equal(provider.maxActive, 1);
+  const passwordRows = store.db.prepare(`
+    SELECT id, account_password_ciphertext FROM mailboxes ORDER BY created_at, id
+  `).all();
+  const passwords = passwordRows.map((row) => vault.openMailboxPassword(row.account_password_ciphertext, row.id));
+  assert.equal(new Set(passwords).size, 3);
+  for (const password of passwords) {
+    assert.equal(password.length, 20);
+    assert.match(password, /^[A-Z]/);
+    assert.match(password, /[a-z]/);
+    assert.match(password, /[0-9]/);
+    assert.match(password, /[!@#$%^&*_.+=?-]/);
+  }
   store.close();
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -70,7 +93,7 @@ test('policy response opens permanent circuit and pauses job', async () => {
     },
   };
   const job = store.createJob({ count: 1, prefix: '', usernames: ['alpha11111'] });
-  const worker = new JobWorker({ store, provider, config: config(root) });
+  const worker = new JobWorker({ store, provider, config: config(root), vault: createVault(root) });
   await worker.tick();
   assert.equal(worker.circuitState().permanent, true);
   assert.equal(store.getJob(job.id).status, 'paused');
@@ -171,7 +194,7 @@ test('controlled worker shutdown aborts active registration and returns item to 
   };
 
   const job = store.createJob({ count: 1, prefix: '', usernames: ['stopper111'] });
-  const worker = new JobWorker({ store, provider, config: { ...config(root), shutdownGraceMs: 1000 } });
+  const worker = new JobWorker({ store, provider, config: { ...config(root), shutdownGraceMs: 1000 }, vault: createVault(root) });
 
   const tick = worker.tick();
   await new Promise((resolve) => setTimeout(resolve, 10));
@@ -209,7 +232,7 @@ test('controlled shutdown does not resurrect a cancelled in-flight item', async 
   };
 
   const job = store.createJob({ count: 1, prefix: '', usernames: ['stopcancel1'] });
-  const worker = new JobWorker({ store, provider, config: { ...config(root), shutdownGraceMs: 1000 } });
+  const worker = new JobWorker({ store, provider, config: { ...config(root), shutdownGraceMs: 1000 }, vault: createVault(root) });
 
   const tick = worker.tick();
   await new Promise((resolve) => setTimeout(resolve, 10));
@@ -274,6 +297,11 @@ test('existing pre-progress databases receive additive live-progress columns', (
       mailbox_id TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       UNIQUE(job_id, position), UNIQUE(job_id, username)
     );
+    CREATE TABLE mailboxes (
+      id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE, inbox_id TEXT NOT NULL,
+      credentials_path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+      job_id TEXT, job_item_id TEXT
+    );
     INSERT INTO jobs(id, requested_count, prefix, status, created_at, updated_at)
     VALUES('job_legacy', 1, 'old', 'completed', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
   `);
@@ -286,6 +314,8 @@ test('existing pre-progress databases receive additive live-progress columns', (
   }
   const jobColumns = new Set(store.db.prepare(`PRAGMA table_info(jobs)`).all().map((row) => row.name));
   assert.ok(jobColumns.has('destination_password_ciphertext'));
+  const mailboxColumns = new Set(store.db.prepare(`PRAGMA table_info(mailboxes)`).all().map((row) => row.name));
+  assert.ok(mailboxColumns.has('account_password_ciphertext'));
   assert.equal(store.getJob('job_legacy').prefix, 'old');
   assert.equal(store.getJob('job_legacy').has_destination_password, 0);
   store.close();

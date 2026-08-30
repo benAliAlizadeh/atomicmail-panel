@@ -69,6 +69,7 @@ export class Store {
         email TEXT NOT NULL UNIQUE,
         inbox_id TEXT NOT NULL,
         credentials_path TEXT NOT NULL,
+        account_password_ciphertext TEXT,
         status TEXT NOT NULL DEFAULT 'active',
         created_at TEXT NOT NULL,
         job_id TEXT,
@@ -170,6 +171,10 @@ export class Store {
     const jobColumns = new Set(this.db.prepare(`PRAGMA table_info(jobs)`).all().map((row) => row.name));
     if (!jobColumns.has('destination_password_ciphertext')) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN destination_password_ciphertext TEXT`);
+    }
+    const mailboxColumns = new Set(this.db.prepare(`PRAGMA table_info(mailboxes)`).all().map((row) => row.name));
+    if (!mailboxColumns.has('account_password_ciphertext')) {
+      this.db.exec(`ALTER TABLE mailboxes ADD COLUMN account_password_ciphertext TEXT`);
     }
     const jobItemColumns = new Set(this.db.prepare(`PRAGMA table_info(job_items)`).all().map((row) => row.name));
     const additions = [
@@ -565,18 +570,22 @@ export class Store {
     this.finalizeJobIfDone(item.job_id);
   }
 
-  markItemSucceeded(id, mailbox) {
+  markItemSucceeded(id, mailbox, { mailboxId = newId('mbx'), accountPasswordCiphertext = null } = {}) {
     const now = nowIso();
     const item = this.db.prepare('SELECT * FROM job_items WHERE id=?').get(id);
     if (!item) throw new Error('Job item not found');
-    const mailboxId = newId('mbx');
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare(`
-        INSERT INTO mailboxes(id, username, email, inbox_id, credentials_path, status, created_at, job_id, job_item_id)
-        VALUES(?, ?, ?, ?, ?, 'active', ?, ?, ?)
-      `).run(mailboxId, mailbox.username, mailbox.email, mailbox.inboxId, mailbox.credentialsPath, now, item.job_id, id);
+        INSERT INTO mailboxes(
+          id, username, email, inbox_id, credentials_path, account_password_ciphertext,
+          status, created_at, job_id, job_item_id
+        ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+      `).run(
+        mailboxId, mailbox.username, mailbox.email, mailbox.inboxId, mailbox.credentialsPath,
+        accountPasswordCiphertext, now, item.job_id, id,
+      );
       this.db.prepare(`
         UPDATE job_items
         SET status='succeeded', mailbox_id=?, last_error=NULL,
@@ -607,7 +616,7 @@ export class Store {
   getMailbox(id) {
     return this.db.prepare(`
       SELECT m.id, m.username, m.email, m.status, m.created_at, m.job_id,
-             j.destination_password_ciphertext IS NOT NULL AS has_destination_password
+             COALESCE(m.account_password_ciphertext, j.destination_password_ciphertext) IS NOT NULL AS has_destination_password
       FROM mailboxes m LEFT JOIN jobs j ON j.id=m.job_id WHERE m.id=?
     `).get(String(id || '')) || null;
   }
@@ -617,14 +626,14 @@ export class Store {
     if (!pattern) {
       return this.db.prepare(`
         SELECT m.id, m.username, m.email, m.status, m.created_at, m.job_id,
-               j.destination_password_ciphertext IS NOT NULL AS has_destination_password
+               COALESCE(m.account_password_ciphertext, j.destination_password_ciphertext) IS NOT NULL AS has_destination_password
         FROM mailboxes m LEFT JOIN jobs j ON j.id=m.job_id
         ORDER BY m.created_at DESC LIMIT ? OFFSET ?
       `).all(limit, offset);
     }
     return this.db.prepare(`
       SELECT m.id, m.username, m.email, m.status, m.created_at, m.job_id,
-             j.destination_password_ciphertext IS NOT NULL AS has_destination_password
+             COALESCE(m.account_password_ciphertext, j.destination_password_ciphertext) IS NOT NULL AS has_destination_password
       FROM mailboxes m LEFT JOIN jobs j ON j.id=m.job_id
       WHERE m.username LIKE ? OR m.email LIKE ?
       ORDER BY m.created_at DESC LIMIT ? OFFSET ?
@@ -662,7 +671,9 @@ export class Store {
 
   getMailboxPasswordCiphertext(mailboxId) {
     const row = this.db.prepare(`
-      SELECT m.id AS mailbox_id, m.email, m.job_id, j.destination_password_ciphertext
+      SELECT m.id AS mailbox_id, m.username, m.email, m.job_id,
+             m.account_password_ciphertext,
+             j.destination_password_ciphertext AS legacy_job_password_ciphertext
       FROM mailboxes m
       LEFT JOIN jobs j ON j.id=m.job_id
       WHERE m.id=?

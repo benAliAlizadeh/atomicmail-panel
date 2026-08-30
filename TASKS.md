@@ -32,8 +32,8 @@
 | AM-28 | Attachments | ✅ Done — guarded JMAP upload/download for Compose and Reply |
 | AM-29 | Verification Helper | ✅ Done — heuristic OTP and safe HTTP/HTTPS verification-link controls |
 | AM-30 | Mail Security hardening | ✅ Done — plain-text rendering, limits, CRLF rejection, secret redaction and safe downloads |
-| AM-31 | Per-job destination account password vault | ✅ Done — job-bound AES-256-GCM, protected reveal/copy and explicit sensitive CSV |
-| AM-32 | Webmail/password backup integration | ✅ Done — additive migration and verified portable restore coverage |
+| AM-31 | Saved account password vault | ✅ Done — automatic unique mailbox-bound AES-256-GCM passwords; protected reveal/copy/export with legacy shared-job compatibility |
+| AM-32 | Webmail/password backup integration | ✅ Done — additive mailbox-password column, verified portable restore, and Cloudflare exact-password reuse |
 | AM-33 | Full mail regression / production validation | ✅ Done — 50 automated mail/security/backup/restart/migration regressions plus read-only live Inbox/Sent smoke |
 | AM-34 | Responsive Operator UX | ✅ Done — end-to-end stale read cancellation, adaptive polling, progress/elapsed states, guarded Compose delivery and accessible async feedback |
 | AM-35 | Cloudflare Browser Runner (legacy) | ⚠️ Retired — retained only for additive migration compatibility; not started or exposed in the main UX |
@@ -47,5 +47,5 @@
 | Phase | Status | Scope |
 |---|---|---|
 | Phase A — Production / Current Version | ✅ Complete | 0.11.1 is deployed and healthy in production |
-| Phase B — End-to-End Live Validation | 🟡 In progress | The first real account exposed credential-step confusion; 0.11.2 adds clear next-step guidance, visible-after-save values for the current session, safe reveal/copy, guided completion, and stale-UI prevention |
+| Phase B — End-to-End Live Validation | 🟡 In progress | 0.11.2 fixes credential-step UX; 0.11.3 removes shared batch passwords, generates one unique password per completed email, and reuses that exact password in Cloudflare Focus Mode |
 | Phase C — Scale & UX Polish | ⏳ Pending | Continue the real 1-account flow, then 3-account → 5-account → larger-batch validation |

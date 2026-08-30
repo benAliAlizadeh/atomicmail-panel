@@ -78,3 +78,20 @@ test('Cloudflare credential UX keeps the operator oriented without weakening sec
   assert.match(styles, /\.focus-next-action/);
   assert.match(styles, /\.focus-attention/);
 });
+
+test('email creation assigns one automatic password per mailbox and Cloudflare reuses it', () => {
+  assert.doesNotMatch(html, /id="destinationPassword"|id="toggleDestinationPassword"/);
+  assert.match(html, /Automatic unique password/);
+  assert.match(html, /Every completed email gets its own strong 20-character saved account password/);
+  assert.match(html, /Email \+ Cloudflare password/);
+  assert.match(html, /same encrypted password saved for this email/);
+  const createFlow = app.slice(
+    app.indexOf("$('#createForm').addEventListener('submit'"),
+    app.indexOf("$('#jobsBody').addEventListener", app.indexOf("$('#createForm').addEventListener('submit'")),
+  );
+  assert.match(createFlow, /count: Number\(\$\('#batchCount'\)\.value\)/);
+  assert.match(createFlow, /prefix: \$\('#batchPrefix'\)\.value/);
+  assert.doesNotMatch(createFlow, /destinationPassword/);
+  assert.match(app, /Updating the email and Cloudflare password together/);
+  assert.match(app, /Email and Cloudflare password updated together/);
+});

@@ -43,6 +43,12 @@ test('redacts API keys and JWTs', () => {
   assert.ok(!safe.includes('cfut_TEST_user_token_abcdefghijklmnop'));
   assert.ok(!safe.includes('eyJabc.def.ghi'));
   assert.ok(!safe.includes('abc123'));
+  const structured = redactSecrets(JSON.stringify({
+    accountPassword: 'Mailbox!Secret-1234',
+    account_password_ciphertext: 'encrypted-envelope-value',
+  }));
+  assert.ok(!structured.includes('Mailbox!Secret-1234'));
+  assert.ok(!structured.includes('encrypted-envelope-value'));
 });
 
 test('retry delay remains capped with jitter', () => {

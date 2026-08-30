@@ -1,5 +1,6 @@
+import { generateAccountPassword } from './account-password.js';
 import { generateUsername } from './username-generator.js';
-import { retryDelay, redactSecrets } from './utils.js';
+import { newId, retryDelay, redactSecrets } from './utils.js';
 
 const CIRCUIT_KEY = 'worker.circuit';
 const NOT_BEFORE_KEY = 'worker.not_before';
@@ -9,11 +10,13 @@ function sleep(ms) {
 }
 
 export class JobWorker {
-  constructor({ store, provider, config, backupManager = null }) {
+  constructor({ store, provider, config, backupManager = null, vault }) {
+    if (!vault?.sealMailboxPassword) throw new Error('JobWorker requires the encrypted mailbox-password vault');
     this.store = store;
     this.provider = provider;
     this.config = config;
     this.backupManager = backupManager;
+    this.vault = vault;
     this.timer = null;
     this.busy = false;
     this.stopping = false;
@@ -131,9 +134,12 @@ export class JobWorker {
           this.store.updateItemProgress(item.id, phase, message);
         },
       });
-      this.store.updateItemProgress(item.id, 'saving', 'Provider registration complete; saving mailbox record');
-      this.store.markItemSucceeded(item.id, mailbox);
-      this.store.audit('info', 'mailbox.created', `Created ${mailbox.email}`, item.job_id, item.id);
+      this.store.updateItemProgress(item.id, 'saving', 'Provider registration complete; generating the unique account password');
+      const mailboxId = newId('mbx');
+      const accountPassword = generateAccountPassword(20);
+      const accountPasswordCiphertext = this.vault.sealMailboxPassword(accountPassword, mailboxId);
+      this.store.markItemSucceeded(item.id, mailbox, { mailboxId, accountPasswordCiphertext });
+      this.store.audit('info', 'mailbox.created', `Created ${mailbox.email} with its encrypted unique account password`, item.job_id, item.id);
       this.backupManager?.requestBackup('mailbox-created');
       this.consecutiveTransientFailures = 0;
       this.setNotBefore(this.config.postSuccessDelayMs);

@@ -1,4 +1,4 @@
-import crypto from 'node:crypto';
+import { generateAccountPassword } from './account-password.js';
 import { isCloudflareVerificationUrl } from './cloudflare-verification.js';
 import { newId, nowIso } from './utils.js';
 
@@ -11,13 +11,7 @@ export const CLOUDFLARE_MANUAL_STATUSES = new Set([
   'failed',
 ]);
 
-const PASSWORD_GROUPS = [
-  'ABCDEFGHJKLMNPQRSTUVWXYZ',
-  'abcdefghijkmnopqrstuvwxyz',
-  '23456789',
-  '!@#$%^&*_-+=?',
-];
-const PASSWORD_ALPHABET = PASSWORD_GROUPS.join('');
+export const generateCloudflareAccountPassword = generateAccountPassword;
 
 function exposedError(message, statusCode = 400, code = 'invalid_cloudflare_request') {
   return Object.assign(new Error(message), { statusCode, code, expose: true });
@@ -53,29 +47,6 @@ function safeSignupUrl(value) {
   return 'https://dash.cloudflare.com/sign-up';
 }
 
-function shuffleSecure(characters) {
-  for (let index = characters.length - 1; index > 0; index -= 1) {
-    const other = crypto.randomInt(index + 1);
-    [characters[index], characters[other]] = [characters[other], characters[index]];
-  }
-  return characters;
-}
-
-export function generateCloudflareAccountPassword(length = 20) {
-  const safeLength = Number(length);
-  if (!Number.isInteger(safeLength) || safeLength < PASSWORD_GROUPS.length || safeLength > 128) {
-    throw new TypeError('Cloudflare password length must be an integer between 4 and 128');
-  }
-  // Keep the first character alphabetic so an exact password remains safe in
-  // spreadsheet CSV consumers without formula-escaping changing its value.
-  const first = PASSWORD_GROUPS[0][crypto.randomInt(PASSWORD_GROUPS[0].length)];
-  const characters = PASSWORD_GROUPS.slice(1).map((group) => group[crypto.randomInt(group.length)]);
-  while (characters.length < safeLength - 1) {
-    characters.push(PASSWORD_ALPHABET[crypto.randomInt(PASSWORD_ALPHABET.length)]);
-  }
-  return `${first}${shuffleSecure(characters).join('')}`;
-}
-
 function normalizeLegacyStatus(account, item) {
   if (account.status === 'verified' || item?.status === 'verified') return 'verified';
   if (item?.verification_url_ciphertext || item?.verification_received_at) return 'verification_received';
@@ -102,7 +73,9 @@ function publicAccountColumns(alias = 'a') {
 export class CloudflareManualService {
   constructor({ store, vault, mailClient = null, backupManager = null, config = {} }) {
     if (!store?.db) throw new Error('CloudflareManualService requires the primary SQLite store');
-    if (!vault?.sealCloudflareSecret || !vault?.openCloudflareSecret) {
+    if (!vault?.sealCloudflareSecret || !vault?.openCloudflareSecret
+        || !vault?.sealMailboxPassword || !vault?.openMailboxPassword
+        || !vault?.openJobPassword) {
       throw new Error('CloudflareManualService requires the encrypted credential vault');
     }
     this.store = store;
@@ -116,11 +89,16 @@ export class CloudflareManualService {
   initialize() {
     const rows = this.db.prepare(`
       SELECT a.*, j.password_ciphertext AS legacy_password_ciphertext,
+             m.account_password_ciphertext AS mailbox_password_ciphertext,
+             m.job_id AS mailbox_job_id,
+             mj.destination_password_ciphertext AS mailbox_legacy_job_password_ciphertext,
              i.id AS item_id, i.status AS item_status, i.submitted_at AS item_submitted_at,
              i.verification_received_at AS item_verification_received_at,
              i.verification_url_ciphertext AS item_verification_url_ciphertext
       FROM cloudflare_accounts a
       JOIN cloudflare_jobs j ON j.id=a.credential_job_id
+      JOIN mailboxes m ON m.id=a.mailbox_id
+      LEFT JOIN jobs mj ON mj.id=m.job_id
       LEFT JOIN cloudflare_job_items i ON i.account_id=a.id AND i.job_id=a.credential_job_id
       WHERE a.workflow_mode<>'manual' OR a.password_ciphertext IS NULL
       ORDER BY a.created_at, i.position
@@ -147,8 +125,12 @@ export class CloudflareManualService {
         if (!passwordCiphertext) {
           try {
             let password;
-            if (status === 'not_started') {
-              do { password = generateCloudflareAccountPassword(); } while (seenPasswords.has(password));
+            if (row.mailbox_password_ciphertext) {
+              password = this.vault.openMailboxPassword(row.mailbox_password_ciphertext, row.mailbox_id);
+            } else if (row.mailbox_legacy_job_password_ciphertext) {
+              password = this.vault.openJobPassword(row.mailbox_legacy_job_password_ciphertext, row.mailbox_job_id);
+            } else if (status === 'not_started') {
+              do { password = generateAccountPassword(); } while (seenPasswords.has(password));
             } else {
               password = this.vault.openCloudflareSecret(row.legacy_password_ciphertext, {
                 purpose: 'cloudflare-job-password', id: row.credential_job_id,
@@ -218,8 +200,83 @@ export class CloudflareManualService {
       this.store.audit('info', 'cloudflare.manual_migration', `Migrated ${migrated} Cloudflare account record(s) to the manual assistant`);
       this.backupManager?.requestBackup?.('cloudflare-manual-migration');
     }
+    this.reconcileMailboxPasswords();
     this.repairStoredVerificationState();
     return { migrated, legacyCredentialsPreserved, failures };
+  }
+
+  reconcileMailboxPasswords() {
+    const rows = this.db.prepare(`
+      SELECT a.id AS account_id, a.mailbox_id, a.credential_job_id AS job_id,
+             a.status, a.password_ciphertext,
+             m.account_password_ciphertext AS mailbox_password_ciphertext,
+             m.job_id AS mailbox_job_id,
+             j.destination_password_ciphertext AS legacy_job_password_ciphertext
+      FROM cloudflare_accounts a
+      JOIN mailboxes m ON m.id=a.mailbox_id
+      LEFT JOIN jobs j ON j.id=m.job_id
+      WHERE a.workflow_mode='manual'
+        AND (a.password_ciphertext IS NULL OR m.account_password_ciphertext IS NULL)
+      ORDER BY a.created_at
+    `).all();
+    if (!rows.length) return 0;
+
+    const repairs = [];
+    const generated = new Set();
+    for (const row of rows) {
+      let password = '';
+      try {
+        if (row.password_ciphertext) {
+          password = this.vault.openCloudflareSecret(row.password_ciphertext, {
+            purpose: 'cloudflare-account-password', id: row.account_id,
+          });
+        } else if (row.mailbox_password_ciphertext) {
+          password = this.vault.openMailboxPassword(row.mailbox_password_ciphertext, row.mailbox_id);
+        } else if (row.legacy_job_password_ciphertext) {
+          password = this.vault.openJobPassword(row.legacy_job_password_ciphertext, row.mailbox_job_id);
+        } else if (row.status === 'not_started') {
+          do { password = generateAccountPassword(); } while (generated.has(password));
+          generated.add(password);
+        }
+      } catch {
+        password = '';
+      }
+      if (!password) continue;
+      repairs.push({
+        ...row,
+        accountCiphertext: row.password_ciphertext || this.vault.sealCloudflareSecret(password, {
+          purpose: 'cloudflare-account-password', id: row.account_id,
+        }),
+        mailboxCiphertext: row.mailbox_password_ciphertext || this.vault.sealMailboxPassword(password, row.mailbox_id),
+      });
+    }
+    if (!repairs.length) return 0;
+
+    const now = nowIso();
+    const updateAccount = this.db.prepare(`
+      UPDATE cloudflare_accounts SET password_ciphertext=?, updated_at=? WHERE id=?
+    `);
+    const updateMailbox = this.db.prepare(`
+      UPDATE mailboxes SET account_password_ciphertext=? WHERE id=?
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const repair of repairs) {
+        updateAccount.run(repair.accountCiphertext, now, repair.account_id);
+        updateMailbox.run(repair.mailboxCiphertext, repair.mailbox_id);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    this.store.audit(
+      'info',
+      'cloudflare.mailbox_password_linked',
+      `Linked ${repairs.length} Cloudflare password record(s) to their mailbox password`,
+    );
+    this.backupManager?.requestBackup?.('cloudflare-mailbox-password-linked');
+    return repairs.length;
   }
 
   repairStoredVerificationState() {
@@ -278,7 +335,12 @@ export class CloudflareManualService {
       throw exposedError('Mailbox selection contains invalid or duplicate entries');
     }
     const mailboxes = this.db.prepare(`
-      SELECT id, username, email, status FROM mailboxes WHERE id IN (${placeholders(ids.length)})
+      SELECT m.id, m.username, m.email, m.status, m.job_id,
+             m.account_password_ciphertext,
+             j.destination_password_ciphertext AS legacy_job_password_ciphertext
+      FROM mailboxes m
+      LEFT JOIN jobs j ON j.id=m.job_id
+      WHERE m.id IN (${placeholders(ids.length)})
     `).all(...ids);
     if (mailboxes.length !== ids.length) throw exposedError('One or more selected mailboxes do not exist', 404, 'mailbox_not_found');
     const byId = new Map(mailboxes.map((row) => [row.id, row]));
@@ -295,17 +357,38 @@ export class CloudflareManualService {
 
     const jobId = newId('cfjob');
     const now = nowIso();
-    const generated = new Set();
+    const seenPasswords = new Set();
     const accounts = ids.map((mailboxId, index) => {
-      let password;
-      do { password = generateCloudflareAccountPassword(20); } while (generated.has(password));
-      generated.add(password);
+      const mailbox = byId.get(mailboxId);
+      let password = '';
+      let mailboxPasswordCiphertext = mailbox.account_password_ciphertext;
+      try {
+        if (mailboxPasswordCiphertext) {
+          password = this.vault.openMailboxPassword(mailboxPasswordCiphertext, mailbox.id);
+        } else if (mailbox.legacy_job_password_ciphertext) {
+          password = this.vault.openJobPassword(mailbox.legacy_job_password_ciphertext, mailbox.job_id);
+        } else {
+          do { password = generateAccountPassword(20); } while (seenPasswords.has(password));
+        }
+      } catch {
+        throw exposedError(
+          `The saved password for ${mailbox.email} could not be decrypted with the active data key`,
+          409,
+          'mailbox_password_unavailable',
+        );
+      }
+      seenPasswords.add(password);
+      if (!mailboxPasswordCiphertext) {
+        mailboxPasswordCiphertext = this.vault.sealMailboxPassword(password, mailbox.id);
+      }
       const accountId = newId('cfacct');
       return {
-        mailbox: byId.get(mailboxId),
+        mailbox,
         accountId,
         itemId: newId('cfitem'),
         position: index + 1,
+        mailboxPasswordCiphertext,
+        needsMailboxPasswordUpdate: !mailbox.account_password_ciphertext,
         passwordCiphertext: this.vault.sealCloudflareSecret(password, {
           purpose: 'cloudflare-account-password', id: accountId,
         }),
@@ -320,8 +403,12 @@ export class CloudflareManualService {
       this.db.prepare(`
         INSERT INTO cloudflare_jobs(
           id, requested_count, password_mode, password_ciphertext, status, created_at, updated_at
-        ) VALUES(?, ?, 'per_account_generated', ?, 'running', ?, ?)
+        ) VALUES(?, ?, 'mailbox_account_password', ?, 'running', ?, ?)
       `).run(jobId, accounts.length, batchMarker, now, now);
+      const updateMailboxPassword = this.db.prepare(`
+        UPDATE mailboxes SET account_password_ciphertext=?
+        WHERE id=? AND account_password_ciphertext IS NULL
+      `);
       const insertAccount = this.db.prepare(`
         INSERT INTO cloudflare_accounts(
           id, mailbox_id, email, credential_job_id, status, password_ciphertext,
@@ -333,9 +420,12 @@ export class CloudflareManualService {
           id, job_id, account_id, mailbox_id, position, email, status, phase,
           phase_message, next_attempt_at, created_at, updated_at
         ) VALUES(?, ?, ?, ?, ?, ?, 'not_started', 'not_started',
-          'Ready for manual Cloudflare signup', ?, ?, ?)
+          'Ready with the saved email password for manual Cloudflare signup', ?, ?, ?)
       `);
       for (const account of accounts) {
+        if (account.needsMailboxPasswordUpdate) {
+          updateMailboxPassword.run(account.mailboxPasswordCiphertext, account.mailbox.id);
+        }
         insertAccount.run(
           account.accountId, account.mailbox.id, account.mailbox.email, jobId,
           account.passwordCiphertext, now, now,
@@ -353,7 +443,7 @@ export class CloudflareManualService {
       }
       throw error;
     }
-    this.store.audit('info', 'cloudflare.manual_batch_created', `Created manual Cloudflare batch with ${accounts.length} account(s)`, jobId);
+    this.store.audit('info', 'cloudflare.manual_batch_created', `Created manual Cloudflare batch with ${accounts.length} mailbox-linked password(s)`, jobId);
     this.backupManager?.requestBackup?.('cloudflare-manual-batch-created');
     return { id: jobId, requested_count: accounts.length, created_at: now, focus: this.getFocusAccount() };
   }
@@ -477,14 +567,24 @@ export class CloudflareManualService {
     if (account.status !== 'not_started' || account.password_locked_at || account.signup_done_at) {
       throw exposedError('Password regeneration is locked after Signup Done', 409, 'cloudflare_password_locked');
     }
-    const password = generateCloudflareAccountPassword(20);
-    const ciphertext = this.vault.sealCloudflareSecret(password, {
+    const password = generateAccountPassword(20);
+    const accountCiphertext = this.vault.sealCloudflareSecret(password, {
       purpose: 'cloudflare-account-password', id: account.id,
     });
+    const mailboxCiphertext = this.vault.sealMailboxPassword(password, account.mailbox_id);
     const now = nowIso();
-    this.db.prepare('UPDATE cloudflare_accounts SET password_ciphertext=?, updated_at=? WHERE id=?')
-      .run(ciphertext, now, account.id);
-    this.store.audit('warn', 'cloudflare.password_regenerated', 'Cloudflare account password regenerated before signup', account.job_id);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE mailboxes SET account_password_ciphertext=? WHERE id=?')
+        .run(mailboxCiphertext, account.mailbox_id);
+      this.db.prepare('UPDATE cloudflare_accounts SET password_ciphertext=?, updated_at=? WHERE id=?')
+        .run(accountCiphertext, now, account.id);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    this.store.audit('warn', 'cloudflare.password_regenerated', 'Saved email and Cloudflare password regenerated together before signup', account.job_id);
     this.backupManager?.requestBackup?.('cloudflare-password-regenerated');
     return { account: this.getAccount(account.id), password };
   }

@@ -36,9 +36,9 @@ A conservative Atomic Mail batch-registration panel. Registration remains strict
 - mark read/unread, Archive, safe move-to-Trash and conservative per-mailbox auto-refresh
 - safe attachment upload/download through the AgentSkill JMAP blob flow
 - verification-code and verification-link helpers without executing message HTML
-- encrypted per-job destination-account password vault with CSRF-protected reveal/copy and explicit sensitive export
+- automatic unique 20-character saved account password per mailbox, encrypted with mailbox-bound AES-256-GCM and available only through protected reveal/copy or explicit sensitive export
 - manual Cloudflare Focus Mode for selected AtomicMail inboxes
-- unique random 20-character password per Cloudflare account, encrypted with account-bound AES-256-GCM
+- Cloudflare Focus Mode reuses the exact saved password of each selected email, while keeping its Cloudflare copy independently account-bound and encrypted
 - durable Signup Done / Verification Received / Verified progress with duplicate prevention and restart resume
 - on-demand trusted Cloudflare verification-email detection that returns either a login/security code or a strict Cloudflare HTTPS verification link directly in Focus Mode
 - per-account encrypted Cloudflare Global API Key + API Token vault with reveal/copy and explicit secure export
@@ -125,11 +125,11 @@ Do not delete or overwrite these directories. `credentials.json` contains the AP
 
 This panel uses Atomic Mail's **agent** registration path and creates `@atomicmail.ai` inboxes. That path authenticates with an API key/JWT credential model and does **not** create a human webmail password or a 12-word recovery seed phrase. Password + BIP39 seed phrases belong to Atomic Mail's separate human-facing `@atomicmail.io` account flow.
 
-The optional **Destination account password** on the Create page is deliberately separate: it is an encrypted operator vault value shared by every mailbox in that job for use at destination services. It is never sent to Atomic Mail and is not an Atomic Mail credential.
+Every successfully created mailbox automatically receives its own strong 20-character **saved account password** for destination services such as Cloudflare. The Create page no longer accepts a shared batch password. This saved value is never sent to Atomic Mail and is not an Atomic Mail credential; the inbox itself still uses its API key/JWT vault.
 
 ## Create emails
 
-Use **Create emails** in the web panel, enter a count and optional prefix, then create the batch. The server reserves final usernames and the worker processes them one by one.
+Use **Create emails** in the web panel, enter a count and optional prefix, then create the batch. The server reserves final usernames and the worker processes them one by one. After each mailbox succeeds, the worker generates and mailbox-binds a different 20-character saved account password; no password field or shared batch secret is required.
 
 A policy/abuse-protection response opens a permanent circuit and pauses the affected job. The panel never automatically resets a permanent circuit; an operator must review the provider response and explicitly reset it from **System**.
 
@@ -138,7 +138,7 @@ A policy/abuse-protection response opens a permanent circuit and pauses the affe
 The current Cloudflare workflow is intentionally simple and does not use Playwright, a paired runner, or browser automation.
 
 1. Open **Mailboxes**, select up to 100 unused inboxes, and choose **Create Cloudflare batch**.
-2. The panel generates a different 20-character password for every email and encrypts it at rest.
+2. The panel loads the exact mailbox-bound 20-character password already saved for each selected email and encrypts the Cloudflare account copy with its own account-bound scope.
 3. In **Cloudflare Accounts → Focus Mode**, copy the current email and password, then choose **Open Cloudflare Signup**.
 4. Complete signup yourself in the official Cloudflare page and return to choose **Signup Done**. This locks the password.
 5. Choose **Check Inbox & Get Code/Link**. The panel checks only that Atomic Mail inbox and trusted Cloudflare messages addressed to that exact recipient. A bounded 10-minute lookback covers codes/links delivered just before you returned and clicked Signup Done; configure it with `CLOUDFLARE_VERIFICATION_LOOKBACK_SECONDS`. Rechecking never downgrades or removes previously saved trusted evidence when no newer message is found.
@@ -146,7 +146,7 @@ The current Cloudflare workflow is intentionally simple and does not use Playwri
 7. After Cloudflare shows the account as verified, paste its **Global API Key** and **API Token** into the Focus Mode vault and save them. Either field can be added/replaced later.
 8. Choose **Mark Verified & Next**. Focus Mode advances to the next unfinished account in the batch.
 
-Focus Mode resumes from the first unfinished record after a restart. An email already present in `cloudflare_accounts` can never be selected again; the Mailboxes page shows its saved status and verification date. Password regeneration is allowed only before Signup Done. For batches up to 100 accounts, the current account remains the only operational focus and the next item is selected automatically after Verified/Failed.
+Focus Mode resumes from the first unfinished record after a restart. An email already present in `cloudflare_accounts` can never be selected again; the Mailboxes page shows its saved status and verification date. Password regeneration is allowed only before Signup Done and updates the mailbox password and Cloudflare password together in one transaction. For batches up to 100 accounts, the current account remains the only operational focus and the next item is selected automatically after Verified/Failed.
 
 Normal account/list APIs never return passwords, verification codes/URLs, Global API Keys, or API Tokens. Reveal/copy and the separate `Email,Password,GlobalApiKey,ApiToken,Status` CSV use authenticated POST actions with `Cache-Control: no-store`; audit records contain the action but never the secret. The SQLite columns holding these values contain only account-bound AES-256-GCM ciphertext, so the existing encrypted backup/restore pipeline includes them automatically.
 
@@ -266,9 +266,9 @@ MAIL_MAX_TOTAL_ATTACHMENT_BYTES=10485760
 
 ## Exports
 
-The Mailboxes page exports the current search as CSV or JSON. Provider credentials, credential paths and destination passwords are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS`.
+The Mailboxes page exports the current search as CSV or JSON. Provider credentials, credential paths and saved account passwords are intentionally excluded. Exports are capped by `EXPORT_MAX_ROWS`.
 
-**Export email + password** is a separate, explicit POST/CSRF-protected action with a warning confirmation. Its CSV contains plaintext destination passwords and must be handled as sensitive data. Reveal/copy actions are likewise explicit and audited without recording the password value.
+**Export email + password** is a separate, explicit POST/CSRF-protected action with a warning confirmation. Its CSV contains each mailbox's plaintext saved account password and must be handled as sensitive data. Reveal/copy actions are likewise explicit and audited without recording the password value.
 
 ## Provider command
 
@@ -346,7 +346,7 @@ The service should report healthy before you use **Create emails**.
 
 ## Live validation status
 
-AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→30 complete the multi-mailbox JMAP Webmail, actions, live refresh, search/pagination, attachments, verification helpers and mail security controls. AM-31→32 add the encrypted per-job destination-password vault and backup/restore integration. AM-33 adds full regression, security, migration, backup and restart coverage. AM-34 removes stale-response races all the way through safe JMAP read-process cancellation, replaces aggressive polling with an adaptive non-overlapping scheduler, and gives every long operator action immediate progress, elapsed-time and accessible busy feedback. AM-35 adds the isolated, operator-assisted Cloudflare signup/verification workflow and visible companion browser runner. Send/Reply and Cloudflare signup Submit remain deliberately non-cancellable after provider submission so their external state never becomes ambiguous.
+AM-18 is complete after the first operator-approved real `@atomicmail.ai` inbox registration succeeded and appeared in the panel. AM-19 adds live phase/heartbeat/elapsed/ETA visibility so long sequential batches no longer look hung. AM-20 encrypts permanent provider credentials, adds verified automatic backups/offline restore, and makes mailbox credentials portable across machines when the encryption key is carried separately. AM-21→30 complete the multi-mailbox JMAP Webmail, actions, live refresh, search/pagination, attachments, verification helpers and mail security controls. AM-31→32 introduced the encrypted saved-password vault and backup/restore integration; version 0.11.3 upgrades the active flow from legacy job-shared values to automatic mailbox-bound passwords. AM-33 adds full regression, security, migration, backup and restart coverage. AM-34 removes stale-response races all the way through safe JMAP read-process cancellation, replaces aggressive polling with an adaptive non-overlapping scheduler, and gives every long operator action immediate progress, elapsed-time and accessible busy feedback. AM-35 adds the isolated, operator-assisted Cloudflare signup/verification workflow and visible companion browser runner. Send/Reply and Cloudflare signup Submit remain deliberately non-cancellable after provider submission so their external state never becomes ambiguous.
 
 The AM-33 production check also completed a read-only live JMAP smoke for both Inbox and Sent against a temporary copy of the existing vault. No message was sent, modified or deleted, and the source data directory was not migrated or rewritten by the smoke.
 
@@ -355,6 +355,8 @@ AM-36 retires the live Browser Runner from runtime and the primary UI. Cloudflar
 Version 0.11.1 starts Phase B live-validation hardening. An empty Inbox recheck after trusted evidence has already been stored now preserves both the encrypted evidence and the `verification_received` workflow state. Startup repairs any AM-38 records already left in the inconsistent waiting state, and the backend completion guard validates durable evidence rather than depending on that transient status alone.
 
 Version 0.11.2 applies the first real-use UX findings without changing the database or secret model. Focus Mode now always states the next required action, **Continue setup** scrolls to and focuses the missing step, saved credential values remain visible immediately after a successful save in the current browser session, and refresh/account-change/logout hides them again until an explicit reveal. Copy actions no longer reveal values on screen as a side effect. Versioned asset URLs plus `Cache-Control: no-store` prevent stale pre-deploy UI from hiding newly added controls.
+
+Version 0.11.3 removes the shared password field from email creation. Every newly completed mailbox now receives a separately generated, mailbox-bound 20-character saved account password. Cloudflare Focus Mode reuses that exact value, and pre-signup regeneration changes both encrypted copies atomically. The SQLite column is added automatically at startup; existing mailbox, job, Cloudflare, vault, and backup data is preserved.
 
 ## AM-20 — encrypted credential vault, backup and portability
 
@@ -401,7 +403,7 @@ On Linux/macOS, storage directories are hardened to mode `0700` and secret files
 
 Backups are written to `backups/` as authenticated `.ambak` files. Each backup contains a consistent SQLite snapshot plus the encrypted credential vault, then the whole compressed payload is encrypted again with a purpose-derived AES-256-GCM key.
 
-Per-job destination passwords live only as AES-256-GCM ciphertext in SQLite under a separate HKDF purpose and job-bound authenticated data. They are included automatically in the SQLite snapshot and survive restore only when the matching `secrets/data.key` is available.
+New saved account passwords live only as AES-256-GCM ciphertext in SQLite under a separate HKDF purpose and mailbox-bound authenticated data. They are included automatically in the SQLite snapshot and survive restore only when the matching `secrets/data.key` is available. Existing legacy job-shared ciphertext remains readable for backward compatibility and is never deleted by the additive upgrade.
 
 Defaults:
 
@@ -412,7 +414,7 @@ BACKUP_MIN_GAP_MINUTES=5
 BACKUP_RETENTION=14
 ```
 
-A successful mailbox creation or a new destination-password job requests a debounced backup; scheduled backups run as a second layer, and graceful shutdown creates a final backup whenever persisted job/mailbox data exists. A backup is only reported successful after decryption and SQLite `integrity_check` pass.
+A successful mailbox creation requests a debounced backup after its unique saved account password is stored; scheduled backups run as a second layer, and graceful shutdown creates a final backup whenever persisted job/mailbox data exists. A backup is only reported successful after decryption and SQLite `integrity_check` pass.
 
 The **System → Data safety & portability** card can create a backup manually and verify the latest backup without exposing any credential material.
 

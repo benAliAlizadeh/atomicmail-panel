@@ -167,6 +167,27 @@ export class CredentialVault {
     }).toString('utf8');
   }
 
+  sealMailboxPassword(password, mailboxId) {
+    const id = String(mailboxId || '');
+    if (!id || id.length > 160) throw new Error('Mailbox password scope is invalid');
+    const plaintext = Buffer.from(String(password), 'utf8');
+    if (plaintext.length === 0) throw new Error('Mailbox account password cannot be empty');
+    return this.encryptBuffer(plaintext, {
+      purpose: 'mailbox-account-password',
+      aad: `mailbox:${id}`,
+    }).toString('base64');
+  }
+
+  openMailboxPassword(ciphertext, mailboxId) {
+    const id = String(mailboxId || '');
+    if (!id || id.length > 160) throw new Error('Mailbox password scope is invalid');
+    if (typeof ciphertext !== 'string' || !ciphertext) throw new Error('Mailbox account password is not configured');
+    return this.decryptBuffer(Buffer.from(ciphertext, 'base64'), {
+      purpose: 'mailbox-account-password',
+      aad: `mailbox:${id}`,
+    }).toString('utf8');
+  }
+
   sealCloudflareSecret(value, { purpose, id }) {
     const safePurpose = String(purpose || '');
     const safeId = String(id || '');

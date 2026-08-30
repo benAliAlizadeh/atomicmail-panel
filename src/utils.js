@@ -32,7 +32,7 @@ export function redactSecrets(input) {
     .replace(/\bcfk_[a-zA-Z0-9_-]{8,}\b/g, '[CLOUDFLARE_API_KEY_REDACTED]')
     .replace(/\b(?:cfat|cfut)_[a-zA-Z0-9_-]{8,}\b/g, '[CLOUDFLARE_API_TOKEN_REDACTED]')
     .replace(/("apiKey"\s*:\s*")[^"]+("\s*)/gi, '$1[REDACTED]$2')
-    .replace(/("(?:globalApiKey|apiToken|destinationPassword|destination_password|destination_password_ciphertext|password)"\s*:\s*")[^"]*("\s*)/gi, '$1[REDACTED]$2')
+    .replace(/("(?:globalApiKey|apiToken|accountPassword|account_password|account_password_ciphertext|destinationPassword|destination_password|destination_password_ciphertext|password)"\s*:\s*")[^"]*("\s*)/gi, '$1[REDACTED]$2')
     .replace(/(?:[a-z]:)?[^\s"']*[\\/]credentials[\\/][^\s"']+/gi, '[CREDENTIAL_PATH_REDACTED]')
     .replace(/(?:[a-z]:)?[^\s"']*[\\/]secrets[\\/]data\.key/gi, '[DATA_KEY_PATH_REDACTED]');
 }

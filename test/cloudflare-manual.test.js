@@ -56,6 +56,65 @@ test('manual Cloudflare passwords are 20 characters, unique, and satisfy every c
   }
 });
 
+
+test('Cloudflare Focus reuses the exact password already saved for the selected email', () => {
+  const current = fixture();
+  try {
+    const password = 'Exact!Mailbox-Cloudflare-7722';
+    current.store.db.prepare(`
+      UPDATE mailboxes SET account_password_ciphertext=? WHERE id='mbx_1'
+    `).run(current.vault.sealMailboxPassword(password, 'mbx_1'));
+    current.service.createBatch(['mbx_1']);
+    const account = current.service.getFocusAccount().account;
+    assert.equal(account.mailbox_id, 'mbx_1');
+    assert.equal(current.service.revealPassword(account.id), password);
+    const mailbox = current.store.getMailboxPasswordCiphertext('mbx_1');
+    assert.equal(
+      current.vault.openMailboxPassword(mailbox.account_password_ciphertext, mailbox.mailbox_id),
+      password,
+    );
+  } finally {
+    current.close();
+  }
+});
+
+test('startup links an existing manual Cloudflare password back to its mailbox without changing it', () => {
+  const current = fixture();
+  try {
+    const jobId = 'cfjob_existing_manual';
+    const accountId = 'cfacct_existing_manual';
+    const password = 'Existing!Cloudflare-Password-8822';
+    const now = new Date().toISOString();
+    const markerCiphertext = current.vault.sealCloudflareSecret('manual-assistant-v1', {
+      purpose: 'cloudflare-job-password', id: jobId,
+    });
+    const passwordCiphertext = current.vault.sealCloudflareSecret(password, {
+      purpose: 'cloudflare-account-password', id: accountId,
+    });
+    current.store.db.prepare(`
+      INSERT INTO cloudflare_jobs(id, requested_count, password_mode, password_ciphertext, status, created_at, updated_at)
+      VALUES(?, 1, 'per_account_generated', ?, 'running', ?, ?)
+    `).run(jobId, markerCiphertext, now, now);
+    current.store.db.prepare(`
+      INSERT INTO cloudflare_accounts(
+        id, mailbox_id, email, credential_job_id, status, password_ciphertext,
+        notes, workflow_mode, created_at, updated_at
+      ) VALUES(?, 'mbx_1', 'manualuser1@atomicmail.ai', ?, 'not_started', ?, '', 'manual', ?, ?)
+    `).run(accountId, jobId, passwordCiphertext, now, now);
+
+    assert.equal(current.store.getMailboxPasswordCiphertext('mbx_1').account_password_ciphertext, null);
+    assert.deepEqual(current.service.initialize(), { migrated: 0, legacyCredentialsPreserved: 0, failures: 0 });
+    const mailbox = current.store.getMailboxPasswordCiphertext('mbx_1');
+    assert.equal(
+      current.vault.openMailboxPassword(mailbox.account_password_ciphertext, mailbox.mailbox_id),
+      password,
+    );
+    assert.equal(current.service.revealPassword(accountId), password);
+  } finally {
+    current.close();
+  }
+});
+
 test('manual batch encrypts a different password per account and blocks duplicate email reuse', () => {
   const current = fixture();
   try {
@@ -67,14 +126,22 @@ test('manual batch encrypts a different password per account and blocks duplicat
     const passwords = accounts.map((account) => current.service.revealPassword(account.id));
     assert.equal(new Set(passwords).size, 3);
     const raw = current.store.db.prepare(`
-      SELECT id, password_ciphertext FROM cloudflare_accounts ORDER BY created_at
+      SELECT id, mailbox_id, password_ciphertext FROM cloudflare_accounts ORDER BY created_at, id
     `).all();
-    for (const [index, row] of raw.entries()) {
+    for (const row of raw) {
+      const account = accounts.find((candidate) => candidate.id === row.id);
+      const password = current.service.revealPassword(row.id);
+      const mailbox = current.store.getMailboxPasswordCiphertext(row.mailbox_id);
+      assert.ok(account);
       assert.ok(row.password_ciphertext);
-      assert.doesNotMatch(row.password_ciphertext, new RegExp(passwords[index].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.doesNotMatch(row.password_ciphertext, new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
       assert.equal(current.vault.openCloudflareSecret(row.password_ciphertext, {
         purpose: 'cloudflare-account-password', id: row.id,
-      }), passwords[index]);
+      }), password);
+      assert.equal(
+        current.vault.openMailboxPassword(mailbox.account_password_ciphertext, mailbox.mailbox_id),
+        password,
+      );
       assert.throws(() => current.vault.openCloudflareSecret(row.password_ciphertext, {
         purpose: 'cloudflare-account-password', id: 'wrong-account',
       }), /authenticated|wrong|corrupted/i);
@@ -97,6 +164,11 @@ test('password regeneration locks after Signup Done and Focus Mode resumes after
     const original = current.service.revealPassword(first.id);
     const regenerated = current.service.regeneratePassword(first.id);
     assert.notEqual(regenerated.password, original);
+    const mailboxPassword = current.store.getMailboxPasswordCiphertext(first.mailbox_id);
+    assert.equal(
+      current.vault.openMailboxPassword(mailboxPassword.account_password_ciphertext, mailboxPassword.mailbox_id),
+      regenerated.password,
+    );
     const signedUp = current.service.markSignupDone(first.id);
     assert.equal(signedUp.status, 'signup_done');
     assert.ok(signedUp.password_locked_at);
@@ -113,6 +185,14 @@ test('password regeneration locks after Signup Done and Focus Mode resumes after
     assert.equal(resumed.id, first.id);
     assert.equal(resumed.status, 'signup_done');
     assert.equal(restarted.revealPassword(first.id), regenerated.password);
+    const restartedMailboxPassword = current.store.getMailboxPasswordCiphertext(first.mailbox_id);
+    assert.equal(
+      current.vault.openMailboxPassword(
+        restartedMailboxPassword.account_password_ciphertext,
+        restartedMailboxPassword.mailbox_id,
+      ),
+      regenerated.password,
+    );
   } finally {
     current.close();
   }
@@ -389,6 +469,11 @@ test('legacy runner records migrate additively without changing a used external 
     assert.equal(migrated.status, 'waiting_verification');
     assert.equal(migrated.workflow_mode, undefined);
     assert.equal(current.service.revealPassword(accountId), password);
+    const mailboxPassword = current.store.getMailboxPasswordCiphertext('mbx_1');
+    assert.equal(
+      current.vault.openMailboxPassword(mailboxPassword.account_password_ciphertext, mailboxPassword.mailbox_id),
+      password,
+    );
   } finally {
     current.close();
   }

@@ -1834,7 +1834,7 @@ function hideJobPassword() {
 
 async function revealJobPassword(sourceButton) {
   if (!state.selectedJobId) return;
-  await withBusyButton(sourceButton, 'Decrypting', 'Decrypting destination password', async () => {
+  await withBusyButton(sourceButton, 'Decrypting', 'Decrypting the saved account password', async () => {
     const result = await api(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/destination-password`, { method: 'POST', body: '{}' });
     state.jobDestinationPassword = result.password;
     $('#jobPasswordValue').textContent = result.password;
@@ -1854,7 +1854,7 @@ async function copyText(value, successMessage = 'Copied') {
 }
 
 async function downloadSensitiveExport() {
-  if (!confirm('This export contains plaintext destination passwords. Store it securely and delete it when finished. Continue?')) return;
+  if (!confirm('This export contains plaintext saved account passwords. Store it securely and delete it when finished. Continue?')) return;
   const response = await fetch('/api/mailboxes/export-sensitive', {
     method: 'POST',
     credentials: 'same-origin',
@@ -1872,7 +1872,7 @@ async function downloadSensitiveExport() {
   const href = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = href;
-  anchor.download = 'atomicmail-email-destination-passwords.csv';
+  anchor.download = 'atomicmail-email-passwords.csv';
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
@@ -2053,12 +2053,8 @@ $('#createForm').addEventListener('submit', async (event) => {
       body: JSON.stringify({
         count: Number($('#batchCount').value),
         prefix: $('#batchPrefix').value,
-        destinationPassword: $('#destinationPassword').value,
       }),
     });
-    $('#destinationPassword').value = '';
-    $('#destinationPassword').type = 'password';
-    $('#toggleDestinationPassword').textContent = 'Show';
     state.selectedJobId = job.id;
     showToast(`Batch created: ${job.requested_count} email${job.requested_count === 1 ? '' : 's'}`);
     switchView('jobs', { load: false });
@@ -2122,9 +2118,9 @@ $('#mailboxesBody').addEventListener('click', async (event) => {
   const passwordButton = event.target.closest('[data-copy-mailbox-password]');
   if (passwordButton) {
     try {
-      await withBusyButton(passwordButton, 'Copying', 'Decrypting destination password', async () => {
+      await withBusyButton(passwordButton, 'Copying', 'Decrypting the saved account password', async () => {
         const result = await api(`/api/mailboxes/${encodeURIComponent(passwordButton.dataset.copyMailboxPassword)}/destination-password`, { method: 'POST', body: '{}' });
-        await copyText(result.password, 'Destination password copied');
+        await copyText(result.password, 'Saved account password copied');
       });
     } catch (error) {
       handleError(error);
@@ -2180,7 +2176,7 @@ $('#manualCloudflareBatchForm').addEventListener('submit', async (event) => {
   errorBox.hidden = true;
   form.setAttribute('aria-busy', 'true');
   setButtonBusy(button, true, 'Creating accounts');
-  const endActivity = beginActivity('manual-cloudflare-create', 'Generating and encrypting unique account passwords', { immediate: true });
+  const endActivity = beginActivity('manual-cloudflare-create', 'Linking each email to its saved unique password', { immediate: true });
   try {
     const result = await api('/api/cloudflare/jobs', {
       method: 'POST',
@@ -2216,19 +2212,19 @@ $('#revealManualCloudflarePassword').addEventListener('click', async (event) => 
 $('#copyManualCloudflarePassword').addEventListener('click', async (event) => {
   await withBusyButton(event.currentTarget, 'Copying', 'Decrypting this account password', async () => {
     const password = state.manualCloudflarePassword || await revealManualCloudflarePassword();
-    if (password) await copyText(password, 'Cloudflare password copied');
+    if (password) await copyText(password, 'Email / Cloudflare password copied');
   }).catch(handleError);
 });
 $('#regenerateManualCloudflarePassword').addEventListener('click', async (event) => {
   const account = state.manualCloudflareAccount;
-  if (!account || !confirm('Replace this unused password with a new random password?')) return;
-  await withBusyButton(event.currentTarget, 'Regenerating', 'Encrypting a new account password', async () => {
+  if (!account || !confirm('Replace the saved password for this email and its Cloudflare account?')) return;
+  await withBusyButton(event.currentTarget, 'Regenerating', 'Updating the email and Cloudflare password together', async () => {
     const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/regenerate-password`, { method: 'POST', body: '{}' });
     state.manualCloudflareAccount = result.account;
     state.manualCloudflarePassword = result.password;
     $('#manualCloudflareFocusPassword').textContent = result.password;
     $('#revealManualCloudflarePassword').textContent = 'Hide';
-    showToast('New unique password generated');
+    showToast('Email and Cloudflare password updated together');
   }).catch(handleError);
 });
 $('#openManualCloudflareSignup').addEventListener('click', () => {
@@ -2236,7 +2232,7 @@ $('#openManualCloudflareSignup').addEventListener('click', () => {
 });
 $('#markManualCloudflareSignupDone').addEventListener('click', async (event) => {
   const account = state.manualCloudflareAccount;
-  if (!account || !confirm('Confirm that Cloudflare accepted the signup for this exact email. The password will be locked.')) return;
+  if (!account || !confirm('Confirm that Cloudflare accepted the signup for this exact email. The matching email/Cloudflare password will be locked.')) return;
   await withBusyButton(event.currentTarget, 'Saving', 'Locking password and saving Signup Done', async () => {
     await api(`/api/cloudflare/accounts/${encodeURIComponent(account.id)}/signup-done`, { method: 'POST', body: '{}' });
     hideManualCloudflareSecrets();
@@ -2420,7 +2416,7 @@ $('#manualCloudflareAccountsBody').addEventListener('click', async (event) => {
   if (copy) {
     await withBusyButton(copy, 'Copying', 'Decrypting this account password', async () => {
       const result = await api(`/api/cloudflare/accounts/${encodeURIComponent(copy.dataset.manualCloudflareCopyPassword)}/password`, { method: 'POST', body: '{}' });
-      await copyText(result.password, 'Cloudflare password copied');
+      await copyText(result.password, 'Email / Cloudflare password copied');
     }).catch(handleError);
   }
 });
@@ -2630,15 +2626,10 @@ $('#composeForm').addEventListener('submit', (event) => {
 $('#exportCsv').addEventListener('click', (event) => withBusyButton(event.currentTarget, 'Exporting', 'Preparing CSV export', () => downloadExport('csv')).catch(handleError));
 $('#exportJson').addEventListener('click', (event) => withBusyButton(event.currentTarget, 'Exporting', 'Preparing JSON export', () => downloadExport('json')).catch(handleError));
 $('#exportSensitiveCsv').addEventListener('click', (event) => withBusyButton(event.currentTarget, 'Exporting', 'Preparing sensitive export', () => downloadSensitiveExport()).catch(handleError));
-$('#toggleDestinationPassword').addEventListener('click', () => {
-  const input = $('#destinationPassword');
-  input.type = input.type === 'password' ? 'text' : 'password';
-  $('#toggleDestinationPassword').textContent = input.type === 'password' ? 'Show' : 'Hide';
-});
 $('#revealJobPassword').addEventListener('click', (event) => revealJobPassword(event.currentTarget).catch(handleError));
 $('#hideJobPassword').addEventListener('click', hideJobPassword);
 $('#copyJobPassword').addEventListener('click', () => {
-  if (state.jobDestinationPassword != null) copyText(state.jobDestinationPassword, 'Destination password copied').catch(handleError);
+  if (state.jobDestinationPassword != null) copyText(state.jobDestinationPassword, 'Saved account password copied').catch(handleError);
 });
 $('#refreshAudit').addEventListener('click', () => loadSystem().catch(handleError));
 $('#createBackup').addEventListener('click', async () => {

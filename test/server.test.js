@@ -317,7 +317,7 @@ test('webmail APIs expose inbox/read/send/reply without leaking credentials or m
   }
 });
 
-test('per-job destination passwords are encrypted, CSRF-protected, explicitly exported, and absent from normal APIs', async () => {
+test('automatic per-mailbox passwords are encrypted, CSRF-protected, explicitly exported, and absent from normal APIs', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-panel-password-api-'));
   const config = {
     ...makeConfig(root, 'correct-horse-battery-staple'),
@@ -339,7 +339,7 @@ test('per-job destination passwords are encrypted, CSRF-protected, explicitly ex
   const server = createServer({ store, worker, config, vault });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const password = 'destination-only-secret-774411';
+  const password = 'Mailbox!Unique-Secret-774411';
   try {
     const login = await fetch(`${base}/api/auth/login`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -348,41 +348,63 @@ test('per-job destination passwords are encrypted, CSRF-protected, explicitly ex
     const auth = await login.json();
     const cookie = cookieFrom(login);
     const headers = { cookie, 'content-type': 'application/json', 'x-atomicmail-csrf': auth.csrf };
-    const created = await fetch(`${base}/api/jobs`, {
+
+    const staleClient = await fetch(`${base}/api/jobs`, {
       method: 'POST', headers,
       body: JSON.stringify({ count: 1, destinationPassword: password }),
+    });
+    assert.equal(staleClient.status, 409);
+    assert.doesNotMatch(await staleClient.text(), new RegExp(password));
+
+    const created = await fetch(`${base}/api/jobs`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ count: 1 }),
     });
     assert.equal(created.status, 201);
     const rawCreated = await created.text();
     assert.doesNotMatch(rawCreated, new RegExp(password));
     assert.doesNotMatch(rawCreated, /ciphertext/i);
     const job = JSON.parse(rawCreated);
-    assert.equal(job.has_destination_password, 1);
+    assert.equal(job.has_destination_password, 0);
 
-    const encrypted = store.db.prepare('SELECT destination_password_ciphertext FROM jobs WHERE id=?').get(job.id).destination_password_ciphertext;
-    assert.ok(encrypted);
-    assert.doesNotMatch(encrypted, new RegExp(password));
-
-    const noCsrf = await fetch(`${base}/api/jobs/${job.id}/destination-password`, { method: 'POST', headers: { cookie } });
-    assert.equal(noCsrf.status, 403);
-    const reveal = await fetch(`${base}/api/jobs/${job.id}/destination-password`, { method: 'POST', headers, body: '{}' });
-    assert.equal(reveal.status, 200);
-    assert.equal((await reveal.json()).password, password);
+    const jobReveal = await fetch(`${base}/api/jobs/${job.id}/destination-password`, {
+      method: 'POST', headers, body: '{}',
+    });
+    assert.equal(jobReveal.status, 404);
 
     const running = store.markItemRunning(job.items[0].id);
-    const mailboxId = store.markItemSucceeded(running.id, {
+    const mailboxId = 'mbx_password_api_test';
+    const accountPasswordCiphertext = vault.sealMailboxPassword(password, mailboxId);
+    store.markItemSucceeded(running.id, {
       username: running.username,
       email: `${running.username}@atomicmail.ai`,
       inboxId: running.username,
       credentialsPath: path.join(config.credentialsRoot, running.username, 'credentials.json.enc'),
-    });
+    }, { mailboxId, accountPasswordCiphertext });
+
+    const encrypted = store.db.prepare(`
+      SELECT account_password_ciphertext FROM mailboxes WHERE id=?
+    `).get(mailboxId).account_password_ciphertext;
+    assert.ok(encrypted);
+    assert.doesNotMatch(encrypted, new RegExp(password));
+    assert.equal(vault.openMailboxPassword(encrypted, mailboxId), password);
+
     const mailboxes = await (await fetch(`${base}/api/mailboxes`, { headers: { cookie } })).json();
     assert.equal(mailboxes.items[0].has_destination_password, 1);
     assert.doesNotMatch(JSON.stringify(mailboxes), new RegExp(password));
+    assert.doesNotMatch(JSON.stringify(mailboxes), /account_password_ciphertext/i);
 
     const normalExport = await (await fetch(`${base}/api/mailboxes/export?format=csv`, { headers: { cookie } })).text();
     assert.doesNotMatch(normalExport, new RegExp(password));
-    const mailboxReveal = await fetch(`${base}/api/mailboxes/${mailboxId}/destination-password`, { method: 'POST', headers, body: '{}' });
+
+    const noCsrf = await fetch(`${base}/api/mailboxes/${mailboxId}/destination-password`, {
+      method: 'POST', headers: { cookie },
+    });
+    assert.equal(noCsrf.status, 403);
+    const mailboxReveal = await fetch(`${base}/api/mailboxes/${mailboxId}/destination-password`, {
+      method: 'POST', headers, body: '{}',
+    });
+    assert.equal(mailboxReveal.status, 200);
     assert.equal((await mailboxReveal.json()).password, password);
 
     const sensitive = await fetch(`${base}/api/mailboxes/export-sensitive`, {
@@ -393,7 +415,7 @@ test('per-job destination passwords are encrypted, CSRF-protected, explicitly ex
 
     const audit = JSON.stringify(store.recentAudit(100));
     assert.doesNotMatch(audit, new RegExp(password));
-    assert.doesNotMatch(audit, /destination_password_ciphertext/i);
+    assert.doesNotMatch(audit, /account_password_ciphertext/i);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     store.close();

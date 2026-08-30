@@ -25,27 +25,30 @@ function makeConfig(root) {
   };
 }
 
-function createMailbox(store, vault, username, destinationPassword = '') {
+function createMailbox(store, vault, username, accountPassword = '') {
   vault.writeEncryptedFile(username, 'credentials.json', Buffer.from(JSON.stringify({
     inboxId: `${username}@atomicmail.ai`,
     apiKey: `secret-${username}`,
   })));
   const jobId = `job_test_${username}`;
-  const destinationPasswordCiphertext = destinationPassword ? vault.sealJobPassword(destinationPassword, jobId) : null;
+  const mailboxId = `mbx_test_${username}`;
   const job = store.createJob({
     id: jobId,
     count: 1,
     prefix: '',
     usernames: [username],
-    destinationPasswordCiphertext,
   });
   const item = store.markItemRunning(job.items[0].id);
+  const accountPasswordCiphertext = accountPassword
+    ? vault.sealMailboxPassword(accountPassword, mailboxId)
+    : null;
   store.markItemSucceeded(item.id, {
     username,
     email: `${username}@atomicmail.ai`,
     inboxId: `${username}@atomicmail.ai`,
     credentialsPath: vault.credentialsPath(username),
-  });
+  }, { mailboxId, accountPasswordCiphertext });
+  return mailboxId;
 }
 
 test('legacy plaintext credentials are authenticated, encrypted, and removed from permanent storage', () => {
@@ -166,6 +169,7 @@ test('encrypted backup verifies and restores portably onto a different path', as
     sourceCloudflare.createBatch([mailboxId]);
     const sourceCloudflareAccount = sourceCloudflare.getFocusAccount().account;
     const sourceCloudflarePassword = sourceCloudflare.revealPassword(sourceCloudflareAccount.id);
+    assert.equal(sourceCloudflarePassword, 'destination-secret-4477');
     sourceCloudflare.updateNotes(sourceCloudflareAccount.id, 'Resume this account after portable restore');
     const sourceGlobalApiKey = 'cfk_BACKUP_TEST_abcdefghijklmnopqrstuvwxyz012345';
     const sourceApiToken = 'cfat_BACKUP_TEST_abcdefghijklmnopqrstuvwxyz0123456789';
@@ -200,9 +204,9 @@ test('encrypted backup verifies and restores portably onto a different path', as
     assert.equal(targetStore.countMailboxes(), 1);
     const mailbox = targetStore.listMailboxes(1)[0];
     assert.equal(mailbox.email, 'portable1111@atomicmail.ai');
-    const restoredPassword = targetStore.getJobPasswordCiphertext('job_test_portable1111');
+    const restoredPassword = targetStore.getMailboxPasswordCiphertext(mailbox.id);
     assert.equal(
-      targetVault.openJobPassword(restoredPassword.destination_password_ciphertext, restoredPassword.id),
+      targetVault.openMailboxPassword(restoredPassword.account_password_ciphertext, restoredPassword.mailbox_id),
       'destination-secret-4477',
     );
     assert.equal(targetVault.readCredentials('portable1111').apiKey, 'secret-portable1111');
@@ -248,7 +252,7 @@ test('tampered encrypted backup is rejected before restore', async () => {
   }
 });
 
-test('shutdown backup protects a destination-password job even before its first mailbox exists', async () => {
+test('shutdown backup preserves a legacy shared-password job before its first mailbox exists', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'atomicmail-password-only-backup-'));
   try {
     const config = makeConfig(root);
